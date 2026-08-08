@@ -7,6 +7,8 @@
 
 Quick Entry becomes the compact, always-available voice surface for the same active Hermes session. Turn-based full-capability parity ships first; provider-native realtime replaces the transport behind the same authority and HUD contracts later.
 
+The HUD and Discord voice are peer operator surfaces, not tool executors. Both admit speech into the same authoritative Hermes session; Hermes owns computer use, screenshots, approvals, tools, persistence, and receipts. A remote operator can therefore ask through Discord voice for work on the Desktop without copying the computer-use catalog into either audio surface.
+
 ## Ownership
 
 | Surface | Owns | Does not own |
@@ -29,6 +31,7 @@ Quick Entry becomes the compact, always-available voice surface for the same act
 | PRP-008 | Provenance and memory convergence | Hermes Agent + Talk | PRP-006 | operator/participant provenance persists; participant text cannot become operator memory |
 | PRP-009 | Resilience and presence truth | Hermes Agent + Talk | prior runtime slices | inactivity/reconnect/profile switch/teardown are visible, bounded and leak-free |
 | PRP-010 | Setup, compatibility, docs and release gate | both | all | provider catalog/config/doctor, turn-based fallback, E2E fake-provider proof |
+| PRP-011 | Remote visual receipts and optional live desktop stream | Hermes Agent + Talk adapter | PRP-006, PRP-007, PRP-009 | Discord/HUD can request canonical screenshots and receive bounded visual receipts; any live stream is explicit, permissioned, observable and revocable |
 
 ## Requirement ownership
 
@@ -56,6 +59,12 @@ Native duplex critical path:
 Talk Discord/terminal convergence can proceed beside Desktop after PRP-004:
 
 `PRP-004 → PRP-006 → PRP-008`
+
+Remote operator path (Discord voice → same Hermes session → computer use → visual receipt):
+
+`PRP-002 → PRP-003 → PRP-004 → PRP-006 → PRP-007 → PRP-009 → PRP-011`
+
+PRP-011 ships screenshot receipts before live streaming. Continuous screen streaming is optional and must never become a silent background feed; the Desktop must show that capture is active, normal approval/identity rules still apply, and the operator can stop it immediately.
 
 ## Program gates
 
