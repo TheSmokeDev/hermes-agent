@@ -155,17 +155,17 @@ The two new test files named above do not exist yet and are created during RED.
 
 ## Acceptance criteria
 
-- [ ] Quick Entry displays an accessible microphone action only for the current target.
-- [ ] Gateway-open with no active runtime remains text-capable but voice-ineligible; voice cannot create a session.
-- [ ] The intent crosses the narrow preload/main IPC bridge and reaches the primary renderer once.
-- [ ] Electron validates the Quick Entry sender and exact current-target literal; every other sender/target fails closed.
-- [ ] The existing main-composer voice conversation starts without creating a second gateway, provider session, Hermes session, or tool executor.
-- [ ] A finalized voice transcript uses the already-selected Hermes session's normal prompt submit path.
-- [ ] Profile/runtime/durable-session drift before consumption or during capture ends/rejects voice before submission to another conversation.
-- [ ] Existing approvals, tools, computer-use policy, skills, delegation/Kanban context, transcript persistence, and background work behavior remain unchanged.
-- [ ] New/stored targets remain text-only and are visibly unsupported for voice.
-- [ ] Disconnected/unavailable/start-failed state is visible; the HUD does not silently pretend voice is live.
-- [ ] Focused tests, typecheck, lint, and Windows packaged smoke pass with receipts.
+- [x] Quick Entry displays an accessible microphone action only for the current target.
+- [x] Gateway-open with no active runtime remains text-capable but voice-ineligible; voice cannot create a session.
+- [x] The intent crosses the narrow preload/main IPC bridge and reaches the primary renderer once.
+- [x] Electron validates the Quick Entry sender and exact current-target literal; every other sender/target fails closed.
+- [x] The existing main-composer voice conversation starts without creating a second gateway, provider session, Hermes session, or tool executor.
+- [x] A finalized voice transcript uses the already-selected Hermes session's normal prompt submit path.
+- [x] Profile/runtime/durable-session drift before consumption or during capture ends/rejects voice before submission to another conversation.
+- [x] Existing approvals, tools, computer-use policy, skills, delegation/Kanban context, transcript persistence, and background work behavior remain unchanged.
+- [x] New/stored targets remain text-only and are visibly unsupported for voice.
+- [x] Disconnected/unavailable/start-failed state is visible; the HUD does not silently pretend voice is live.
+- [x] Focused tests, typecheck, lint, and Windows packaged smoke pass with receipts.
 
 ## Backout
 
@@ -173,4 +173,14 @@ Revert the typed action, IPC relay, and mic control. No data or configuration mi
 
 ## Completion evidence
 
-The implementation handoff SHALL include branch/revision, changed files, each acceptance criterion mapped to a test or packaged smoke receipt, exact commands/exit codes, review dispositions, and confirmation that no remote push or merge occurred without approval.
+Implementation revision: `e5b946b7595d34d10c1b7cc50bea4cd1efd426f8` on `feat/quick-entry-current-session-voice`.
+
+- Focused UI: 7 files / 65 tests passed.
+- Focused Electron: 3 files / 40 tests passed.
+- Desktop typecheck passed; lint passed with 0 errors and 88 pre-existing warnings; `git diff --check` passed.
+- Specification closure review: PASS. Quality/security closure review: APPROVED.
+- Windows build: `npm run build --workspace apps/desktop` exited 0; `assert-dist-built` verified renderer assets and staged `node-pty`.
+- Real Windows canary: Quick Entry projected `Voice ready`, then the existing composer projected listening/transcribing/speaking. The finalized transcript `Hermes, use a tool to check the current date.` entered the already-selected canonical session; Hermes executed the visible tool receipt `date '+%A, %B %d, %Y'`, generated TTS audio, and returned to the inactive `Start voice conversation` control.
+- Gateway PID remained `49272` before and after. The existing session was retitled `Casual Greeting and Mic Check`; no second session or gateway appeared.
+- The spoken confirmation suffix was imperfectly transcribed and ambient speech produced additional turns while the microphone remained active. This is transport/STT behavior, not an authority or routing failure.
+- No remote push, pull request, merge, live gateway replacement, or modification of an original checkout occurred.
