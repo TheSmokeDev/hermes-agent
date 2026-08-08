@@ -1,13 +1,16 @@
 import { useEffect, useRef } from 'react'
 
+import { requestVoiceConversationStart } from '@/store/composer'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
+  $quickEntryVoiceProjection,
   initQuickEntryBridge,
   QUICK_TARGET_CURRENT,
   QUICK_TARGET_NEW,
   type QuickEntrySessionOption,
   setQuickEntrySubmitHandler
 } from '@/store/quick-entry'
-import { $gatewayState, $sessions } from '@/store/session'
+import { $activeSessionId, $gatewayState, $selectedStoredSessionId, $sessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import { isSecondaryWindow } from '@/store/windows'
 
@@ -90,9 +93,28 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
       void submitTextRef.current(text)
     })
 
+    const api = window.hermesDesktop?.quickEntry
+
+    const offVoice = api?.onVoiceStart?.(payload => {
+      const runtimeSessionId = $activeSessionId.get()
+
+      if (payload?.target !== QUICK_TARGET_CURRENT || $gatewayState.get() !== 'open' || !runtimeSessionId) {
+        return
+      }
+
+      // Snapshot host-owned identity at acceptance time. The quick window is
+      // intentionally not trusted to name a profile or session.
+      requestVoiceConversationStart({
+        durableSessionId: $selectedStoredSessionId.get(),
+        profile: normalizeProfileKey($activeGatewayProfile.get()),
+        runtimeSessionId
+      })
+    })
+
     const dispose = initQuickEntryBridge()
 
     return () => {
+      offVoice?.()
       setQuickEntrySubmitHandler(null)
       dispose()
     }
@@ -112,17 +134,27 @@ export function useQuickEntryBridge({ startFreshSessionDraft, submitText }: Quic
     }
 
     const push = () => {
-      api.pushState({ connected: $gatewayState.get() === 'open', sessions: sessionOptions() })
+      const connected = $gatewayState.get() === 'open'
+      api.pushState({
+        connected,
+        currentVoiceTargetAvailable: connected && Boolean($activeSessionId.get()),
+        sessions: sessionOptions(),
+        voice: $quickEntryVoiceProjection.get()
+      })
     }
 
     push()
 
     const offGateway = $gatewayState.listen(push)
+    const offRuntime = $activeSessionId.listen(push)
     const offSessions = $sessions.listen(push)
+    const offVoice = $quickEntryVoiceProjection.listen(push)
 
     return () => {
       offGateway()
+      offRuntime()
       offSessions()
+      offVoice()
     }
   }, [])
 }

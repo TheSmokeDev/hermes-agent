@@ -418,4 +418,78 @@ export function quickEntryWindowBounds(workArea?: { height: number; width: numbe
   return { height, width, x, y }
 }
 
+export interface QuickEntryVoiceRelayTarget {
+  isDestroyed?(): boolean
+  send(channel: string, payload: { target: 'current' }): void
+}
+
+export interface QuickEntryVoiceRelayResult {
+  /** Voice lifecycle remains visible in the HUD after a successful intent. */
+  dismissQuickEntry: false
+  relayed: boolean
+}
+
+interface WebContentsLifecycleLike {
+  isDestroyed?(): boolean
+}
+
+function webContentsIsUnavailable(candidate: unknown): boolean {
+  if (!candidate || typeof candidate !== 'object') {
+    return true
+  }
+
+  try {
+    const lifecycle = candidate as WebContentsLifecycleLike
+
+    return typeof lifecycle.isDestroyed === 'function' && lifecycle.isDestroyed()
+  } catch {
+    return true
+  }
+}
+
+/** Accept renderer-owned Quick Entry state only from the exact live primary. */
+export function authorizeQuickEntryStatePush<T>(sender: unknown, livePrimarySender: unknown, payload: T): T | null {
+  if (
+    !livePrimarySender ||
+    sender !== livePrimarySender ||
+    webContentsIsUnavailable(livePrimarySender) ||
+    !payload ||
+    typeof payload !== 'object'
+  ) {
+    return null
+  }
+
+  return payload
+}
+
+/** Fail-closed authority check for the Quick Entry voice IPC boundary. */
+export function relayQuickEntryVoiceStart(
+  sender: unknown,
+  liveQuickSender: unknown,
+  primary: QuickEntryVoiceRelayTarget | null,
+  payload: unknown
+): QuickEntryVoiceRelayResult {
+  if (
+    !liveQuickSender ||
+    sender !== liveQuickSender ||
+    webContentsIsUnavailable(liveQuickSender) ||
+    !primary ||
+    webContentsIsUnavailable(primary)
+  ) {
+    return { dismissQuickEntry: false, relayed: false }
+  }
+
+  if (!payload || typeof payload !== 'object' || (payload as { target?: unknown }).target !== 'current') {
+    return { dismissQuickEntry: false, relayed: false }
+  }
+
+  try {
+    primary.send('hermes:quick-entry:startVoice', { target: 'current' })
+  } catch {
+    return { dismissQuickEntry: false, relayed: false }
+  }
+
+  return { dismissQuickEntry: false, relayed: true }
+}
+
 export { DEFAULT_QUICK_ENTRY_SHORTCUT, QUICK_ENTRY_TOP_FRACTION, QUICK_ENTRY_WINDOW_HEIGHT, QUICK_ENTRY_WINDOW_WIDTH }

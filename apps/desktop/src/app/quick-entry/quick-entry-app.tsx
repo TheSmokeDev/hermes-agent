@@ -6,8 +6,23 @@ import {
   QUICK_TARGET_NEW,
   type QuickComposerEvent,
   quickComposerReducer,
-  type QuickComposerState
+  type QuickComposerState,
+  type QuickEntryVoiceStatus
 } from '@/store/quick-entry'
+
+const VOICE_STATUS_LABELS: Record<QuickEntryVoiceStatus, string> = {
+  idle: 'Voice ready',
+  listening: 'Listening',
+  speaking: 'Speaking',
+  thinking: 'Thinking',
+  transcribing: 'Transcribing'
+}
+
+function normalizeVoiceStatus(status: unknown): QuickEntryVoiceStatus {
+  return typeof status === 'string' && Object.hasOwn(VOICE_STATUS_LABELS, status)
+    ? (status as QuickEntryVoiceStatus)
+    : 'idle'
+}
 
 /**
  * The Quick Entry composer — the whole renderer surface of the global-hotkey
@@ -32,11 +47,13 @@ export function QuickEntryApp() {
   // (hand the payload to the shell, ask to hide) and stores the next state, so
   // the decision stays pure and testable while the effects stay in one place.
   const [state, dispatch] = useReducer((current: QuickComposerState, event: QuickComposerEvent) => {
-    const { send, state: next } = quickComposerReducer(current, event)
+    const { send, startVoice, state: next } = quickComposerReducer(current, event)
     const api = window.hermesDesktop?.quickEntry
 
     if (send) {
       api?.submit(send)
+    } else if (startVoice) {
+      api?.startVoice(startVoice)
     } else if (!next.visible && current.visible) {
       api?.dismiss()
     }
@@ -58,8 +75,15 @@ export function QuickEntryApp() {
     const offState = api?.onState(payload => {
       dispatch({
         connected: payload?.connected === true,
+        currentVoiceTargetAvailable: payload?.currentVoiceTargetAvailable === true,
         sessions: Array.isArray(payload?.sessions) ? payload.sessions : [],
-        type: 'state'
+        type: 'state',
+        voice: {
+          active: payload?.voice?.active === true,
+          available: payload?.voice?.available === true,
+          error: payload?.voice?.error === 'failed' ? 'failed' : null,
+          status: normalizeVoiceStatus(payload?.voice?.status)
+        }
       })
     })
 
@@ -147,6 +171,31 @@ export function QuickEntryApp() {
             }}
             value={state.draft}
           />
+          <button
+            aria-label="Start voice conversation"
+            disabled={
+              !state.connected ||
+              state.target !== QUICK_TARGET_CURRENT ||
+              !state.currentVoiceTargetAvailable ||
+              !state.voice.available ||
+              state.voice.active
+            }
+            onClick={() => dispatch({ type: 'voice' })}
+            style={{
+              background: 'transparent',
+              border: '1px solid var(--ui-stroke-secondary, rgba(127,127,127,0.35))',
+              borderRadius: 6,
+              color: 'var(--foreground, #eee)',
+              cursor: 'pointer',
+              flexShrink: 0,
+              fontSize: 14,
+              lineHeight: 1,
+              padding: 5
+            }}
+            type="button"
+          >
+            <span aria-hidden>🎙</span>
+          </button>
         </div>
         <div style={{ alignItems: 'center', display: 'flex', gap: 8 }}>
           <label
@@ -190,6 +239,20 @@ export function QuickEntryApp() {
               </option>
             ))}
           </select>
+          <span
+            role="status"
+            style={{
+              color: state.voice.error ? 'var(--destructive, #ef4444)' : 'var(--muted-foreground, #8a8a8a)',
+              fontSize: 11,
+              marginLeft: 'auto'
+            }}
+          >
+            {state.voice.error
+              ? 'Voice failed'
+              : state.target === QUICK_TARGET_CURRENT && state.currentVoiceTargetAvailable && state.voice.available
+                ? VOICE_STATUS_LABELS[state.voice.status]
+                : 'Voice unavailable'}
+          </span>
         </div>
       </div>
     </div>

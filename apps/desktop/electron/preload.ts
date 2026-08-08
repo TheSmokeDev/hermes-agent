@@ -54,6 +54,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     getSettings: () => ipcRenderer.invoke('hermes:quick-entry:settings:get'),
     setSettings: patch => ipcRenderer.invoke('hermes:quick-entry:settings:set', patch),
     submit: payload => ipcRenderer.send('hermes:quick-entry:submit', payload),
+    startVoice: payload => ipcRenderer.send('hermes:quick-entry:startVoice', payload),
     dismiss: () => ipcRenderer.send('hermes:quick-entry:dismiss'),
     // Primary renderer → main → quick window: gateway connection state + the
     // recent-session options the target picker offers. Main caches the latest
@@ -72,6 +73,13 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.on('hermes:quick-entry:submit', listener)
 
       return () => ipcRenderer.removeListener('hermes:quick-entry:submit', listener)
+    },
+    // Main → primary renderer: a voice intent captured by the quick window.
+    onVoiceStart: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:quick-entry:startVoice', listener)
+
+      return () => ipcRenderer.removeListener('hermes:quick-entry:startVoice', listener)
     },
     // Main → quick window: you were just summoned (reset draft + refocus).
     onShown: callback => {

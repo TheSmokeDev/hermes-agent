@@ -17,15 +17,25 @@ import {
 } from './composer'
 
 describe('voice conversation start requests', () => {
-  it('latches each request until the main composer consumes it once', () => {
-    requestVoiceConversationStart()
+  const binding = { durableSessionId: 'stored-1', profile: 'default', runtimeSessionId: 'runtime-1' }
+
+  it('latches each binding-aware request until the matching main composer consumes it once', () => {
+    requestVoiceConversationStart(binding)
     const first = $voiceConversationStartRequest.get()
 
-    expect(takeVoiceConversationStart(first)).toBe(true)
-    expect(takeVoiceConversationStart(first)).toBe(false)
+    expect(takeVoiceConversationStart(first, binding)).toBe(true)
+    expect(takeVoiceConversationStart(first, binding)).toBe(false)
 
-    requestVoiceConversationStart()
-    expect(takeVoiceConversationStart($voiceConversationStartRequest.get())).toBe(true)
+    requestVoiceConversationStart(binding)
+    expect(takeVoiceConversationStart($voiceConversationStartRequest.get(), binding)).toBe(true)
+  })
+
+  it('consumes and rejects a stale profile/runtime/durable mismatch so it cannot start later', () => {
+    requestVoiceConversationStart(binding)
+    const request = $voiceConversationStartRequest.get()
+
+    expect(takeVoiceConversationStart(request, { ...binding, runtimeSessionId: 'runtime-2' })).toBe(false)
+    expect(takeVoiceConversationStart(request, binding)).toBe(false)
   })
 })
 

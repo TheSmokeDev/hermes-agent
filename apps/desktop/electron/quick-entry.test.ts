@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  authorizeQuickEntryStatePush,
   createQuickEntryShortcut,
   DEFAULT_QUICK_ENTRY_SHORTCUT,
   type GlobalShortcutLike,
   parseQuickEntryShortcut,
   quickEntryWindowBounds,
+  relayQuickEntryVoiceStart,
   sanitizeQuickEntrySettings
 } from './quick-entry'
 
@@ -236,5 +238,95 @@ describe('quickEntryWindowBounds', () => {
 
   it('falls back to the origin without a work area', () => {
     expect(quickEntryWindowBounds()).toEqual({ height: 168, width: 640, x: 0, y: 0 })
+  })
+})
+
+describe('relayQuickEntryVoiceStart', () => {
+  it('relays a current-target intent only from the exact live quick window sender', () => {
+    const quickSender = {}
+    const primary = { send: vi.fn() }
+
+    expect(relayQuickEntryVoiceStart(quickSender, quickSender, primary, { target: 'current' })).toEqual({
+      dismissQuickEntry: false,
+      relayed: true
+    })
+    expect(primary.send).toHaveBeenCalledWith('hermes:quick-entry:startVoice', { target: 'current' })
+  })
+
+  it('fails closed for main, secondary, unknown, and stale senders', () => {
+    const liveQuickSender = {}
+    const primary = { send: vi.fn() }
+
+    for (const sender of [{ kind: 'main' }, { kind: 'secondary' }, {}, { kind: 'stale-quick' }]) {
+      expect(relayQuickEntryVoiceStart(sender, liveQuickSender, primary, { target: 'current' })).toEqual({
+        dismissQuickEntry: false,
+        relayed: false
+      })
+    }
+
+    expect(primary.send).not.toHaveBeenCalled()
+  })
+
+  it('fails closed for malformed, new, and stored targets or a missing primary', () => {
+    const quickSender = {}
+    const primary = { send: vi.fn() }
+
+    for (const payload of [null, {}, { target: 'new' }, { target: 'stored-1' }]) {
+      expect(relayQuickEntryVoiceStart(quickSender, quickSender, primary, payload)).toEqual({
+        dismissQuickEntry: false,
+        relayed: false
+      })
+    }
+
+    expect(relayQuickEntryVoiceStart(quickSender, quickSender, null, { target: 'current' })).toEqual({
+      dismissQuickEntry: false,
+      relayed: false
+    })
+    expect(primary.send).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when either webContents is destroyed or primary send throws', () => {
+    const quickSender = { isDestroyed: vi.fn(() => false) }
+    const destroyedQuick = { isDestroyed: vi.fn(() => true) }
+    const destroyedPrimary = { isDestroyed: vi.fn(() => true), send: vi.fn() }
+
+    const throwingPrimary = {
+      isDestroyed: vi.fn(() => false),
+      send: vi.fn(() => {
+        throw new Error('render frame disposed')
+      })
+    }
+
+    expect(
+      relayQuickEntryVoiceStart(destroyedQuick, destroyedQuick, throwingPrimary, { target: 'current' }).relayed
+    ).toBe(false)
+    expect(relayQuickEntryVoiceStart(quickSender, quickSender, destroyedPrimary, { target: 'current' }).relayed).toBe(
+      false
+    )
+    expect(relayQuickEntryVoiceStart(quickSender, quickSender, throwingPrimary, { target: 'current' }).relayed).toBe(
+      false
+    )
+  })
+})
+
+describe('authorizeQuickEntryStatePush', () => {
+  it('accepts state only from the exact live primary renderer', () => {
+    const primary = { isDestroyed: vi.fn(() => false) }
+    const state = { connected: true }
+
+    expect(authorizeQuickEntryStatePush(primary, primary, state)).toBe(state)
+  })
+
+  it('rejects peer, secondary, unknown, stale, and destroyed primary renderers', () => {
+    const primary = { isDestroyed: vi.fn(() => false) }
+    const destroyedPrimary = { isDestroyed: vi.fn(() => true) }
+    const state = { connected: true }
+
+    for (const sender of [{ kind: 'peer' }, { kind: 'secondary' }, {}, { kind: 'stale-primary' }]) {
+      expect(authorizeQuickEntryStatePush(sender, primary, state)).toBeNull()
+    }
+
+    expect(authorizeQuickEntryStatePush(destroyedPrimary, destroyedPrimary, state)).toBeNull()
+    expect(authorizeQuickEntryStatePush(primary, primary, null)).toBeNull()
   })
 })

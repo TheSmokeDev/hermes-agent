@@ -1,14 +1,17 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
-import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
+import { $voiceConversationStartRequest, takeVoiceConversationStart, type VoiceSessionBinding } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { setQuickEntryVoiceProjection } from '@/store/quick-entry'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
@@ -20,6 +23,14 @@ import type { ChatBarProps } from '../types'
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
+
+function voiceBindingMatches(expected: VoiceSessionBinding, actual: VoiceSessionBinding): boolean {
+  return (
+    expected.profile === actual.profile &&
+    expected.runtimeSessionId === actual.runtimeSessionId &&
+    expected.durableSessionId === actual.durableSessionId
+  )
+}
 
 interface UseComposerVoiceArgs {
   busy: boolean
@@ -62,9 +73,29 @@ export function useComposerVoice({
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
+  const [voiceTerminalError, setVoiceTerminalError] = useState<null | 'failed'>(null)
   const lastSpokenIdRef = useRef<string | null>(null)
   const ownsWakeIndicatorRef = useRef(false)
+  const boundVoiceSessionRef = useRef<VoiceSessionBinding | null>(null)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
+  const activeProfile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const activeRuntimeSessionId = useStore($activeSessionId)
+  const activeDurableSessionId = useStore($selectedStoredSessionId)
+
+  const activeBinding: VoiceSessionBinding | null = useMemo(
+    () =>
+      activeRuntimeSessionId
+        ? {
+            durableSessionId: activeDurableSessionId,
+            profile: activeProfile,
+            runtimeSessionId: activeRuntimeSessionId
+          }
+        : null,
+    [activeDurableSessionId, activeProfile, activeRuntimeSessionId]
+  )
+
+  const voiceStartAdmissionRef = useRef({ activeBinding, disabled, target, voiceConversationActive })
+  voiceStartAdmissionRef.current = { activeBinding, disabled, target, voiceConversationActive }
 
   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
     focusInput,
@@ -112,6 +143,26 @@ export function useComposerVoice({
   }
 
   const submitVoiceTurn = async (text: string) => {
+    const bound = boundVoiceSessionRef.current
+    const runtimeSessionId = $activeSessionId.get()
+
+    const currentBinding: VoiceSessionBinding | null = runtimeSessionId
+      ? {
+          durableSessionId: $selectedStoredSessionId.get(),
+          profile: normalizeProfileKey($activeGatewayProfile.get()),
+          runtimeSessionId
+        }
+      : null
+
+    // Revalidate immediately before the canonical onSubmit seam. A transcript
+    // captured for one identity must never land in another after drift.
+    if (bound && (!currentBinding || !voiceBindingMatches(bound, currentBinding))) {
+      setVoiceTerminalError('failed')
+      setVoiceConversationActive(false)
+
+      return
+    }
+
     if (busy) {
       return
     }
@@ -134,7 +185,10 @@ export function useComposerVoice({
     busy,
     consumePendingResponse,
     enabled: voiceConversationActive,
-    onFatalError: () => setVoiceConversationActive(false),
+    onFatalError: () => {
+      setVoiceTerminalError('failed')
+      setVoiceConversationActive(false)
+    },
     // Speaking over the model mid-generation interrupts the in-flight turn —
     // the same seam as the Stop button — so the interjection becomes the next
     // turn instead of waiting behind a reply the user already rejected.
@@ -143,7 +197,10 @@ export function useComposerVoice({
     // hands-free conversation. Flipping the flag is the authoritative off
     // switch — the enabled=false prop + effect below drive conversation.end()
     // teardown (mic close, wake re-arm).
-    onStopWord: () => setVoiceConversationActive(false),
+    onStopWord: () => {
+      boundVoiceSessionRef.current = null
+      setVoiceConversationActive(false)
+    },
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
@@ -151,6 +208,28 @@ export function useComposerVoice({
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
+
+  useEffect(() => {
+    if (target !== 'main') {
+      return
+    }
+
+    setQuickEntryVoiceProjection({
+      active: voiceConversationActive,
+      available: !disabled,
+      error: voiceTerminalError,
+      status: voiceConversationActive ? conversation.status : 'idle'
+    })
+  }, [conversation.status, disabled, target, voiceConversationActive, voiceTerminalError])
+
+  useEffect(
+    () => () => {
+      if (target === 'main') {
+        setQuickEntryVoiceProjection({ active: false, available: false, error: null, status: 'idle' })
+      }
+    },
+    [target]
+  )
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
   useEffect(() => {
@@ -181,9 +260,12 @@ export function useComposerVoice({
     }
 
     if (voiceConversationActive) {
+      boundVoiceSessionRef.current = null
       setVoiceConversationActive(false)
       void conversation.end()
     } else {
+      boundVoiceSessionRef.current = null
+      setVoiceTerminalError(null)
       setVoiceConversationActive(true)
     }
   }, [conversation, disabled, voiceConversationActive])
@@ -193,11 +275,64 @@ export function useComposerVoice({
     [target, toggleVoiceConversation]
   )
 
+  // Consume bound intents synchronously when they arrive while this controller
+  // cannot admit a start. Waiting for the next React render leaves a race where
+  // an end/identity change in the same batch can make a stale request valid.
+  // Legacy unbound wake requests intentionally retain their remount latch.
+  useEffect(
+    () =>
+      $voiceConversationStartRequest.listen(request => {
+        const admission = voiceStartAdmissionRef.current
+
+        if (
+          admission.target === 'main' &&
+          request &&
+          (admission.voiceConversationActive || (admission.disabled && request.binding))
+        ) {
+          takeVoiceConversationStart(request, admission.activeBinding ?? undefined)
+        }
+      }),
+    []
+  )
+
+  // eslint-disable-next-line no-restricted-syntax -- consumes a one-shot request into an identity guard, not mirrored reactive state
   useEffect(() => {
-    if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest) && !voiceConversationActive) {
+    if (target !== 'main' || !voiceStartRequest) {
+      return
+    }
+
+    // Bound Quick Entry intents are attempts against one exact identity. Even
+    // while disabled/already active they must be consumed now so they cannot
+    // become valid after later identity or lifecycle drift. Legacy unbound wake
+    // requests keep their historical latch-across-remount behavior.
+    if (disabled || voiceConversationActive) {
+      if (voiceConversationActive || voiceStartRequest.binding) {
+        takeVoiceConversationStart(voiceStartRequest, activeBinding ?? undefined)
+      }
+
+      return
+    }
+
+    if (takeVoiceConversationStart(voiceStartRequest, activeBinding ?? undefined)) {
+      boundVoiceSessionRef.current = voiceStartRequest?.binding ?? null
+      setVoiceTerminalError(null)
       setVoiceConversationActive(true)
     }
-  }, [disabled, target, voiceConversationActive, voiceStartRequest])
+  }, [activeBinding, disabled, target, voiceConversationActive, voiceStartRequest])
+
+  useEffect(() => {
+    const bound = boundVoiceSessionRef.current
+
+    if (!voiceConversationActive || !bound) {
+      return
+    }
+
+    if (!activeBinding || !voiceBindingMatches(bound, activeBinding)) {
+      setVoiceTerminalError('failed')
+      setVoiceConversationActive(false)
+      void conversation.end()
+    }
+  }, [activeBinding, conversation, voiceConversationActive])
 
   const resumeWakeIfPaused = useCallback(() => {
     if (!wakePausedRef.current) {
@@ -262,9 +397,14 @@ export function useComposerVoice({
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
-  const startConversation = useCallback(() => setVoiceConversationActive(true), [])
+  const startConversation = useCallback(() => {
+    boundVoiceSessionRef.current = null
+    setVoiceTerminalError(null)
+    setVoiceConversationActive(true)
+  }, [])
 
   const endConversation = useCallback(() => {
+    boundVoiceSessionRef.current = null
     setVoiceConversationActive(false)
     void conversation.end()
   }, [conversation])

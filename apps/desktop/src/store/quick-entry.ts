@@ -118,7 +118,35 @@ export const QUICK_TARGET_NEW = 'new'
  */
 export interface QuickEntryStatePush {
   connected: boolean
+  /** True only while the primary owns a live runtime for the current chat. */
+  currentVoiceTargetAvailable: boolean
   sessions: QuickEntrySessionOption[]
+  voice: QuickEntryVoiceProjection
+}
+
+export type QuickEntryVoiceStatus = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
+
+export interface QuickEntryVoiceProjection {
+  active: boolean
+  available: boolean
+  error: null | 'failed'
+  status: QuickEntryVoiceStatus
+}
+
+export const $quickEntryVoiceProjection = atom<QuickEntryVoiceProjection>({
+  active: false,
+  available: false,
+  error: null,
+  status: 'idle'
+})
+
+export function setQuickEntryVoiceProjection(projection: QuickEntryVoiceProjection): void {
+  $quickEntryVoiceProjection.set(projection)
+}
+
+/** Dedicated voice intent. Voice is never represented as an empty text submit. */
+export interface QuickEntryVoiceStartPayload {
+  target: typeof QUICK_TARGET_CURRENT
 }
 
 /** What a quick-window submit carries back to the primary renderer. */
@@ -139,6 +167,7 @@ export interface QuickEntrySubmitPayload {
 export interface QuickComposerState {
   /** Last pushed gateway truth. False (the initial value) disables submit. */
   connected: boolean
+  currentVoiceTargetAvailable: boolean
   draft: string
   /** Recent sessions the picker offers, pushed by the primary renderer. */
   sessions: QuickEntrySessionOption[]
@@ -146,6 +175,7 @@ export interface QuickComposerState {
   submitting: boolean
   /** Where a submit lands: current / new / a stored session id. */
   target: string
+  voice: QuickEntryVoiceProjection
   /** Whether the window should be visible. False asks the shell to hide. */
   visible: boolean
 }
@@ -155,13 +185,15 @@ export type QuickComposerEvent =
   | { type: 'dismiss' }
   | { type: 'edit'; draft: string }
   | { type: 'shown' }
-  | { type: 'state'; connected: boolean; sessions: QuickEntrySessionOption[] }
+  | ({ type: 'state' } & QuickEntryStatePush)
   | { type: 'submit' }
   | { type: 'target'; target: string }
+  | { type: 'voice' }
 
 export interface QuickComposerTransition {
   /** Payload to send through the real prompt-submit path, or null for none. */
   send: null | QuickEntrySubmitPayload
+  startVoice?: QuickEntryVoiceStartPayload
   state: QuickComposerState
 }
 
@@ -169,10 +201,12 @@ export const initialQuickComposerState: QuickComposerState = {
   // Disconnected until the primary renderer's first push proves otherwise — a
   // capture window that accepts text it can never deliver is a lie.
   connected: false,
+  currentVoiceTargetAvailable: false,
   draft: '',
   sessions: [],
   submitting: false,
   target: QUICK_TARGET_CURRENT,
+  voice: { active: false, available: false, error: null, status: 'idle' },
   visible: true
 }
 
@@ -215,8 +249,10 @@ export function quickComposerReducer(state: QuickComposerState, event: QuickComp
         state: {
           ...state,
           connected: event.connected,
+          currentVoiceTargetAvailable: event.currentVoiceTargetAvailable,
           sessions: event.sessions,
-          target: targetStillValid ? state.target : QUICK_TARGET_CURRENT
+          target: targetStillValid ? state.target : QUICK_TARGET_CURRENT,
+          voice: event.voice
         }
       }
     }
@@ -238,6 +274,21 @@ export function quickComposerReducer(state: QuickComposerState, event: QuickComp
 
     case 'target': {
       return { send: null, state: { ...state, target: event.target } }
+    }
+
+    case 'voice': {
+      const canStart =
+        state.target === QUICK_TARGET_CURRENT &&
+        state.connected &&
+        state.currentVoiceTargetAvailable &&
+        state.voice.available &&
+        !state.voice.active
+
+      return {
+        send: null,
+        startVoice: canStart ? { target: QUICK_TARGET_CURRENT } : undefined,
+        state
+      }
     }
 
     default: {

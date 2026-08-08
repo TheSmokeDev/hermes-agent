@@ -23,20 +23,47 @@ export const $composerTerminalSelections = atom<Record<string, string>>({})
 
 // Latched because opening a fresh session may remount the main composer before
 // it can start voice. Session-tile composers deliberately never consume this.
-export const $voiceConversationStartRequest = atom(0)
+export interface VoiceSessionBinding {
+  durableSessionId: null | string
+  profile: string
+  runtimeSessionId: string
+}
+
+export interface VoiceConversationStartRequest {
+  binding: null | VoiceSessionBinding
+  id: number
+}
+
+export const $voiceConversationStartRequest = atom<VoiceConversationStartRequest | null>(null)
 let nextVoiceStartRequest = 0
 let handledVoiceStartRequest = 0
 
-export const requestVoiceConversationStart = (): void => $voiceConversationStartRequest.set(++nextVoiceStartRequest)
+export const requestVoiceConversationStart = (binding: VoiceSessionBinding | null = null): void =>
+  $voiceConversationStartRequest.set({ binding, id: ++nextVoiceStartRequest })
 
-export const takeVoiceConversationStart = (current: number): boolean => {
-  if (current <= handledVoiceStartRequest) {
+export const takeVoiceConversationStart = (
+  current: VoiceConversationStartRequest | null,
+  activeBinding?: VoiceSessionBinding
+): boolean => {
+  if (!current || current.id <= handledVoiceStartRequest) {
     return false
   }
 
-  handledVoiceStartRequest = current
+  // Consume before validating. A stale request must never become valid later.
+  handledVoiceStartRequest = current.id
 
-  return true
+  if (!current.binding) {
+    // Legacy wake-word request: it intentionally starts a fresh, not-yet-bound
+    // session. Quick Entry always supplies a binding.
+    return true
+  }
+
+  return Boolean(
+    activeBinding &&
+    current.binding.profile === activeBinding.profile &&
+    current.binding.runtimeSessionId === activeBinding.runtimeSessionId &&
+    current.binding.durableSessionId === activeBinding.durableSessionId
+  )
 }
 
 // ---------------------------------------------------------------------------

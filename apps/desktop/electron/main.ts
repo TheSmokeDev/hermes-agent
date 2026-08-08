@@ -158,7 +158,13 @@ import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-bac
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
-import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import {
+  authorizeQuickEntryStatePush,
+  createQuickEntryShortcut,
+  quickEntryWindowBounds,
+  relayQuickEntryVoiceStart,
+  sanitizeQuickEntrySettings
+} from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
@@ -10740,14 +10746,36 @@ ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
   })
 })
 
+ipcMain.on('hermes:quick-entry:startVoice', (event, payload) => {
+  const liveQuickSender = quickEntryWindow && !quickEntryWindow.isDestroyed() ? quickEntryWindow.webContents : null
+  const primary = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null
+
+  const result = relayQuickEntryVoiceStart(event.sender, liveQuickSender, primary, payload)
+
+  if (result.dismissQuickEntry) {
+    hideQuickEntryWindow()
+  }
+})
+
 // Primary renderer → main → quick window: gateway connection state + the
 // recent-session list for the target picker. Cached so a quick window spawned
 // AFTER the last push still boots from truth instead of "disconnected".
-ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
-  quickEntryLastState = payload ?? null
+ipcMain.on('hermes:quick-entry:state', (event, payload) => {
+  const primary = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null
+  const accepted = authorizeQuickEntryStatePush(event.sender, primary, payload)
+
+  if (!accepted) {
+    return
+  }
+
+  quickEntryLastState = accepted
 
   if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
-    quickEntryWindow.webContents.send('hermes:quick-entry:state', payload)
+    try {
+      quickEntryWindow.webContents.send('hermes:quick-entry:state', accepted)
+    } catch {
+      // The HUD may be tearing down between the BrowserWindow check and send.
+    }
   }
 })
 

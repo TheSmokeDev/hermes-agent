@@ -7,7 +7,12 @@ import type {
   PetOverlayOpenRequest,
   PetOverlayStatePayload
 } from './store/pet-overlay'
-import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } from './store/quick-entry'
+import type {
+  QuickEntryStatePush,
+  QuickEntryStatus,
+  QuickEntrySubmitPayload,
+  QuickEntryVoiceStartPayload
+} from './store/quick-entry'
 
 export {}
 
@@ -76,6 +81,8 @@ declare global {
         // primary renderer, which routes it to the target session and submits
         // through the normal prompt path) and hide.
         submit: (payload: QuickEntrySubmitPayload) => void
+        /** Dedicated current-session voice intent; never an empty text submit. */
+        startVoice: (payload: QuickEntryVoiceStartPayload) => void
         // Quick window → main: hide without sending (Escape / blur).
         dismiss: () => void
         // Primary renderer → main → quick window: gateway connection state +
@@ -86,6 +93,8 @@ declare global {
         onState: (callback: (payload: QuickEntryStatePush) => void) => () => void
         // Primary renderer subscribes to submits captured by the quick window.
         onSubmit: (callback: (payload: QuickEntrySubmitPayload | string) => void) => () => void
+        // Primary renderer subscribes to voice intents captured by the quick window.
+        onVoiceStart: (callback: (payload: QuickEntryVoiceStartPayload) => void) => () => void
         // Quick window subscribes to "you were just summoned" so it can reset
         // its draft and re-focus the input on every open.
         onShown: (callback: () => void) => () => void

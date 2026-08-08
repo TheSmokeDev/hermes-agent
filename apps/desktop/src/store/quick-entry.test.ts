@@ -7,13 +7,15 @@ import {
   type QuickComposerEvent,
   quickComposerReducer,
   type QuickComposerState,
-  type QuickEntrySubmitPayload
+  type QuickEntrySubmitPayload,
+  type QuickEntryVoiceStartPayload
 } from './quick-entry'
 
 // Drive the reducer like the window does, collecting every send it asked for.
 function run(events: QuickComposerEvent[], from: QuickComposerState = initialQuickComposerState) {
   let state = from
   const sent: QuickEntrySubmitPayload[] = []
+  const voiceStarts: QuickEntryVoiceStartPayload[] = []
 
   for (const event of events) {
     const transition = quickComposerReducer(state, event)
@@ -22,19 +24,25 @@ function run(events: QuickComposerEvent[], from: QuickComposerState = initialQui
     if (transition.send !== null) {
       sent.push(transition.send)
     }
+
+    if (transition.startVoice) {
+      voiceStarts.push(transition.startVoice)
+    }
   }
 
-  return { sent, state }
+  return { sent, state, voiceStarts }
 }
 
 // Most flows only make sense once the primary renderer has reported a live
 // gateway — this is the push the quick window receives on open.
 const connect: QuickComposerEvent = {
   connected: true,
+  currentVoiceTargetAvailable: true,
   sessions: [
     { id: 's1', title: 'Fix the build' },
     { id: 's2', title: 'Research trip' }
   ],
+  voice: { active: false, available: true, error: null, status: 'idle' },
   type: 'state'
 }
 
@@ -42,12 +50,31 @@ describe('quickComposerReducer', () => {
   it('starts visible, empty, DISCONNECTED, and targeting the current chat', () => {
     expect(initialQuickComposerState).toEqual({
       connected: false,
+      currentVoiceTargetAvailable: false,
       draft: '',
       sessions: [],
       submitting: false,
       target: QUICK_TARGET_CURRENT,
+      voice: { active: false, available: false, error: null, status: 'idle' },
       visible: true
     })
+  })
+
+  it('starts current-session voice with its dedicated payload and never emits empty text', () => {
+    const { sent, voiceStarts } = run([connect, { type: 'voice' }])
+
+    expect(voiceStarts).toEqual([{ target: QUICK_TARGET_CURRENT }])
+    expect(sent).toEqual([])
+  })
+
+  it('rejects voice when disconnected, unbound, unavailable, or targeting new/stored', () => {
+    expect(run([{ type: 'voice' }]).voiceStarts).toEqual([])
+    expect(run([{ ...connect, currentVoiceTargetAvailable: false }, { type: 'voice' }]).voiceStarts).toEqual([])
+    expect(run([{ ...connect, voice: { ...connect.voice, available: false } }, { type: 'voice' }]).voiceStarts).toEqual(
+      []
+    )
+    expect(run([connect, { target: QUICK_TARGET_NEW, type: 'target' }, { type: 'voice' }]).voiceStarts).toEqual([])
+    expect(run([connect, { target: 's1', type: 'target' }, { type: 'voice' }]).voiceStarts).toEqual([])
   })
 
   it('submit sends the trimmed draft with the target, clears it, and hides', () => {
@@ -87,7 +114,13 @@ describe('quickComposerReducer', () => {
     const { sent, state } = run([
       connect,
       { draft: 'almost done', type: 'edit' },
-      { connected: false, sessions: [], type: 'state' },
+      {
+        connected: false,
+        currentVoiceTargetAvailable: false,
+        sessions: [],
+        type: 'state',
+        voice: { active: false, available: false, error: null, status: 'idle' }
+      },
       { type: 'submit' }
     ])
 
@@ -129,7 +162,13 @@ describe('quickComposerReducer', () => {
     const { state } = run([
       connect,
       { target: 's2', type: 'target' },
-      { connected: true, sessions: [{ id: 's1', title: 'Fix the build' }], type: 'state' }
+      {
+        connected: true,
+        currentVoiceTargetAvailable: true,
+        sessions: [{ id: 's1', title: 'Fix the build' }],
+        type: 'state',
+        voice: { active: false, available: true, error: null, status: 'idle' }
+      }
     ])
 
     expect(state.target).toBe(QUICK_TARGET_CURRENT)
