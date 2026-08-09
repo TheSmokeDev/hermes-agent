@@ -976,8 +976,8 @@ class PluginContext:
 
     # -- realtime voice provider registration -------------------------------
 
-    def register_realtime_voice_provider(self, provider) -> None:
-        """Register a bidirectional realtime voice backend.
+    def register_realtime_voice_provider(self, provider) -> bool:
+        """Register a bidirectional realtime voice backend and report acceptance.
 
         ``provider`` must inherit from
         :class:`agent.realtime_voice_provider.RealtimeVoiceProvider` and match
@@ -988,6 +988,10 @@ class PluginContext:
         Built-in providers always win name collisions. This keeps OpenAI
         Realtime and future first-party integrations stable while allowing
         Gemini Live and other engines to use the same extension surface.
+
+        Returns ``True`` only when the shared registry accepts this exact
+        provider; wrong types, API mismatches, and reserved-name collisions
+        return ``False`` without disabling the plugin.
         """
         from agent.realtime_voice_provider import RealtimeVoiceProvider
         from agent.realtime_voice_registry import register_provider
@@ -998,13 +1002,15 @@ class PluginContext:
                 "does not inherit from RealtimeVoiceProvider. Ignoring.",
                 self.manifest.name,
             )
-            return
-        if register_provider(provider):
+            return False
+        accepted = register_provider(provider)
+        if accepted:
             logger.info(
                 "Plugin '%s' registered realtime voice provider: %s",
                 self.manifest.name,
                 provider.name,
             )
+        return accepted
 
     # -- platform adapter registration ---------------------------------------
 
