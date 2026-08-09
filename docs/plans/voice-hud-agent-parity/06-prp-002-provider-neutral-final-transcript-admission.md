@@ -2,7 +2,7 @@
 
 > **For Hermes:** Implement task-by-task with strict RED → GREEN. This PRP received its one adversarial planning review; move further review to executable evidence and the final diff.
 
-**Status:** Reviewed; implementation-ready
+**Status:** Completed locally; no remote action authorized
 **Stack base:** `95323478b5d9cc9fe1d3db0a912466138bf47dae` (`feat/realtime-final-transcript-admission`)
 **Depends on:** PRP-001 canary `92504e2ed771cc0a91b763838070589e60da22c8`; provider API v2 in `agent/realtime_voice_provider.py`
 **Goal:** Admit one finalized operator transcript into an already-bound canonical Hermes session exactly once through a host-issued permit, without granting provider events tool, identity, session, or persistence authority.
@@ -112,14 +112,14 @@ Detailed authorization failure data remains host-side and is never exposed to th
 1. Non-`InputTranscript` events return `REJECTED` without authorizer/ingress calls.
 2. A partial input returns `IGNORED_PARTIAL` and does not reserve its final replay key.
 3. A final key is `(bound provider_session_id, event.turn_id, event.item_id)`.
-4. Under an internal async lock, every final checks closed/capacity/replay state and reserves the key **before the first await**. A duplicate with changed text or role remains duplicate.
+4. The service is owned by one controller event loop. In one synchronous pre-await section, every final checks closed/capacity/replay state and reserves the key **before the first await**. A duplicate with changed text or role remains duplicate. PRP-003 must not call one admission object concurrently from foreign threads/event loops.
 5. The replay ledger is fixed-capacity and never evicts during the provider-session lifetime. Once a new final would exceed capacity, the service latches `CAPACITY_EXHAUSTED` and rejects every unseen final for the rest of that provider session. Existing keys remain duplicates.
 6. PRP-003 SHALL preserve the same admission object/ledger across reconnect or resume of the same provider session. Only a proven terminal provider-session boundary discards it; old-generation callbacks remain closed/suppressed.
 7. Final participant input and non-string, blank, whitespace-only, or over-limit text remain terminally reserved and return `REJECTED` without authorization.
 8. Accepted text is trimmed once. `provider_data` never enters binding, utterance, permit, receipt, or status.
 9. Authorization happens only after core gates. `None`, exceptions, and cancellation are terminal for the key.
-10. A returned permit is registered as pending under the state lock before any later await. Every issued permit has exactly one terminal ownership outcome: ingress atomically consumes it, or the service performs idempotent shielded revocation.
-11. After every await, the service rechecks closed/generation state before continuing. Close linearizes closed state first, collects pending permits under lock, then revokes outside the lock.
+10. A returned permit is registered synchronously as pending before the ingress await. Every issued permit has exactly one terminal ownership outcome: ingress atomically consumes it, or the service performs idempotent shielded revocation.
+11. After authorization returns, the service rechecks closed state before continuing. Close linearizes closed state first, collects pending permits, and performs cancellation-shielded revocation. Current generation/binding validation remains host-owned and occurs atomically inside ingress submit immediately before canonical enqueue.
 12. Close racing submit is decided only by the host's shared atomic submit/revoke point. The admission service never claims completion itself.
 13. Exceptions remain visible to PRP-003, but the key stays reserved. No retry of the same provider identity can replay.
 14. Binding identifiers are nonblank, trimmed, and bounded to `MAX_IDENTIFIER_LENGTH`. Generation, replay capacity, and max transcript characters are positive non-boolean integers. Default replay capacity is 1024; default maximum transcript length is 32,768 characters.
@@ -197,16 +197,16 @@ git diff --check
 
 ## Acceptance criteria
 
-- [ ] Only a finalized operator transcript can request a host permit.
-- [ ] One provider-session/turn/item identity reaches canonical ingress at most once.
-- [ ] Replay history is retained without eviction for the live/resumed provider session; capacity exhaustion latches fail-closed.
-- [ ] Participant, partial, malformed/blank/over-limit, denied, stale/closed, cancelled, and exceptional attempts never submit.
-- [ ] Provider session identity comes only from the trusted bound host, never provider data.
-- [ ] Permit submission/revocation share a host-owned atomic linearization point; every issued permit is consumed or cancellation-safely revoked.
-- [ ] Close during authorization revokes a late permit and blocks submission; accepted canonical work survives later voice close.
-- [ ] Provider metadata never becomes identity or authority.
-- [ ] No direct tool dispatch, `run_conversation`, persistence write, gateway session creation, provider-specific behavior, or invented durable-completion receipt is introduced.
-- [ ] Focused/regression tests, Ruff, and diff checks pass with exact receipts.
+- [x] Only a finalized operator transcript can request a host permit.
+- [x] One provider-session/turn/item identity reaches canonical ingress at most once.
+- [x] Replay history is retained without eviction for the live/resumed provider session; capacity exhaustion latches fail-closed.
+- [x] Participant, partial, malformed/blank/over-limit, denied, stale/closed, cancelled, and exceptional attempts never submit.
+- [x] Provider session identity comes only from the trusted bound host, never provider data.
+- [x] Permit submission/revocation share a host-owned atomic linearization point; every issued permit is consumed or cancellation-safely revoked.
+- [x] Close during authorization revokes a late permit and blocks submission; accepted canonical work survives later voice close.
+- [x] Provider metadata never becomes identity or authority.
+- [x] No direct tool dispatch, `run_conversation`, persistence write, gateway session creation, provider-specific behavior, or invented durable-completion receipt is introduced.
+- [x] Focused/regression tests, Ruff, and diff checks pass with exact receipts.
 
 ## Adversarial planning review disposition
 
@@ -225,4 +225,39 @@ Revert the new standalone module/tests and this PRP. No migration, configuration
 
 ## Completion evidence
 
-The implementation handoff SHALL include branch/revision, changed files, every acceptance criterion mapped to a test, exact RED/GREEN/gate commands and exit codes, final security/quality review dispositions, and confirmation that no push/PR/merge occurred without separate authorization.
+### RED → GREEN receipts
+
+- Initial tracer RED: focused pytest exited `2` because `agent.realtime_voice_admission` did not exist; first GREEN was `2 passed`.
+- Subsequent discriminating REDs proved missing terminal denial replay, participant/spoof rejection, malformed text validation, binding/capacity validation, fail-closed capacity, close lifecycle, atomic close/submit behavior, repeated-cancellation cleanup, retryable revocation failure, and host-cancelled revocation handling.
+- The host-cancelled revocation RED was intentionally bounded and exited `124`; the GREEN regression passes without timeout.
+- Final focused command: `./.venv/Scripts/python.exe -m pytest tests/agent/test_realtime_voice_admission.py -q` → **39 passed**.
+- Full realtime command from Task 4 → **159 passed** (39 admission cases + 120 existing provider/orchestrator/registry).
+- Focused Ruff → `All checks passed!`.
+- `git diff --check` → exit `0`.
+- Forbidden-boundary scan for `AIAgent`, `run_conversation`, tools, gateway, `provider_data`, persistence, session-store, and turn-lease references → **0 hits**.
+- Final adversarial implementation review initially returned two blockers: truthy non-boolean `final` values and cancellation racing an issued authorization permit. Both received discriminating REDs and fixes. The bounded re-review returned **PASS** with **5 targeted cases passed** and Ruff green.
+
+### Same-session admission canary
+
+Executed `C:\Users\Degen\AppData\Local\hermes\cache\prp2-same-session-canary.py` against the isolated worktree. The canary used a real normalized `InputTranscript`, trusted immutable runtime/durable/provider binding, opaque host permit, and a fake atomic canonical ingress matching the PRP-003 host contract. Receipt:
+
+```json
+{"canary":"PASS","submitted":"submitted","duplicate":"duplicate","canonical_queue":[["durable-canary","use the authoritative same session"]],"permit_consumed":true,"permit_revoked":false,"revoke_calls_after_close":0}
+```
+
+This proves the standalone PRP-002 seam, not live gateway/provider wiring. A live gateway same-session canary is explicitly a PRP-003 acceptance gate.
+
+### PRP-003 handoff
+
+PRP-003 must:
+
+1. create one `FinalTranscriptAdmission` from trusted host-selected profile/routing/runtime/durable/provider identity;
+2. own that object on one controller event loop and preserve it across reconnect/resume of the same provider session;
+3. discard/close it only at proven terminal provider-session or binding-generation boundaries;
+4. implement `RealtimeInputAuthorizer` plus `SameSessionTurnIngress` at one host-owned lock/transaction that validates current binding, consumes one opaque permit, and enqueues through the existing canonical serialized turn path;
+5. route normalized provider events through admission without granting `provider_data`, provider tool events, or adapters direct authority;
+6. surface compact admission statuses while retaining detailed authorization failures host-side;
+7. test profile, principal, routing, runtime, durable-session, provider-session, and selection-generation drift with event barriers, plus reconnect/resume ledger retention;
+8. run a live same-session final-transcript canary proving canonical persistence/tools/approvals and no duplicate Hermes session or gateway.
+
+No push, PR, merge, installation, provider registration, gateway mutation, or persisted-session migration was performed for PRP-002.
