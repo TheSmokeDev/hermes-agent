@@ -70,6 +70,7 @@ class HostProjection:
 
 class AudioFeedResult(StrEnum):
     ACCEPTED = "accepted"
+    UNAUTHORIZED = "unauthorized"
     OVERFLOW = "overflow"
     CLOSED = "closed"
     RECONNECTING = "reconnecting"

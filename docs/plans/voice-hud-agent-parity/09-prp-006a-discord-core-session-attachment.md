@@ -124,7 +124,7 @@ Use a temporary `HERMES_HOME`, the real gateway session store, installed plugin-
 
 Prove:
 
-1. `/talk join` captures one exact Discord source/operator and existing durable session;
+1. `/talk core join` captures one exact Discord source/operator and existing durable session;
 2. one final transcript persists exactly once in that same durable session;
 3. the ordinary gateway agent path, tools/approvals policy, turn lease, response delivery, and persistence are used;
 4. no second gateway, durable session, `AIAgent`, tool registry, executor, or legacy Talk loop is constructed;
@@ -139,7 +139,7 @@ Only after Tasks 1–5 and final diff review pass:
 - install/use the isolated Agent and Talk branches locally without replacing published releases;
 - verify passive doctor/provider/Discord operator readiness without printing secrets;
 - start the existing gateway and join a controlled Discord voice channel;
-- activate `/talk join` as Smoke's immutable user ID;
+- activate `/talk core join` as Smoke's immutable user ID;
 - speak a harmless, read-only prompt first;
 - verify the exact durable session gained one user turn and canonical assistant response;
 - verify `/talk leave` returns the borrowed Discord connection and no controller/provider task remains;

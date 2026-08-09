@@ -100,6 +100,49 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
+    async def test_contextual_plugin_command_rejects_busy_without_interrupt(self, monkeypatch):
+        """`/talk core join`-shaped commands are idle-only capability capture."""
+        from gateway.run import GatewayRunner
+        import hermes_cli.plugins as plugin_registry
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="222",
+            chat_type="group",
+            user_id="111",
+            scope_id="333",
+        )
+        event = MessageEvent(
+            text="/talk core join",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="busy-core-join",
+        )
+        session_key = build_session_key(source)
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time()
+        handler = MagicMock()
+        monkeypatch.setattr(
+            plugin_registry,
+            "get_plugin_command_registration",
+            lambda command: (
+                {"handler": handler, "invocation_context": True}
+                if command == "talk"
+                else None
+            ),
+        )
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert "busy" in str(result).lower()
+        handler.assert_not_called()
+        agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
         """Rapid Telegram text follow-ups in queue mode must not merge."""
         from gateway.run import GatewayRunner

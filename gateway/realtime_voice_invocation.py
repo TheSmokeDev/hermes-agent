@@ -142,9 +142,44 @@ class RealtimeVoiceAttachmentFactory:
     def __reduce__(self):
         raise TypeError("realtime attachment factories cannot be serialized")
 
+    async def open(
+        self,
+        provider_name: str,
+        setup: object,
+        *,
+        provider_session_id: str,
+        required_capabilities: object = frozenset(),
+    ) -> object:
+        """Open one gateway-owned provider/controller attachment."""
+
+        with _state_lock:
+            record = _factory_records.get(self)
+            if record is not None:
+                if self in _consumed_factories:
+                    raise RealtimeVoiceInvocationError(
+                        "realtime attachment factory was already consumed"
+                    )
+                # Reserve before any validation or provider await.  An open
+                # attempt is the factory's single use even when setup fails.
+                _consumed_factories.add(self)
+        runner = record.runner_ref() if record is not None else None
+        if runner is None:
+            raise RealtimeVoiceInvocationError("factory is stale or was not committed")
+        from gateway.realtime_voice_messaging_host import _open_attachment
+
+        return await _open_attachment(
+            self,
+            runner,
+            provider_name,
+            setup,
+            provider_session_id=provider_session_id,
+            required_capabilities=required_capabilities,
+        )
+
 
 _invocation_states = weakref.WeakKeyDictionary()
 _factory_records = weakref.WeakKeyDictionary()
+_consumed_factories = weakref.WeakSet()
 _gateway_hosts = weakref.WeakKeyDictionary()
 
 
@@ -357,6 +392,19 @@ def _validate_realtime_voice_attachment_factory(
     ):
         raise RealtimeVoiceInvocationError("factory session identity is stale")
     return record.binding
+
+
+def _record_for_realtime_voice_attachment_factory(
+    value: object, runner: object
+) -> _FactoryRecord:
+    """Return the exact live private record after full host validation."""
+
+    _validate_realtime_voice_attachment_factory(value, runner)
+    with _state_lock:
+        record = _factory_records.get(value)
+    if record is None:
+        raise RealtimeVoiceInvocationError("factory was not issued by this host")
+    return record
 
 
 def _binding_for_realtime_voice_attachment_factory(

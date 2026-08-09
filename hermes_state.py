@@ -6862,6 +6862,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def set_message_display_kind(
+        self,
+        session_id: str,
+        message_row_id: int,
+        *,
+        display_kind: str,
+        display_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Stamp one exact active message row owned by ``session_id``."""
+        if (
+            not session_id
+            or type(message_row_id) is not int
+            or message_row_id <= 0
+            or not display_kind
+        ):
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET display_kind = ?, display_metadata = ? "
+                "WHERE id = ? AND session_id = ? AND active = 1",
+                (
+                    _scrub_surrogates(display_kind),
+                    self._encode_display_metadata(display_metadata),
+                    message_row_id,
+                    session_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
     #: Key under which message reactions live inside ``display_metadata``.
     #: Reactions share the existing per-message JSON column rather than a side
     #: table so they survive rewind/compaction row rewrites with the row itself.

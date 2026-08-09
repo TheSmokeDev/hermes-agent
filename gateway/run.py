@@ -14741,6 +14741,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        # Realtime voice turns carry an opaque host-owned claim.  Validate it
+        # before the ordinary busy path can interrupt, steer, merge, or queue.
+        # Ordinary MessageEvents have no claim and remain byte-for-byte on the
+        # existing path.
+        from gateway.realtime_voice_messaging_host import (
+            _preflight_realtime_voice_event,
+        )
+        _preflight_realtime_voice_event(self, event, _quick_key)
         _up_state = self._peek_session_state(_quick_key)
         if _up_state is not None and _up_state.persistent.update_prompt_pending:
             raw = (event.text or "").strip()
@@ -14985,6 +14993,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            # Contextual plugin commands can capture host-owned capabilities.
+            # They are deliberately idle-only: an unrecognized plugin slash
+            # command must never fall through to the ordinary text path and
+            # interrupt, steer, merge, or queue against the active turn.
+            if _evt_cmd and _cmd_def_inner is None:
+                try:
+                    from hermes_cli.plugins import get_plugin_command_registration
+
+                    _busy_plugin_registration = get_plugin_command_registration(
+                        _evt_cmd.replace("_", "-")
+                    )
+                except Exception:
+                    _busy_plugin_registration = None
+                if (
+                    _busy_plugin_registration is not None
+                    and _busy_plugin_registration.get("invocation_context") is True
+                ):
+                    return (
+                        "⏳ This session is busy with an active turn. "
+                        "Wait for it to finish, then retry the command."
+                    )
 
             # /status and /context are intentionally pre-gate so users
             # always see session state.
@@ -15962,6 +15992,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            # The canonical handler has now completed its normal persistence
+            # boundary while this routing slot and turn lease are still owned.
+            # A realtime turn may mint a completion receipt only here; matching
+            # text or a caller/provider acknowledgement is not proof.
+            from gateway.realtime_voice_messaging_host import (
+                _finalize_realtime_voice_event,
+            )
+            await _finalize_realtime_voice_event(self, event, None)
+
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -16944,6 +16983,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+
+        # Revalidate the exact captured route/session only after final session
+        # resolution and successful turn-lease acquisition.  This closes the
+        # /new, /resume, compression-rotation, and recycled-ID pre-claim window.
+        from gateway.realtime_voice_messaging_host import (
+            _validate_realtime_voice_event_after_resolution,
+        )
+        _validate_realtime_voice_event_after_resolution(self, event, session_entry)
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the
