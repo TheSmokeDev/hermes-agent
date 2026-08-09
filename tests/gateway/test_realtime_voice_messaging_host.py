@@ -101,9 +101,11 @@ def _utterance(text: str = "hello from voice") -> RealtimeUtterance:
 async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_receipt():
     from gateway.realtime_voice_messaging_host import (
         RealtimeVoiceFinalizationReceipt,
+        _commit_realtime_voice_slot_claim,
         _create_messaging_host,
         _finalize_realtime_voice_event,
         _preflight_realtime_voice_event,
+        _prepare_realtime_voice_slot_claim,
         _validate_realtime_voice_event_after_resolution,
     )
 
@@ -148,6 +150,8 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
     async def canonical(event: MessageEvent):
         seen.append(event)
         assert _preflight_realtime_voice_event(runner, event, route)
+        slot_claim = _prepare_realtime_voice_slot_claim(runner, event, route)
+        _commit_realtime_voice_slot_claim(runner, event, route, slot_claim)
         assert _validate_realtime_voice_event_after_resolution(runner, event, entry)
         rows.extend(completed_rows)
         await _finalize_realtime_voice_event(runner, event, entry.session_id)
@@ -191,8 +195,10 @@ async def test_field_equivalent_resolved_entry_is_rejected_before_canonical_work
     from dataclasses import replace
 
     from gateway.realtime_voice_messaging_host import (
+        _commit_realtime_voice_slot_claim,
         _create_messaging_host,
         _preflight_realtime_voice_event,
+        _prepare_realtime_voice_slot_claim,
         _validate_realtime_voice_event_after_resolution,
     )
 
@@ -205,6 +211,8 @@ async def test_field_equivalent_resolved_entry_is_rejected_before_canonical_work
 
     async def canonical(event: MessageEvent):
         assert _preflight_realtime_voice_event(runner, event, route)
+        slot_claim = _prepare_realtime_voice_slot_claim(runner, event, route)
+        _commit_realtime_voice_slot_claim(runner, event, route, slot_claim)
         copied_entry = replace(entry)
         assert copied_entry is not entry
         assert copied_entry == entry
@@ -223,8 +231,10 @@ async def test_field_equivalent_resolved_entry_is_rejected_before_canonical_work
 @pytest.mark.asyncio
 async def test_legitimate_event_rewrite_preserves_and_revalidates_exact_claim():
     from gateway.realtime_voice_messaging_host import (
+        _commit_realtime_voice_slot_claim,
         _create_messaging_host,
         _preflight_realtime_voice_event,
+        _prepare_realtime_voice_slot_claim,
         _rewrite_realtime_voice_event,
         _validate_realtime_voice_event_after_resolution,
     )
@@ -241,6 +251,8 @@ async def test_legitimate_event_rewrite_preserves_and_revalidates_exact_claim():
         rewritten = _rewrite_realtime_voice_event(runner, event, "rewritten voice")
         seen.append(rewritten)
         assert _preflight_realtime_voice_event(runner, rewritten, route)
+        slot_claim = _prepare_realtime_voice_slot_claim(runner, rewritten, route)
+        _commit_realtime_voice_slot_claim(runner, rewritten, route, slot_claim)
         assert _validate_realtime_voice_event_after_resolution(runner, rewritten, entry)
         raise RuntimeError("bounded stop after claim validation")
 
@@ -337,9 +349,11 @@ async def test_provider_transcript_cannot_become_gateway_control_input():
 @pytest.mark.asyncio
 async def test_accepted_canonical_work_survives_submit_waiter_cancellation():
     from gateway.realtime_voice_messaging_host import (
+        _commit_realtime_voice_slot_claim,
         _create_messaging_host,
         _finalize_realtime_voice_event,
         _preflight_realtime_voice_event,
+        _prepare_realtime_voice_slot_claim,
         _validate_realtime_voice_event_after_resolution,
     )
 
@@ -373,6 +387,8 @@ async def test_accepted_canonical_work_survives_submit_waiter_cancellation():
         started.set()
         await release.wait()
         assert _preflight_realtime_voice_event(runner, event, route)
+        slot_claim = _prepare_realtime_voice_slot_claim(runner, event, route)
+        _commit_realtime_voice_slot_claim(runner, event, route, slot_claim)
         assert _validate_realtime_voice_event_after_resolution(runner, event, entry)
         rows.extend(completed_rows)
         await _finalize_realtime_voice_event(runner, event, entry.session_id)

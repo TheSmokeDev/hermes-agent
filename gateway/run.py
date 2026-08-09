@@ -15956,6 +15956,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
+        from gateway.realtime_voice_messaging_host import (
+            _commit_realtime_voice_slot_claim,
+            _prepare_realtime_voice_slot_claim,
+        )
+        _realtime_slot_claim = _prepare_realtime_voice_slot_claim(
+            self, event, _quick_key
+        )
         _active_session_lease, _limit_message = self._claim_active_session_slot(
             _quick_key,
             source,
@@ -15971,6 +15978,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
+        try:
+            _commit_realtime_voice_slot_claim(
+                self, event, _quick_key, _realtime_slot_claim
+            )
+        except BaseException:
+            # Commit can fail only if the opaque event claim was synchronously
+            # corrupted inside this no-await claim window. Roll back the
+            # sentinel and any cross-process lease before propagating.
+            if _claim_state.turn.agent is _AGENT_PENDING_SENTINEL:
+                self._release_running_agent_state(_quick_key)
+            raise
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 

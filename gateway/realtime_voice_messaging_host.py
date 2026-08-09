@@ -53,6 +53,7 @@ class _CanonicalClaim:
     turn_marker: str
     captured_entry: object
     preflighted: bool = False
+    slot_claimed: bool = False
     resolved: bool = False
     receipt: RealtimeVoiceFinalizationReceipt | None = None
 
@@ -459,14 +460,62 @@ def _preflight_realtime_voice_event(
     return True
 
 
+def _prepare_realtime_voice_slot_claim(
+    runner: object, event: object, routing_key: str
+) -> _CanonicalClaim | None:
+    """Validate idle-only authority at the actual routing-slot boundary."""
+
+    claim = _claim_for(runner, event)
+    if claim is None:
+        return None
+    if not claim.preflighted:
+        raise RealtimeVoiceIngressError("realtime event bypassed canonical preflight")
+    if claim.binding.routing_key != routing_key:
+        raise RealtimeVoiceIngressError(
+            "realtime route changed before canonical slot claim"
+        )
+    if claim.slot_claimed:
+        raise RealtimeVoiceIngressError("canonical realtime claim was already used")
+    is_running = getattr(runner, "_is_session_running", None)
+    if callable(is_running) and is_running(routing_key):
+        raise RealtimeVoiceIngressError("canonical realtime route is busy")
+    return claim
+
+
+def _commit_realtime_voice_slot_claim(
+    runner: object,
+    event: object,
+    routing_key: str,
+    claim: _CanonicalClaim | None,
+) -> None:
+    """Commit the exact prepared claim without yielding or host callbacks."""
+
+    if claim is None:
+        return
+    if (
+        type(claim) is not _CanonicalClaim
+        or getattr(event, _CLAIM_ATTR, None) is not claim
+        or claim.host._runner_ref() is not runner
+        or claim.binding.routing_key != routing_key
+        or not claim.preflighted
+        or claim.slot_claimed
+    ):
+        raise RealtimeVoiceIngressError(
+            "canonical realtime slot claim changed before commit"
+        )
+    claim.slot_claimed = True
+
+
 def _validate_realtime_voice_event_after_resolution(
     runner: object, event: object, session_entry: object
 ) -> bool:
     claim = _claim_for(runner, event)
     if claim is None:
         return False
-    if not claim.preflighted:
-        raise RealtimeVoiceIngressError("realtime event bypassed canonical preflight")
+    if not claim.preflighted or not claim.slot_claimed:
+        raise RealtimeVoiceIngressError(
+            "realtime event bypassed canonical routing-slot claim"
+        )
     if session_entry is not claim.captured_entry:
         raise RealtimeVoiceIngressError(
             "resolved session is not the exact captured session entry"
