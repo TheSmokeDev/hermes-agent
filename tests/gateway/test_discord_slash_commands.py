@@ -687,6 +687,60 @@ async def test_native_slash_guild_event_can_capture_contextual_attachment(
     assert binding.chat_type == expected_type
 
 
+class _CoerciveGuildId:
+    def __str__(self):
+        return "456"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "guild_id",
+    [True, 456.0, "456", _CoerciveGuildId()],
+    ids=["bool", "float", "string", "coercive-str-object"],
+)
+@pytest.mark.parametrize(
+    "channel",
+    [_FakeTextChannel(channel_id=123), _FakeThreadChannel(channel_id=555)],
+    ids=["group", "thread"],
+)
+async def test_native_slash_rejects_coercive_guild_ids_before_session_lookup(
+    adapter, channel, guild_id
+):
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _invoke_plugin_command_with_context,
+    )
+    from gateway.session import build_session_key
+
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=channel.id,
+        guild_id=guild_id,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+    )
+    event = adapter._build_slash_event(interaction, "/talk join")
+    assert event.source.guild_id is None
+    assert event.source.scope_id is None
+    runner = _slash_invocation_runner(event.source)
+    issued = []
+
+    with pytest.raises(RealtimeVoiceInvocationError):
+        await _invoke_plugin_command_with_context(
+            runner=runner,
+            handler=lambda _args, invocation: issued.append(
+                invocation.capture_realtime_voice_attachment_factory()
+            ),
+            raw_args="join",
+            source=event.source,
+            routing_key=build_session_key(event.source),
+            authenticated=True,
+            internal=False,
+        )
+
+    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
+    assert issued == []
+
+
 @pytest.mark.asyncio
 async def test_native_slash_dm_remains_unscoped_and_cannot_capture_attachment(adapter):
     from gateway.realtime_voice_invocation import (
