@@ -2,7 +2,7 @@
 
 > **For Hermes:** implement with strict RED → GREEN in this isolated worktree. Keep the controller provider-neutral and keep canonical agent authority in the owning host.
 
-**Status:** Implementation-ready — one adversarial review returned three blockers; the concrete TUI host seam, interrupt admission barrier, and attachment/transport-generation reconnect model below incorporate them.
+**Status:** Implementation in progress — one adversarial review returned three blockers; the concrete TUI host seam, interrupt admission barrier, and attachment/transport-generation reconnect model below incorporate them. Integration RED found one additional TOCTOU boundary: `prompt.submit` must validate the opaque attachment proof inside its existing `history_lock` claim.
 
 **Goal:** Add one backend-owned realtime voice controller that opens and supervises a registered provider session, admits only authorized final operator transcripts through PRP-002, and schedules them onto the owning Hermes session's existing canonical turn path.
 
@@ -32,19 +32,22 @@ Production:
 
 - Create `gateway/realtime_voice_controller.py`.
 - Create `tui_gateway/realtime_voice_host.py` as the one concrete canonical-host bridge.
+- Modify `tui_gateway/methods_prompt.py` only to validate an opaque in-process realtime attachment proof inside the existing `prompt.submit` history-lock claim.
+- Modify only the existing TUI busy-submit helper in `tui_gateway/server.py` to apply the same proof at its actual queue-insertion lock; no other server behavior changes.
 - Modify `agent/realtime_voice_orchestrator.py` only if required to expose one provider-resolution/open primitive reused by both `run()` and the controller.
 
 Tests:
 
 - Create `tests/gateway/test_realtime_voice_controller.py`.
 - Create `tests/tui_gateway/test_realtime_voice_host.py`.
+- Create `tests/tui_gateway/test_realtime_voice_host_integration.py` for the installed-handler proof.
 - Modify `tests/agent/test_realtime_voice_orchestrator.py` only with the matching shared-open contract tests.
 
 Evidence:
 
 - This PRP.
 
-No renderer/Electron RPC, Talk code, provider adapter, setup/config UI, persistence schema, messaging `gateway/run.py` edit, tool executor, model tool schema, or audio-device implementation is in scope. The TUI bridge calls existing installed server handlers; it does not copy `prompt.submit` or `session.interrupt` logic.
+No renderer/Electron RPC, Talk code, provider adapter, setup/config UI, persistence schema, messaging `gateway/run.py` edit, tool executor, model tool schema, or audio-device implementation is in scope. The TUI bridge calls existing installed server handlers; it does not copy `prompt.submit` or `session.interrupt` logic. Ordinary text submissions remain byte-for-byte behaviorally unchanged when the private proof parameter is absent.
 
 ## Trusted contracts
 
@@ -65,7 +68,8 @@ Every permit operation re-reads `server._sessions[runtime_sid]` under its `histo
 
 - `authorize()` validates the exact captured TUI session/transport/principal and requested binding, creates a private identity-keyed permit, and binds it to the exact immutable binding and utterance.
 - `revoke()` removes that exact permit under the same lock; repeated/unknown permits are harmless no-ops.
-- `submit()` under the same lock revalidates the exact TUI attachment, validates exact permit object/binding/utterance ownership, consumes the permit terminally, and synchronously invokes the existing `prompt.submit` handler with the captured runtime SID, transcript text, and `queued=True` before releasing the lock.
+- `submit()` under the same lock revalidates the exact TUI attachment, validates exact permit object/binding/utterance ownership, consumes the permit terminally, and synchronously invokes the existing `prompt.submit` handler with the captured runtime SID, transcript text, `queued=True`, and the host-owned opaque attachment capability before releasing the lock.
+- `prompt.submit` recognizes that private in-process parameter only by object identity. Inside the same existing `history_lock` section that claims or queues work, it requires the selected runtime record's namespaced attachment to own that capability and revalidates durable key, profile, transport, routing key, provider-session identity, and selection generation. A serialized external value cannot satisfy identity. Missing proof preserves the ordinary text path unchanged.
 - A receipt is returned only when `prompt.submit` positively reports a streaming or queued claim. Any RPC error, missing/changed session, capacity rejection, or ambiguous result fails visibly; it is never converted into acceptance.
 - Binding drift, wrong host, wrong utterance, reused permit, enqueue exception, cancellation, and close fail closed. A consumed permit never reappears.
 - Once `prompt.submit` returns a positive claim, accepted canonical work is no longer controller-owned and survives controller close.
@@ -97,11 +101,15 @@ Rules:
 - Only `InputTranscript` reaches `FinalTranscriptAdmission`; all other normalized events are projected but cannot authorize or execute work.
 - `ToolCall` and `ToolCallCancelled` are diagnostic/provisional in this slice and never dispatch tools or send fabricated results.
 - Final transcript `SUBMITTED` moves through queued/thinking based on host receipt/projections, not provider acknowledgements. `agent.completed` is not emitted until the canonical host reports finalization.
+- Canonical lifecycle projections are production-owned: actual TUI turn start emits `thinking`, tool start emits `acting`, first streamed/TTS output emits `speaking`, and the terminal TUI path emits `completed` or `failed`. No public caller may manufacture these transitions.
+- `completed` requires an opaque host-minted consume-once receipt produced only after the live agent's `SessionDB` is read back and contains the exact host-generated accepted-turn ID persisted atomically through the installed idle-claim or busy-queue path on that canonical user row, followed by the expected final assistant response; tool messages may occur between them. Matching text, an older/intervening identical exchange, a missing append, or mismatched durable evidence becomes `failed`. Agent-build failure, cancellation before agent start, context preprocessing rejection, queued-generation invalidation, returned errors, and thrown exceptions all emit the same production-owned `failed` terminal projection and release the pending turn ID before another authorization.
 - `feed_audio()` copies bytes into a bounded queue with a non-blocking admission decision. Overflow emits visible failure/backpressure and drops the rejected chunk; provider event consumption remains live.
 - Queue bounds and identifier/text bounds are positive finite construction inputs with safe defaults.
+- Audio, replay, transcript, interruption, and resume bounds are validated before provider allocation; invalid construction cannot leak an opened session.
 - Attachment identity and provider transport generation are distinct. The immutable attachment/provider-session binding owns the admission ledger; each event-pump start captures a monotonic transport generation and stale-generation callbacks are discarded.
 - A `SessionFailure` is recoverable only when the retained session advertises `SESSION_RESUMPTION` and a normalized `SessionReady.session_id` transport-resume token was observed. The controller enters `reconnecting`, keeps the same provider object/admission ledger, and accepts only explicit bounded `resume()`.
 - `resume()` invokes `session.resume_session()` on the retained provider object, increments transport generation, and starts a fresh fenced event pump. Resume failure, timeout, `SessionClosed`, stream exhaustion without a recoverable failure, or a new authoritative provider-session identity is terminal and destroys the old admission ledger. Opening a replacement provider object requires a new controller attachment.
+- Close wins every resume race: after native resume returns, the controller rechecks terminal ownership before publishing a generation or starting workers, so `closed` can never transition back to `connecting`. Resume ownership is serialized across precondition validation, shielded retained-pump joining, native resume, generation publication, and worker creation; concurrent duplicate callers cannot create overlapping pumps or consume provider events/audio out of order, and cancellation of a waiter cannot cancel the shared retained pump or poison a later retry.
 - Binding drift stops new admission immediately, revokes owned permits, and closes the attachment. It never retargets the controller.
 
 ## Interrupt and teardown
@@ -109,6 +117,8 @@ Rules:
 - Controller event admission and `interrupt()` share one admission barrier plus a synchronous interrupt-generation fence. `interrupt()` marks the fence before its first await, acquires the barrier, stops/truncates provider output when supported, invokes host `interrupt_and_wait(binding)`, and holds the barrier until the exact TUI turn reports `running=False` or the bounded wait fails.
 - A final transcript already linearized before the fence remains the prior accepted turn. A final arriving after the fence waits at the barrier and cannot authorize or enqueue before release. Add a controlled event-barrier test proving no permit or `prompt.submit` call occurs while host release is blocked.
 - Replacement speech becomes a new serialized turn only after that release; TUI `prompt.submit` locking/queueing remains the final backstop.
+- Private realtime `prompt.submit` requests bypass ordinary typed-stop/interrupted/session-slot side effects. The TUI `_sessions_lock` remains held across registry re-read, attachment validation, and the actual busy enqueue or idle claim under `history_lock`, so a removed/replaced runtime record cannot be mutated after lookup.
+- PRP-003 rejects process-isolated compute-host sessions before attachment/acceptance because that path does not yet carry the exact in-process marker and lifecycle authority. If isolation activates after queueing or queue generation drifts before dispatch, the real drain emits terminal `failed` and releases the accepted marker.
 - `close()` first closes admission, then stops accepting audio/events, resolves worker/event tasks without self-await, closes the provider session idempotently, and emits one terminal event.
 - Caller cancellation cannot orphan the provider session, event pump, queued audio, or unconsumed permit. Cleanup failures remain visible and retryable.
 - `SessionClosed`, terminal stream exhaustion/failure, explicit close, repeated close, close-from-event-pump, and cancellation races converge on the same close ownership. A recoverable resumable `SessionFailure` remains nonterminal in `reconnecting` as defined above.
@@ -157,16 +167,17 @@ Use a fake API-v2 provider, real `TuiRealtimeTurnHost`, installed TUI handlers, 
 4. accepted work survives controller close;
 5. no second Hermes runtime, durable session, gateway, or tool executor is created.
 
-The canary must inspect the same runtime SID and stored/durable key before and after, observe canonical completion/persistence, and prove no second TUI/gateway process or session record. A fake callback or bare list is not deployment proof.
+The canary must inspect the same runtime SID and stored/durable key before and after, run the installed `_run_prompt_submit` turn path, persist with the real `AIAgent._persist_session` implementation into a temporary real `SessionDB`, read those rows back, and observe the production-generated opaque completion receipt. A second mode closes the controller after positive canonical acceptance but before the deliberately blocked turn persists, then proves the turn still completes durably. Explicit constructor/factory traps plus stable registry and exact-agent assertions prove no second TUI/gateway process, session record, agent, or tool executor. A fake callback, caller-minted completion, or bare list is not deployment proof.
 
 ## Verification commands
 
 ```bash
 python -m pytest tests/gateway/test_realtime_voice_controller.py -q
 python -m pytest tests/tui_gateway/test_realtime_voice_host.py -q
+python -m pytest tests/tui_gateway/test_realtime_voice_host_integration.py -q
 python -m pytest tests/agent/test_realtime_voice_orchestrator.py tests/agent/test_realtime_voice_admission.py tests/agent/test_realtime_voice_provider.py tests/agent/test_realtime_voice_registry.py -q
 python -m pytest tests/gateway/test_turn_lease.py tests/gateway/test_realtime_voice_controller.py -q
-ruff check gateway/realtime_voice_controller.py tui_gateway/realtime_voice_host.py agent/realtime_voice_orchestrator.py tests/gateway/test_realtime_voice_controller.py tests/tui_gateway/test_realtime_voice_host.py tests/agent/test_realtime_voice_orchestrator.py
+ruff check gateway/realtime_voice_controller.py tui_gateway/realtime_voice_host.py tui_gateway/methods_prompt.py agent/realtime_voice_orchestrator.py tests/gateway/test_realtime_voice_controller.py tests/tui_gateway/test_realtime_voice_host.py tests/tui_gateway/test_realtime_voice_host_integration.py tests/agent/test_realtime_voice_orchestrator.py
 git diff --check
 ```
 

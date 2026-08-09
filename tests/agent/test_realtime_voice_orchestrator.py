@@ -4,7 +4,10 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from agent.realtime_voice_orchestrator import RealtimeVoiceOrchestrator
+from agent.realtime_voice_orchestrator import (
+    RealtimeVoiceOrchestrator,
+    open_realtime_voice_session,
+)
 from agent.realtime_voice_provider import (
     RealtimeCapability,
     RealtimeToolResult,
@@ -44,13 +47,17 @@ class _Session(RealtimeVoiceSession):
 
 
 class _Provider(RealtimeVoiceProvider):
-    def __init__(self, session: _Session) -> None:
+    def __init__(self, session: _Session, *, available: bool = True) -> None:
         self._session = session
+        self._available = available
         self.opened_setups: list[RealtimeVoiceSetup] = []
 
     @property
     def name(self) -> str:
         return "fake"
+
+    def is_available(self) -> bool:
+        return self._available
 
     async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
         self.opened_setups.append(setup)
@@ -102,4 +109,16 @@ async def test_missing_required_capability_fails_before_session_open() -> None:
         )
 
     assert exc_info.value.capability is RealtimeCapability.TOOL_CALLING
+    assert provider.opened_setups == []
+
+
+@pytest.mark.asyncio
+async def test_shared_open_rejects_unavailable_provider_before_open() -> None:
+    session = _Session(())
+    provider = _Provider(session, available=False)
+    assert register_provider(provider)
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await open_realtime_voice_session("fake", RealtimeVoiceSetup())
+
     assert provider.opened_setups == []

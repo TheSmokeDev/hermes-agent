@@ -7,6 +7,7 @@ from typing import Protocol
 from agent.realtime_voice_provider import (
     RealtimeCapability,
     RealtimeVoiceEvent,
+    RealtimeVoiceSession,
     RealtimeVoiceSetup,
     UnsupportedRealtimeCapability,
 )
@@ -18,6 +19,26 @@ class RealtimeVoiceHost(Protocol):
 
     async def handle_realtime_event(self, event: RealtimeVoiceEvent) -> None:
         """Handle one normalized event without transferring host authority."""
+
+
+async def open_realtime_voice_session(
+    provider_name: str,
+    setup: RealtimeVoiceSetup,
+    *,
+    required_capabilities: frozenset[RealtimeCapability] = frozenset(),
+) -> RealtimeVoiceSession:
+    """Resolve, validate, and open one registered realtime provider session."""
+    provider = get_provider(provider_name)
+    if provider is None:
+        raise ValueError(f"unknown realtime voice provider: {provider_name}")
+    missing_capabilities = required_capabilities - provider.capabilities
+    if missing_capabilities:
+        raise UnsupportedRealtimeCapability(
+            min(missing_capabilities, key=lambda capability: capability.value)
+        )
+    if not provider.is_available():
+        raise RuntimeError(f"realtime voice provider is unavailable: {provider_name}")
+    return await provider.open_session(setup)
 
 
 class RealtimeVoiceOrchestrator:
@@ -33,19 +54,18 @@ class RealtimeVoiceOrchestrator:
         *,
         required_capabilities: frozenset[RealtimeCapability] = frozenset(),
     ) -> None:
-        provider = get_provider(provider_name)
-        if provider is None:
-            raise ValueError(f"unknown realtime voice provider: {provider_name}")
-        missing_capabilities = required_capabilities - provider.capabilities
-        if missing_capabilities:
-            raise UnsupportedRealtimeCapability(
-                min(missing_capabilities, key=lambda capability: capability.value)
-            )
-
-        session = await provider.open_session(setup)
+        session = await open_realtime_voice_session(
+            provider_name,
+            setup,
+            required_capabilities=required_capabilities,
+        )
         async with session:
             async for event in session.events():
                 await self._host.handle_realtime_event(event)
 
 
-__all__ = ["RealtimeVoiceHost", "RealtimeVoiceOrchestrator"]
+__all__ = [
+    "RealtimeVoiceHost",
+    "RealtimeVoiceOrchestrator",
+    "open_realtime_voice_session",
+]

@@ -5396,6 +5396,12 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
+        from gateway.realtime_voice_controller import HostProjectionStatus
+        from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+        notify_realtime_turn(
+            session, HostProjectionStatus.ACTING, detail="canonical tool started"
+        )
         try:
             from agent.display import capture_local_edit_snapshot
 
@@ -7429,6 +7435,8 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    display_kind: str | None = None,
+    display_metadata: dict | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7441,6 +7449,9 @@ def _enqueue_prompt(
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
+    if display_kind:
+        queued["display_kind"] = display_kind
+        queued["display_metadata"] = dict(display_metadata or {})
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -7450,6 +7461,8 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and not existing.get("display_kind")
+        and not display_kind
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -7496,8 +7509,36 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
+def _realtime_attachment_error(
+    rid,
+    sid: str,
+    session: dict,
+    proof: object | None,
+    turn_id: object | None,
+    required: bool,
+) -> dict | None:
+    if not required:
+        return None
+    from tui_gateway.realtime_voice_host import validate_realtime_prompt_attachment
+
+    if _sessions.get(sid) is session and validate_realtime_prompt_attachment(
+        session, proof, turn_id
+    ):
+        return None
+    return _err(rid, 4013, "realtime attachment changed")
+
+
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    *,
+    realtime_attachment_proof: object | None = None,
+    realtime_turn_id: object | None = None,
+    require_realtime_attachment: bool = False,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7520,12 +7561,22 @@ def _handle_busy_submit(
     """
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
-    with session["history_lock"]:
+    with _sessions_lock, session["history_lock"]:
+        if attachment_error := _realtime_attachment_error(
+            rid, sid, session, realtime_attachment_proof, realtime_turn_id,
+            require_realtime_attachment
+        ):
+            return attachment_error
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
-    with session["history_lock"]:
+    with _sessions_lock, session["history_lock"]:
+        if attachment_error := _realtime_attachment_error(
+            rid, sid, session, realtime_attachment_proof, realtime_turn_id,
+            require_realtime_attachment
+        ):
+            return attachment_error
         if not session.get("running"):
             return None
         image_paths = list(session.get("attached_images", []))
@@ -7565,12 +7616,26 @@ def _handle_busy_submit(
     # Queue before asking the live turn to stop. In particular, never call a
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
-    with session["history_lock"]:
+    with _sessions_lock, session["history_lock"]:
+        if attachment_error := _realtime_attachment_error(
+            rid, sid, session, realtime_attachment_proof, realtime_turn_id,
+            require_realtime_attachment
+        ):
+            return attachment_error
         if not session.get("running"):
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            display_kind="realtime_voice" if require_realtime_attachment else None,
+            display_metadata=(
+                {"turn_id": realtime_turn_id} if require_realtime_attachment else None
+            ),
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7600,10 +7665,34 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
+    queue_generation_invalid = False
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             session["running"] = False
-            return True
+            queue_generation_invalid = True
+    if queue_generation_invalid:
+        from gateway.realtime_voice_controller import HostProjectionStatus
+        from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+        notify_realtime_turn(
+            session,
+            HostProjectionStatus.FAILED,
+            detail="canonical queued envelope invalidated before dispatch",
+        )
+        return True
+    if use_compute_host and queued.get("display_kind") == "realtime_voice":
+        with session["history_lock"]:
+            session["running"] = False
+        from gateway.realtime_voice_controller import HostProjectionStatus
+        from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+        notify_realtime_turn(
+            session,
+            HostProjectionStatus.FAILED,
+            detail="realtime canonical work cannot enter the compute host",
+            allow_host_drift=True,
+        )
+        return True
     dispatch_failed = False
     try:
         if use_compute_host:
@@ -7628,23 +7717,21 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
         else:
+            run_kwargs: dict[str, Any] = {
+                "queued_prompt_generation": queue_generation,
+            }
             if queued.get("image_paths"):
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    image_paths=queued["image_paths"],
-                    queued_prompt_generation=queue_generation,
-                )
-            else:
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    queued["text"],
-                    queued_prompt_generation=queue_generation,
-                )
+                run_kwargs["image_paths"] = queued["image_paths"]
+            if queued.get("display_kind"):
+                run_kwargs["display_kind"] = queued["display_kind"]
+                run_kwargs["display_metadata"] = queued.get("display_metadata")
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                **run_kwargs,
+            )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -9488,30 +9575,48 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
 ) -> None:
+    queued_generation_invalid = False
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
-            return
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
+            queued_generation_invalid = True
         else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        agent = session["agent"]
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            agent = session["agent"]
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    agent.clear_interrupt()
+                except Exception:
+                    pass
+    if queued_generation_invalid:
+        from gateway.realtime_voice_controller import HostProjectionStatus
+        from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+        notify_realtime_turn(
+            session,
+            HostProjectionStatus.FAILED,
+            detail="canonical queued turn generation changed before start",
+        )
+        return
     _emit("message.start", sid)
+    from gateway.realtime_voice_controller import HostProjectionStatus
+    from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+    notify_realtime_turn(
+        session, HostProjectionStatus.THINKING, detail="canonical turn started"
+    )
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
@@ -9618,6 +9723,11 @@ def _run_prompt_submit(
                             "message": "\n".join(ctx.warnings)
                             or "Context injection refused."
                         },
+                    )
+                    notify_realtime_turn(
+                        session,
+                        HostProjectionStatus.FAILED,
+                        detail="canonical context preprocessing rejected the turn",
                     )
                     return
                 prompt = ctx.message
@@ -9746,6 +9856,11 @@ def _run_prompt_submit(
                     run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
             def _stream(delta):
+                notify_realtime_turn(
+                    session,
+                    HostProjectionStatus.SPEAKING,
+                    detail="canonical assistant output started",
+                )
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
                 payload = {"text": delta}
@@ -10136,6 +10251,11 @@ def _run_prompt_submit(
             ):
                 try:
                     spoken = raw
+                    notify_realtime_turn(
+                        session,
+                        HostProjectionStatus.SPEAKING,
+                        detail="canonical TTS output started",
+                    )
                     # Barge-aware: spoken interruptions must cut this
                     # fallback playback too, not just the streaming path.
                     threading.Thread(
@@ -10145,6 +10265,21 @@ def _run_prompt_submit(
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
+            if status == "complete":
+                notify_realtime_turn(
+                    session,
+                    HostProjectionStatus.COMPLETED,
+                    detail="canonical turn durably persisted",
+                    agent=agent,
+                    expected_user=run_kwargs.get("persist_user_message"),
+                    expected_assistant=raw,
+                )
+            else:
+                notify_realtime_turn(
+                    session,
+                    HostProjectionStatus.FAILED,
+                    detail=f"canonical turn ended with status {status}",
+                )
         except Exception as e:
             import traceback
 
@@ -10168,6 +10303,11 @@ def _run_prompt_submit(
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            notify_realtime_turn(
+                session,
+                HostProjectionStatus.FAILED,
+                detail=f"canonical turn failed: {type(e).__name__}",
+            )
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining

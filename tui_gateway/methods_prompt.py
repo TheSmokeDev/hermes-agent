@@ -71,6 +71,10 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    require_realtime_attachment = "_trusted_realtime_attachment" in params
+    realtime_attachment_proof = params.get("_trusted_realtime_attachment")
+    realtime_turn_id = params.get("_trusted_realtime_turn_id")
+
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -78,7 +82,11 @@ def _(rid, params: dict) -> dict:
     # being ON: typed "stop" outside a voice chat is a normal message.
     # (The desktop's voice conversation is renderer-owned and never flips
     # the backend flag, so it handles its own typed stop client-side.)
-    if isinstance(text, str) and _voice_mode_enabled():
+    if (
+        not require_realtime_attachment
+        and isinstance(text, str)
+        and _voice_mode_enabled()
+    ):
         try:
             from tools.voice_mode import is_voice_stop_phrase
 
@@ -102,7 +110,7 @@ def _(rid, params: dict) -> dict:
             logger.info("prompt.submit: typed stop phrase — voice chat ended")
             return _ok(rid, {"voice_stopped": True})
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-    if params.get("interrupted"):
+    if params.get("interrupted") and not require_realtime_attachment:
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
         # so this turn's model message carries the interruption note.
         from tools.tts_streaming import mark_speech_interrupted
@@ -111,7 +119,10 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+    if (
+        not require_realtime_attachment
+        and (limit_message := _ensure_active_session_slot(sid, session)) is not None
+    ):
         return _err(rid, 4090, limit_message)
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
@@ -126,22 +137,35 @@ def _(rid, params: dict) -> dict:
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
+    if (t := current_transport()) is not None and not require_realtime_attachment:
         session["transport"] = t
     while True:
         busy_transport = None
-        with session["history_lock"]:
-            if session.get("running"):
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
-                busy_transport = t or session.get("transport")
-            else:
-                break
+        with _sessions_lock:
+            with session["history_lock"]:
+                if attachment_error := _realtime_attachment_error(
+                    rid,
+                    sid,
+                    session,
+                    realtime_attachment_proof,
+                    realtime_turn_id,
+                    require_realtime_attachment,
+                ):
+                    return attachment_error
+                if session.get("running"):
+                    # Don't reject a mid-turn prompt — queue it (and, by default,
+                    # interrupt the live turn) so it runs as the next turn. The
+                    # provider interrupt itself must happen after this lock is
+                    # released: a non-interruptible tool may keep it waiting.
+                    busy_transport = t or session.get("transport")
+                else:
+                    break
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            realtime_attachment_proof=realtime_attachment_proof,
+            realtime_turn_id=realtime_turn_id,
+            require_realtime_attachment=require_realtime_attachment,
         )
         if busy_response is not None:
             return busy_response
@@ -149,7 +173,16 @@ def _(rid, params: dict) -> dict:
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
 
-    with session["history_lock"]:
+    with _sessions_lock, session["history_lock"]:
+        if attachment_error := _realtime_attachment_error(
+            rid,
+            sid,
+            session,
+            realtime_attachment_proof,
+            realtime_turn_id,
+            require_realtime_attachment,
+        ):
+            return attachment_error
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -335,29 +368,55 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+            from gateway.realtime_voice_controller import HostProjectionStatus
+            from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+            notify_realtime_turn(
+                session,
+                HostProjectionStatus.FAILED,
+                detail="canonical agent initialization failed",
+            )
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
+        cancelled_before_run = False
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
-                # Surface the cancellation to the client. Without this emit the
-                # turn vanishes silently — the Desktop sees `prompt.submit`
-                # return `{"status": "streaming"}` but never receives a
-                # `message.start` or `error` event, so the composer shows no
-                # feedback (issue #63078 server-side half). Match the
-                # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
-                        if session.get("_turn_cancel_requested")
-                        else "Session no longer running before the agent was ready"
-                    },
-                )
-                return
-        _run_prompt_submit(rid, sid, session, text)
+                cancelled_before_run = True
+        if cancelled_before_run:
+            # Surface the cancellation to the client. Without this emit the
+            # turn vanishes silently — the Desktop sees `prompt.submit`
+            # return `{"status": "streaming"}` but never receives a
+            # `message.start` or `error` event.
+            _emit(
+                "error",
+                sid,
+                {
+                    "message": "Turn cancelled before the agent was ready"
+                    if session.get("_turn_cancel_requested")
+                    else "Session no longer running before the agent was ready"
+                },
+            )
+            from gateway.realtime_voice_controller import HostProjectionStatus
+            from tui_gateway.realtime_voice_host import notify_realtime_turn
+
+            notify_realtime_turn(
+                session,
+                HostProjectionStatus.FAILED,
+                detail="canonical turn cancelled before agent start",
+            )
+            return
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind="realtime_voice" if require_realtime_attachment else None,
+            display_metadata=(
+                {"turn_id": realtime_turn_id} if require_realtime_attachment else None
+            ),
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
