@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+import pytest
 import yaml
 
 from agent.realtime_voice_provider import RealtimeVoiceProvider, RealtimeVoiceSession
@@ -45,6 +46,21 @@ class _Provider(RealtimeVoiceProvider):
 
 def _context():
     return PluginContext(PluginManifest(name="receipt-test"), object())
+
+
+def test_realtime_attachment_capture_api_is_additive_and_fail_closed():
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    ctx = _context()
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="active gateway plugin command"):
+        ctx.capture_realtime_voice_attachment_factory()
+    assert vars(ctx).keys() == {
+        "manifest",
+        "_manager",
+        "_llm",
+        "_subagent_lifecycle",
+    }
 
 
 def _write_plugin(

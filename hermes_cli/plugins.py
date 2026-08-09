@@ -412,6 +412,25 @@ class PluginContext:
             )
         return self._subagent_lifecycle
 
+    # -- invocation-scoped gateway capabilities ----------------------------
+
+    def capture_realtime_voice_attachment_factory(self) -> Any:
+        """Capture the host-owned realtime attachment capability for this command.
+
+        The capability exists only while an authenticated gateway event is
+        dispatching the current plugin slash-command handler.  It is bound by
+        the host to that invocation's exact principal, route, source scope,
+        and existing durable session.  Calls from registration, other
+        surfaces, or background tasks fail closed.
+
+        No mutable invocation state is stored on this global ``PluginContext``.
+        """
+        from gateway.realtime_voice_invocation import (
+            capture_realtime_voice_attachment_factory,
+        )
+
+        return capture_realtime_voice_attachment_factory()
+
     # -- profile awareness --------------------------------------------------
 
     @property

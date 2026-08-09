@@ -15694,9 +15694,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    from gateway.realtime_voice_invocation import (
+                        realtime_voice_plugin_invocation,
+                    )
+
+                    def _current_durable_session_id() -> str | None:
+                        session_store = getattr(self, "session_store", None)
+                        peek_session_id = getattr(session_store, "peek_session_id", None)
+                        if not callable(peek_session_id):
+                            return None
+                        return peek_session_id(_quick_key)
+
+                    with realtime_voice_plugin_invocation(
+                        source=source,
+                        routing_key=_quick_key,
+                        durable_session_id=_current_durable_session_id,
+                    ):
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
