@@ -142,15 +142,16 @@ _factory_records = weakref.WeakKeyDictionary()
 _gateway_hosts = weakref.WeakKeyDictionary()
 
 
-def _register_gateway_runner(runner: object) -> None:
+def _register_gateway_runner(runner: object) -> bool:
     """Install private mint authority during exact GatewayRunner construction."""
     from gateway.run import GatewayRunner
 
     if type(runner) is not GatewayRunner:
-        raise TypeError("realtime invocation host must be an exact GatewayRunner")
+        return False
     with _state_lock:
         if runner not in _gateway_hosts:
             _gateway_hosts[runner] = _GatewayHostState(weakref.ref(runner))
+    return True
 
 
 def capture_realtime_voice_attachment_factory() -> RealtimeVoiceAttachmentFactory:
@@ -204,7 +205,7 @@ def _mint_invocation_state(
     if (
         source.is_bot is not False
         or source.guild_id != scope_id
-        or chat_type not in {"channel", "thread"}
+        or chat_type not in {"group", "thread"}
         or route != build_session_key(source)
     ):
         raise RealtimeVoiceInvocationError("Discord guild routing facts are invalid")

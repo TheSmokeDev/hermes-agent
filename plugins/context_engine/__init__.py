@@ -230,6 +230,24 @@ class _EngineCollector:
             )
             return
 
+        if invocation_context is True:
+            try:
+                import inspect
+
+                signature = inspect.signature(handler)
+                signature.bind("")
+                signature.bind("", object())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Context engine '%s' command '/%s' opted into invocation "
+                    "context but must accept both handler(raw_args) and "
+                    "handler(raw_args, invocation), typically by declaring "
+                    "invocation=None. Skipping.",
+                    self._engine_name,
+                    clean,
+                )
+                return
+
         # Reject conflicts with built-in commands.
         try:
             from hermes_cli.commands import resolve_command

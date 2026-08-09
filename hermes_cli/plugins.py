@@ -603,10 +603,13 @@ class PluginContext:
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        The legacy handler signature is exactly
+        The ordinary handler signature is
         ``fn(raw_args: str) -> str | None``. Commands which explicitly set
-        ``invocation_context=True`` instead receive
-        ``fn(raw_args, host_invocation)`` during authenticated host dispatch.
+        ``invocation_context=True`` must retain that one-argument contract and
+        also accept an optional second argument, conventionally
+        ``fn(raw_args, invocation=None)``. Exact authenticated Discord host
+        dispatch supplies the host invocation; CLI, TUI, and other gateways do
+        not. Incompatible signatures are rejected at registration time.
         It may also be an async callable — the gateway dispatch handles both.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
@@ -629,6 +632,22 @@ class PluginContext:
                 self.manifest.name,
             )
             return
+
+        if invocation_context is True:
+            try:
+                signature = inspect.signature(handler)
+                signature.bind("")
+                signature.bind("", object())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Plugin '%s' command '/%s' opted into invocation context but "
+                    "must accept both handler(raw_args) and "
+                    "handler(raw_args, invocation), typically by declaring "
+                    "invocation=None. Skipping.",
+                    self.manifest.name,
+                    clean,
+                )
+                return
 
         # Reject if it conflicts with a built-in command
         try:

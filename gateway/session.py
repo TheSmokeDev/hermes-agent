@@ -1253,6 +1253,11 @@ class SessionStore:
         self._save_lock = threading.Lock()
         self._routing_generation = 0
         self._persisted_routing_generation = 0
+        # Capability snapshots need route isolation, not the persistence
+        # generation above (which advances on every save). Values are per-route
+        # structural tombstones and intentionally survive removal so a later
+        # recreation cannot reuse stale authority within this process.
+        self._route_structural_generations: Dict[str, int] = {}
         # Single-entry upserts persisted since the last full rewrite:
         # session_key -> (revision, entry_json). Revisions are allocated
         # from _routing_generation, so fast and full snapshots are totally
@@ -1413,6 +1418,11 @@ class SessionStore:
 
         self._loaded = True
 
+        # Loading publishes each durable route as a fresh in-process binding.
+        # Preserve prior tombstones but never reuse them for a new entry.
+        for key in self._entries:
+            self._advance_route_structural_generation_locked(key)
+
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
         # shutdown path, so sessions.json is never cleared and is left pointing
@@ -1486,6 +1496,7 @@ class SessionStore:
                             recovered_entry.session_id,
                         )
                         self._entries[key] = recovered_entry
+                        self._advance_route_structural_generation_locked(key)
                         recovered_keys += 1
                         continue
 
@@ -1504,6 +1515,7 @@ class SessionStore:
 
         for key in stale_keys:
             del self._entries[key]
+            self._advance_route_structural_generation_locked(key)
 
         if stale_keys or recovered_keys:
             self._save()
@@ -1524,6 +1536,16 @@ class SessionStore:
         """
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
         return self._routing_generation
+
+    def _advance_route_structural_generation_locked(self, session_key: str) -> int:
+        """Advance one route's structural tombstone while ``_lock`` is held."""
+        generations = getattr(self, "_route_structural_generations", None)
+        if generations is None:
+            generations = {}
+            self._route_structural_generations = generations
+        generation = generations.get(session_key, 0) + 1
+        generations[session_key] = generation
+        return generation
 
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
@@ -2358,6 +2380,7 @@ class SessionStore:
             canonical_session_id,
         )
         entry.session_id = canonical_session_id
+        self._advance_route_structural_generation_locked(entry.session_key)
         return True
 
     def has_any_sessions(self) -> bool:
@@ -2474,11 +2497,13 @@ class SessionStore:
                         adopt = source.chat_type == "dm"
                     if adopt and self._claim_legacy_slack_key(legacy_key):
                         migrated_legacy_entry = self._entries.pop(legacy_key)
+                        self._advance_route_structural_generation_locked(legacy_key)
                         migrated_legacy_entry.session_key = session_key
                         migrated_legacy_entry.origin = source
                         migrated_legacy_entry.platform = source.platform
                         migrated_legacy_entry.chat_type = source.chat_type
                         self._entries[session_key] = migrated_legacy_entry
+                        self._advance_route_structural_generation_locked(session_key)
             if migrated_legacy_entry is not None:
                 self._save_entries()
                 self._record_gateway_session_peer(
@@ -2592,6 +2617,7 @@ class SessionStore:
                         session_key, entry.session_id,
                     )
                     self._entries.pop(session_key, None)
+                    self._advance_route_structural_generation_locked(session_key)
                     # If an expiry watcher (daily/idle reset) already finalized
                     # this session, honour the reset decision instead of silently
                     # reopening it via recovery.
@@ -2618,6 +2644,7 @@ class SessionStore:
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
                         self._entries.pop(session_key, None)
+                        self._advance_route_structural_generation_locked(session_key)
                         entry = None
                         _needs_recover = True
                     else:
@@ -2642,6 +2669,7 @@ class SessionStore:
                     published = self._entries.get(session_key)
                     if published is None:
                         self._entries[session_key] = recovered
+                        self._advance_route_structural_generation_locked(session_key)
                         published = recovered
                 entry = published
                 _needs_save = True
@@ -2671,6 +2699,7 @@ class SessionStore:
                 )
                 if may_publish:
                     self._entries[session_key] = candidate
+                    self._advance_route_structural_generation_locked(session_key)
                     published = candidate
                 else:
                     published = current
@@ -3067,6 +3096,7 @@ class SessionStore:
                     removed_keys.append(key)
             for key in removed_keys:
                 self._entries.pop(key, None)
+                self._advance_route_structural_generation_locked(key)
             if removed_keys:
                 self._save()
 
@@ -3144,6 +3174,7 @@ class SessionStore:
             )
 
             self._entries[session_key] = new_entry
+            self._advance_route_structural_generation_locked(session_key)
             self._save()
             db_create_kwargs = {
                 "session_id": session_id,
@@ -3259,6 +3290,7 @@ class SessionStore:
             )
 
             self._entries[session_key] = new_entry
+            self._advance_route_structural_generation_locked(session_key)
             self._save()
 
         if self._db and db_end_session_id:
@@ -3347,7 +3379,9 @@ class SessionStore:
             return None, -1
         with self._lock:
             self._ensure_loaded_locked()
-            return self._entries.get(session_key), getattr(self, "_routing_generation", 0)
+            generations = getattr(self, "_route_structural_generations", None)
+            generation = generations.get(session_key, 0) if generations else 0
+            return self._entries.get(session_key), generation
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Serialize transcript draining across queue migration boundaries."""
