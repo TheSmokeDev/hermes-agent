@@ -407,16 +407,17 @@ def _(rid, params: dict) -> dict:
                 detail="canonical turn cancelled before agent start",
             )
             return
-        _run_prompt_submit(
-            rid,
-            sid,
-            session,
-            text,
-            display_kind="realtime_voice" if require_realtime_attachment else None,
-            display_metadata=(
-                {"turn_id": realtime_turn_id} if require_realtime_attachment else None
-            ),
-        )
+        if require_realtime_attachment:
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind="realtime_voice",
+                display_metadata={"turn_id": realtime_turn_id},
+            )
+        else:
+            _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
