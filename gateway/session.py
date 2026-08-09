@@ -1255,8 +1255,8 @@ class SessionStore:
         self._persisted_routing_generation = 0
         # Capability snapshots need route isolation, not the persistence
         # generation above (which advances on every save). Values are per-route
-        # structural tombstones and intentionally survive removal so a later
-        # recreation cannot reuse stale authority within this process.
+        # structural versions retained only while the corresponding route is
+        # live. Exact entry identity separately rejects remove/recreate reuse.
         self._route_structural_generations: Dict[str, int] = {}
         # Single-entry upserts persisted since the last full rewrite:
         # session_key -> (revision, entry_json). Revisions are allocated
@@ -1419,7 +1419,11 @@ class SessionStore:
         self._loaded = True
 
         # Loading publishes each durable route as a fresh in-process binding.
-        # Preserve prior tombstones but never reuse them for a new entry.
+        # The generation map is bounded to exactly the routes loaded as live.
+        generations = getattr(self, "_route_structural_generations", None)
+        if generations is not None:
+            for stale_key in generations.keys() - self._entries.keys():
+                generations.pop(stale_key, None)
         for key in self._entries:
             self._advance_route_structural_generation_locked(key)
 
@@ -1515,7 +1519,7 @@ class SessionStore:
 
         for key in stale_keys:
             del self._entries[key]
-            self._advance_route_structural_generation_locked(key)
+            self._discard_route_structural_generation_locked(key)
 
         if stale_keys or recovered_keys:
             self._save()
@@ -1546,6 +1550,12 @@ class SessionStore:
         generation = generations.get(session_key, 0) + 1
         generations[session_key] = generation
         return generation
+
+    def _discard_route_structural_generation_locked(self, session_key: str) -> None:
+        """Drop bookkeeping for a route immediately after removing the route."""
+        generations = getattr(self, "_route_structural_generations", None)
+        if generations is not None:
+            generations.pop(session_key, None)
 
     def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
@@ -2497,7 +2507,7 @@ class SessionStore:
                         adopt = source.chat_type == "dm"
                     if adopt and self._claim_legacy_slack_key(legacy_key):
                         migrated_legacy_entry = self._entries.pop(legacy_key)
-                        self._advance_route_structural_generation_locked(legacy_key)
+                        self._discard_route_structural_generation_locked(legacy_key)
                         migrated_legacy_entry.session_key = session_key
                         migrated_legacy_entry.origin = source
                         migrated_legacy_entry.platform = source.platform
@@ -2617,7 +2627,7 @@ class SessionStore:
                         session_key, entry.session_id,
                     )
                     self._entries.pop(session_key, None)
-                    self._advance_route_structural_generation_locked(session_key)
+                    self._discard_route_structural_generation_locked(session_key)
                     # If an expiry watcher (daily/idle reset) already finalized
                     # this session, honour the reset decision instead of silently
                     # reopening it via recovery.
@@ -2644,7 +2654,7 @@ class SessionStore:
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
                         self._entries.pop(session_key, None)
-                        self._advance_route_structural_generation_locked(session_key)
+                        self._discard_route_structural_generation_locked(session_key)
                         entry = None
                         _needs_recover = True
                     else:
@@ -3096,7 +3106,7 @@ class SessionStore:
                     removed_keys.append(key)
             for key in removed_keys:
                 self._entries.pop(key, None)
-                self._advance_route_structural_generation_locked(key)
+                self._discard_route_structural_generation_locked(key)
             if removed_keys:
                 self._save()
 

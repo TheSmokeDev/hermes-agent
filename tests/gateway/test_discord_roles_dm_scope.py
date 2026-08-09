@@ -195,9 +195,10 @@ def test_slash_authorization_rejects_cross_guild_role_dm(monkeypatch):
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=42),
         channel=MagicMock(spec=_discord.DMChannel),
-        channel_id=None,
+        channel_id=987,
         guild=None,
     )
+    interaction.channel.id = 987
 
     allowed, reason = adapter._evaluate_slash_authorization(interaction)
     assert allowed is False

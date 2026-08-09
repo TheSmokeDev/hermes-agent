@@ -30,7 +30,9 @@ def _source(*, user_id: str = "operator", chat_id: str = "voice-room") -> Sessio
     )
 
 
-def _event(text: str = "/talk join", *, source: SessionSource | None = None) -> MessageEvent:
+def _event(
+    text: str = "/talk join", *, source: SessionSource | None = None
+) -> MessageEvent:
     source = source or _source()
     return MessageEvent(
         text=text,
@@ -106,7 +108,9 @@ async def _invoke(runner, source, handler, *, authenticated=True, internal=False
 def test_plugin_context_capture_fails_outside_gateway_dispatch():
     from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
 
-    with pytest.raises(RealtimeVoiceInvocationError, match="active opted-in plugin command"):
+    with pytest.raises(
+        RealtimeVoiceInvocationError, match="active opted-in plugin command"
+    ):
         _plugin_context().capture_realtime_voice_attachment_factory()
 
 
@@ -141,9 +145,35 @@ async def test_contextual_handler_receives_immutable_host_invocation_and_can_cap
 
 
 @pytest.mark.asyncio
+async def test_repeated_capture_is_idempotent_and_commits_one_factory():
+    from gateway.realtime_voice_invocation import (
+        _is_host_realtime_voice_attachment_factory,
+        _validate_realtime_voice_attachment_factory,
+    )
+
+    source = _source()
+    runner, _entry = _runner(source)
+    captured = []
+
+    def handler(_args, invocation):
+        captured.append(invocation.capture_realtime_voice_attachment_factory())
+        captured.append(invocation.capture_realtime_voice_attachment_factory())
+
+    await _invoke(runner, source, handler)
+
+    assert captured[0] is captured[1]
+    assert _is_host_realtime_voice_attachment_factory(captured[0])
+    assert _validate_realtime_voice_attachment_factory(
+        captured[0], runner
+    ).routing_key == (build_session_key(source))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chat_type", ["group", "thread"])
 async def test_production_discord_guild_sources_can_capture(chat_type):
-    from gateway.realtime_voice_invocation import _validate_realtime_voice_attachment_factory
+    from gateway.realtime_voice_invocation import (
+        _validate_realtime_voice_attachment_factory,
+    )
 
     source = dataclasses.replace(_source(), chat_type=chat_type)
     runner, _entry = _runner(source)
@@ -157,7 +187,10 @@ async def test_production_discord_guild_sources_can_capture(chat_type):
         ),
     )
 
-    assert _validate_realtime_voice_attachment_factory(captured[0], runner).chat_type == chat_type
+    assert (
+        _validate_realtime_voice_attachment_factory(captured[0], runner).chat_type
+        == chat_type
+    )
 
 
 @pytest.mark.asyncio
@@ -196,9 +229,10 @@ async def test_exact_host_factory_is_opaque_and_lookalikes_fail_closed():
         type(factory)(binding)
     with pytest.raises((pickle.PicklingError, TypeError)):
         pickle.dumps(factory)
-    assert not _is_host_realtime_voice_attachment_factory(
-        {"routing_key": "route-1", "durable_session_id": "session-1"}
-    )
+    assert not _is_host_realtime_voice_attachment_factory({
+        "routing_key": "route-1",
+        "durable_session_id": "session-1",
+    })
 
 
 @pytest.mark.asyncio
@@ -208,7 +242,9 @@ async def test_invocation_does_not_leak_to_background_tasks():
     runner, _entry = _runner(_source())
 
     async def handler(_args, invocation):
-        task = asyncio.create_task(asyncio.to_thread(invocation.capture_realtime_voice_attachment_factory))
+        task = asyncio.create_task(
+            asyncio.to_thread(invocation.capture_realtime_voice_attachment_factory)
+        )
         with pytest.raises(RealtimeVoiceInvocationError):
             await task
 
@@ -269,7 +305,9 @@ async def test_gateway_plugin_dispatch_exposes_factory_and_preserves_ordinary_co
     monkeypatch.setattr(
         plugins_mod,
         "get_plugin_command_registration",
-        lambda name: {"handler": handler, "invocation_context": True} if name == "talk" else None,
+        lambda name: (
+            {"handler": handler, "invocation_context": True} if name == "talk" else None
+        ),
     )
 
     assert await runner._handle_message(_event(source=source)) == "joined join"
@@ -291,17 +329,26 @@ async def test_gateway_plugin_dispatch_exposes_factory_and_preserves_ordinary_co
     monkeypatch.setattr(
         plugins_mod,
         "get_plugin_command_registration",
-        lambda name: {
-            "handler": legacy_handler,
-            "invocation_context": False,
-        } if name == "plain" else None,
+        lambda name: (
+            {
+                "handler": legacy_handler,
+                "invocation_context": False,
+            }
+            if name == "plain"
+            else None
+        ),
     )
-    assert await runner._handle_message(_event("/plain works", source=source)) == "ordinary works"
+    assert (
+        await runner._handle_message(_event("/plain works", source=source))
+        == "ordinary works"
+    )
     assert legacy_calls == [("works",)]
 
 
 @pytest.mark.asyncio
-async def test_non_discord_context_opt_in_keeps_one_argument_legacy_dispatch(monkeypatch):
+async def test_non_discord_context_opt_in_keeps_one_argument_legacy_dispatch(
+    monkeypatch,
+):
     from hermes_cli import plugins as plugins_mod
 
     source = SessionSource(
@@ -331,7 +378,9 @@ async def test_non_discord_context_opt_in_keeps_one_argument_legacy_dispatch(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("platform", [Platform.SLACK, Platform.TELEGRAM])
-async def test_opted_handler_keeps_one_argument_gateway_compatibility(monkeypatch, platform):
+async def test_opted_handler_keeps_one_argument_gateway_compatibility(
+    monkeypatch, platform
+):
     from hermes_cli import plugins as plugins_mod
 
     source = SessionSource(
@@ -360,7 +409,9 @@ async def test_opted_handler_keeps_one_argument_gateway_compatibility(monkeypatc
 
 @pytest.mark.asyncio
 async def test_capture_then_exception_revokes_factory():
-    from gateway.realtime_voice_invocation import _is_host_realtime_voice_attachment_factory
+    from gateway.realtime_voice_invocation import (
+        _is_host_realtime_voice_attachment_factory,
+    )
 
     runner, _entry = _runner(_source())
     captured = []
@@ -376,7 +427,9 @@ async def test_capture_then_exception_revokes_factory():
 
 @pytest.mark.asyncio
 async def test_capture_then_cancellation_revokes_factory():
-    from gateway.realtime_voice_invocation import _is_host_realtime_voice_attachment_factory
+    from gateway.realtime_voice_invocation import (
+        _is_host_realtime_voice_attachment_factory,
+    )
 
     runner, _entry = _runner(_source())
     captured = []
@@ -394,10 +447,28 @@ async def test_capture_then_cancellation_revokes_factory():
 @pytest.mark.parametrize(
     "source,authenticated,internal",
     [
-        (SessionSource(platform=Platform.SLACK, user_id="operator", chat_id="room", scope_id="guild"), True, False),
+        (
+            SessionSource(
+                platform=Platform.SLACK,
+                user_id="operator",
+                chat_id="room",
+                scope_id="guild",
+            ),
+            True,
+            False,
+        ),
         (_source(user_id=True), True, False),
         (_source(user_id=" operator"), True, False),
-        (SessionSource(platform=Platform.DISCORD, user_id="operator", chat_id="room", scope_id=True), True, False),
+        (
+            SessionSource(
+                platform=Platform.DISCORD,
+                user_id="operator",
+                chat_id="room",
+                scope_id=True,
+            ),
+            True,
+            False,
+        ),
         (dataclasses.replace(_source(), chat_type="channel"), True, False),
         (_source(), False, False),
         (_source(), True, True),
@@ -410,7 +481,13 @@ async def test_non_discord_unauthenticated_and_coercive_facts_fail_without_looku
 
     runner, _entry = _runner(_source())
     with pytest.raises(RealtimeVoiceInvocationError):
-        await _invoke(runner, source, lambda _args, _invocation: None, authenticated=authenticated, internal=internal)
+        await _invoke(
+            runner,
+            source,
+            lambda _args, _invocation: None,
+            authenticated=authenticated,
+            internal=internal,
+        )
     runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
 
 
@@ -441,7 +518,13 @@ async def test_factory_validation_pins_runner_entry_identity_and_generation():
     source = _source()
     runner, entry = _runner(source)
     captured = []
-    await _invoke(runner, source, lambda _a, inv: captured.append(inv.capture_realtime_voice_attachment_factory()))
+    await _invoke(
+        runner,
+        source,
+        lambda _a, inv: captured.append(
+            inv.capture_realtime_voice_attachment_factory()
+        ),
+    )
     factory = captured[0]
 
     other_runner, _ = _runner(source)
@@ -490,7 +573,10 @@ def test_session_store_exact_lookup_is_noncreating_and_identity_preserving():
 
     source = _source()
     entry = SessionEntry(
-        session_key=build_session_key(source), session_id="sid", created_at=datetime.now(), updated_at=datetime.now()
+        session_key=build_session_key(source),
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
     )
     store = object.__new__(SessionStore)
     store._entries = {entry.session_key: entry}
@@ -535,11 +621,14 @@ def test_route_snapshots_are_isolated_and_only_structural_changes_invalidate():
     assert after_reset_b[1] != before_reset_b[1]
 
     before_compression_b = after_reset_b
-    assert store.advance_compression_session(
-        route_b,
-        before_compression_b[0].session_id,
-        "sid-b-compressed",
-    ) is before_compression_b[0]
+    assert (
+        store.advance_compression_session(
+            route_b,
+            before_compression_b[0].session_id,
+            "sid-b-compressed",
+        )
+        is before_compression_b[0]
+    )
     after_compression_b = store.get_exact_session_entry_snapshot(route_b)
     assert after_compression_b[0] is before_compression_b[0]
     assert after_compression_b[1] != before_compression_b[1]
@@ -550,7 +639,7 @@ def test_route_snapshots_are_isolated_and_only_structural_changes_invalidate():
     assert current_a[1] != captured_a[1]
 
 
-def test_route_tombstone_survives_remove_and_recreate():
+def test_route_generation_is_discarded_and_recreate_gets_fresh_live_version():
     from datetime import timedelta
     from gateway.session import SessionStore
 
@@ -560,6 +649,7 @@ def test_route_tombstone_survives_remove_and_recreate():
     entry = SessionEntry(route, "sid-old", old, old, origin=source)
     store = object.__new__(SessionStore)
     store._entries = {route: entry}
+    store._route_structural_generations = {route: 1}
     store._loaded = True
     store._lock = threading.Lock()
     store._db = None
@@ -573,12 +663,35 @@ def test_route_tombstone_survives_remove_and_recreate():
     assert store.prune_old_entries(1) == 1
     removed = store.get_exact_session_entry_snapshot(route)
     assert removed[0] is None
-    assert removed[1] != before[1]
+    assert route not in store._route_structural_generations
 
     recreated = store._get_or_create_session_impl(source)
     after = store.get_exact_session_entry_snapshot(route)
     assert after[0] is recreated
-    assert after[1] != removed[1]
+    assert after[0] is not before[0]
+    assert after[1] == before[1]
+
+
+def test_pruned_route_generation_bookkeeping_is_bounded_to_live_entries():
+    from datetime import timedelta
+    from gateway.session import SessionStore
+
+    old = datetime.now() - timedelta(days=10)
+    store = object.__new__(SessionStore)
+    store._entries = {
+        f"route-{index}": SessionEntry(f"route-{index}", f"sid-{index}", old, old)
+        for index in range(2000)
+    }
+    store._route_structural_generations = {key: 1 for key in store._entries}
+    store._loaded = True
+    store._lock = threading.Lock()
+    store._db = None
+    store._save = lambda: None
+    store._has_active_processes_fn = None
+
+    assert store.prune_old_entries(1) == 2000
+    assert store._entries == {}
+    assert store._route_structural_generations == {}
 
 
 @pytest.mark.asyncio
@@ -596,7 +709,9 @@ async def test_compression_retry_reroute_invalidates_only_matching_route_factory
     unrelated_route = build_session_key(unrelated_source)
     now = datetime.now()
     entry = SessionEntry(route, "parent", now, now, origin=source)
-    unrelated = SessionEntry(unrelated_route, "other", now, now, origin=unrelated_source)
+    unrelated = SessionEntry(
+        unrelated_route, "other", now, now, origin=unrelated_source
+    )
 
     class FakeDb:
         def find_live_compression_child(self, session_id):

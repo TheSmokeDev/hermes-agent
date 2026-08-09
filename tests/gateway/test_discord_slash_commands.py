@@ -150,7 +150,7 @@ async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter)
     interaction = SimpleNamespace(
         channel=_FakeTextChannel(channel_id=123, name="general"),
         channel_id=123,
-        guild_id=456,
+        guild_id=1,
         user=SimpleNamespace(id=42, name="Jezza", display_name="Jezza"),
         response=SimpleNamespace(defer=AsyncMock(side_effect=UnknownInteraction("Unknown interaction"))),
         edit_original_response=AsyncMock(),
@@ -660,12 +660,12 @@ async def test_native_slash_guild_event_can_capture_contextual_attachment(
     interaction = SimpleNamespace(
         channel=channel,
         channel_id=channel.id,
-        guild_id=456,
+        guild_id=channel.guild.id,
         user=SimpleNamespace(display_name="Jezza", id=42),
     )
     event = adapter._build_slash_event(interaction, "/talk join")
-    assert event.source.guild_id == "456"
-    assert event.source.scope_id == "456"
+    assert event.source.guild_id == "1"
+    assert event.source.scope_id == "1"
     assert event.source.chat_type == expected_type
     runner = _slash_invocation_runner(event.source)
     captured = []
@@ -683,7 +683,7 @@ async def test_native_slash_guild_event_can_capture_contextual_attachment(
     )
 
     binding = _validate_realtime_voice_attachment_factory(captured[0], runner)
-    assert binding.scope_id == "456"
+    assert binding.scope_id == "1"
     assert binding.chat_type == expected_type
 
 
@@ -706,39 +706,18 @@ class _CoerciveGuildId:
 async def test_native_slash_rejects_coercive_guild_ids_before_session_lookup(
     adapter, channel, guild_id
 ):
-    from gateway.realtime_voice_invocation import (
-        RealtimeVoiceInvocationError,
-        _invoke_plugin_command_with_context,
-    )
-    from gateway.session import build_session_key
-
     interaction = SimpleNamespace(
         channel=channel,
         channel_id=channel.id,
         guild_id=guild_id,
         user=SimpleNamespace(display_name="Jezza", id=42),
     )
-    event = adapter._build_slash_event(interaction, "/talk join")
-    assert event.source.guild_id is None
-    assert event.source.scope_id is None
-    runner = _slash_invocation_runner(event.source)
-    issued = []
+    adapter.handle_message = AsyncMock()
 
-    with pytest.raises(RealtimeVoiceInvocationError):
-        await _invoke_plugin_command_with_context(
-            runner=runner,
-            handler=lambda _args, invocation: issued.append(
-                invocation.capture_realtime_voice_attachment_factory()
-            ),
-            raw_args="join",
-            source=event.source,
-            routing_key=build_session_key(event.source),
-            authenticated=True,
-            internal=False,
-        )
+    with pytest.raises(ValueError, match="guild_id"):
+        adapter._build_slash_event(interaction, "/talk join")
 
-    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
-    assert issued == []
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

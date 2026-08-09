@@ -349,6 +349,96 @@ async def test_missing_user_denied_even_with_allow_all(adapter, monkeypatch, env
     interaction.response.send_message.assert_awaited_once()
 
 
+class _CoerciveSnowflake:
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("user", _CoerciveSnowflake("100200300")),
+        ("user", True),
+        ("user", 100200300.0),
+        ("user", "100200300"),
+        ("user", 0),
+        ("user", -100200300),
+        ("interaction_channel", True),
+        ("interaction_channel", 12345.0),
+        ("interaction_channel", "12345"),
+        ("interaction_channel", 0),
+        ("channel", _CoerciveSnowflake("12345")),
+        ("guild", True),
+        ("guild", 42.0),
+        ("guild", "42"),
+        ("thread", _CoerciveSnowflake("12345")),
+        ("parent", True),
+        ("parent", 5555.0),
+        ("parent", "5555"),
+    ],
+)
+async def test_coercive_slash_identities_reject_before_dispatch_or_session_lookup(
+    adapter, field, bad_value
+):
+    adapter._allowed_user_ids = {"100200300"}
+    interaction = _make_interaction(
+        "100200300", channel_id=12345, guild_id=42,
+        in_thread=field in {"thread", "parent"}, parent_channel_id=5555,
+        user=SimpleNamespace(id=100200300, name="operator", display_name="operator"),
+    )
+    interaction.channel.guild = interaction.guild
+    if field == "user":
+        interaction.user.id = bad_value
+    elif field == "interaction_channel":
+        interaction.channel_id = bad_value
+    elif field == "channel":
+        interaction.channel.id = bad_value
+    elif field == "guild":
+        interaction.guild_id = bad_value
+    elif field == "thread":
+        interaction.channel_id = bad_value
+        interaction.channel.id = bad_value
+    elif field == "parent":
+        interaction.channel.parent_id = bad_value
+
+    adapter.handle_message = AsyncMock()
+    adapter.gateway_runner = SimpleNamespace(session_store=MagicMock())
+    await adapter._run_simple_slash(interaction, "/talk join")
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.gateway_runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
+    interaction.response.defer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["channel", "guild", "parent"])
+async def test_conflicting_duplicate_slash_identities_fail_closed(adapter, mismatch):
+    adapter._allowed_user_ids = {"100200300"}
+    interaction = _make_interaction(
+        "100200300", channel_id=12345, guild_id=42, in_thread=True,
+        parent_channel_id=5555,
+    )
+    interaction.user.display_name = "operator"
+    interaction.channel.guild = SimpleNamespace(id=42, name="guild")
+    interaction.channel.parent = SimpleNamespace(id=5555, name="parent")
+    if mismatch == "channel":
+        interaction.channel.id = 99999
+    elif mismatch == "guild":
+        interaction.channel.guild.id = 99
+    else:
+        interaction.channel.parent.id = 99999
+
+    adapter.handle_message = AsyncMock()
+    await adapter._run_simple_slash(interaction, "/talk join")
+
+    adapter.handle_message.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Thread parent channel allowlist parity
 # ---------------------------------------------------------------------------

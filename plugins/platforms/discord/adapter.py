@@ -4752,6 +4752,75 @@ class DiscordAdapter(BasePlatformAdapter):
     # (not as a user-wide bypass). Slash and on_message both pass the
     # resolved channel ids into ``_is_allowed_user`` after the channel gate.
 
+    @staticmethod
+    def _exact_positive_discord_id(value: object) -> Optional[int]:
+        """Return a native Discord snowflake, rejecting coercive lookalikes."""
+        return value if type(value) is int and value > 0 else None
+
+    def _validated_slash_identities(
+        self, interaction: "discord.Interaction"
+    ) -> tuple[Optional[Dict[str, int | None]], Optional[str]]:
+        """Validate and cross-check every slash identity before canonicalizing."""
+        channel = getattr(interaction, "channel", None)
+        user = getattr(interaction, "user", None)
+        if user is None:
+            return None, "missing interaction.user"
+        user_id = self._exact_positive_discord_id(getattr(user, "id", None))
+        channel_id = self._exact_positive_discord_id(getattr(interaction, "channel_id", None))
+        if user_id is None:
+            return None, "interaction.user.id is not a native positive integer"
+        if channel_id is None:
+            return None, "interaction.channel_id is not a native positive integer"
+
+        raw_channel_id = getattr(channel, "id", None)
+        if raw_channel_id is not None:
+            object_channel_id = self._exact_positive_discord_id(raw_channel_id)
+            if object_channel_id is None:
+                return None, "interaction.channel.id is not a native positive integer"
+            if object_channel_id != channel_id:
+                return None, "interaction channel identities disagree"
+
+        is_dm = isinstance(channel, discord.DMChannel) if channel is not None else False
+        raw_guild_id = getattr(interaction, "guild_id", None)
+        guild_id = None
+        if raw_guild_id is not None:
+            guild_id = self._exact_positive_discord_id(raw_guild_id)
+            if guild_id is None:
+                return None, "interaction.guild_id is not a native positive integer"
+        if not is_dm and guild_id is None:
+            return None, "guild interaction is missing a native guild id"
+
+        for guild in (getattr(interaction, "guild", None), getattr(channel, "guild", None)):
+            if guild is None:
+                continue
+            object_guild_id = self._exact_positive_discord_id(getattr(guild, "id", None))
+            if object_guild_id is None:
+                return None, "Discord guild object id is not a native positive integer"
+            if guild_id is None or object_guild_id != guild_id:
+                return None, "interaction guild identities disagree"
+
+        parent_id = None
+        parent = getattr(channel, "parent", None)
+        for label, raw_value in (
+            ("channel.parent_id", getattr(channel, "parent_id", None)),
+            ("channel.parent.id", getattr(parent, "id", None) if parent is not None else None),
+        ):
+            if raw_value is None:
+                continue
+            candidate = self._exact_positive_discord_id(raw_value)
+            if candidate is None:
+                return None, f"{label} is not a native positive integer"
+            if parent_id is not None and parent_id != candidate:
+                return None, "thread parent identities disagree"
+            parent_id = candidate
+
+        return {
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "parent_id": parent_id,
+        }, None
+
     def _evaluate_slash_authorization(
         self, interaction: "discord.Interaction",
     ) -> Tuple[bool, Optional[str]]:
@@ -4774,6 +4843,10 @@ class DiscordAdapter(BasePlatformAdapter):
         raise ``AttributeError`` in the user check below, surfacing as
         an opaque interaction failure rather than a clean rejection.
         """
+        identities, identity_error = self._validated_slash_identities(interaction)
+        if identities is None:
+            return False, identity_error or "invalid Discord slash identities"
+
         chan_obj = getattr(interaction, "channel", None)
         in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
 
@@ -4783,15 +4856,13 @@ class DiscordAdapter(BasePlatformAdapter):
         # DMs aren't channel-gated — DMs follow on_message's DM lockdown
         # path which has its own user-allowlist enforcement.
         if not in_dm:
-            chan_id_raw = getattr(interaction, "channel_id", None) or getattr(
-                chan_obj, "id", None,
-            )
+            chan_id_raw = identities["channel_id"]
             if chan_id_raw is not None:
                 channel_ids.add(str(chan_id_raw))
                 # Mirror on_message: also test the parent channel for threads
                 # so per-channel allow/deny lists work consistently.
                 if isinstance(chan_obj, discord.Thread):
-                    parent_id = self._get_parent_channel_id(chan_obj)
+                    parent_id = identities["parent_id"]
                     if parent_id:
                         channel_ids.add(str(parent_id))
 
@@ -4800,8 +4871,9 @@ class DiscordAdapter(BasePlatformAdapter):
             # interactions too, matching the on_message gates.
             channel_keys = self._discord_channel_keys_from_channel(
                 chan_obj,
-                self._get_parent_channel_id(chan_obj)
+                str(identities["parent_id"])
                 if isinstance(chan_obj, discord.Thread)
+                and identities["parent_id"] is not None
                 else None,
             )
 
@@ -4838,7 +4910,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return (False, "missing interaction.user with allowlist configured")
             return (False, "missing interaction.user")
 
-        user_id = str(user.id)
+        user_id = str(identities["user_id"])
         # Pass guild + is_dm so role check is scoped to the originating
         # guild and cross-guild DM bypass (#12136) can't land via the
         # slash surface either.
@@ -5984,6 +6056,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
+        identities, identity_error = self._validated_slash_identities(interaction)
+        if identities is None:
+            raise ValueError(identity_error or "invalid Discord slash identities")
         is_dm = isinstance(interaction.channel, discord.DMChannel)
         is_thread = isinstance(interaction.channel, discord.Thread)
         thread_id = None
@@ -5992,7 +6067,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_type = "dm"
         elif is_thread:
             chat_type = "thread"
-            thread_id = str(interaction.channel_id)
+            thread_id = str(identities["channel_id"])
         else:
             chat_type = "group"
 
@@ -6005,18 +6080,17 @@ class DiscordAdapter(BasePlatformAdapter):
         # Get channel topic (if available).
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
-        raw_guild_id = interaction.guild_id
         guild_id = (
-            str(raw_guild_id)
-            if type(raw_guild_id) is int and raw_guild_id > 0
+            str(identities["guild_id"])
+            if identities["guild_id"] is not None
             else None
         )
 
         source = self.build_source(
-            chat_id=str(interaction.channel_id),
+            chat_id=str(identities["channel_id"]),
             chat_name=chat_name,
             chat_type=chat_type,
-            user_id=str(interaction.user.id),
+            user_id=str(identities["user_id"]),
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
@@ -6024,8 +6098,12 @@ class DiscordAdapter(BasePlatformAdapter):
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
-        channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
+        channel_id = str(identities["channel_id"])
+        parent_id = (
+            str(identities["parent_id"])
+            if identities["parent_id"] is not None
+            else ""
+        )
         return MessageEvent(
             text=text,
             message_type=msg_type,

@@ -51,7 +51,7 @@ class _InvocationState:
     binding: _RealtimeVoiceAttachmentBinding
     owner_task: asyncio.Task[Any] | None
     owner_thread_id: int
-    provisional: list[tuple["RealtimeVoiceAttachmentFactory", _FactoryRecord]]
+    provisional: tuple["RealtimeVoiceAttachmentFactory", _FactoryRecord] | None
     active: bool = True
 
 
@@ -63,7 +63,9 @@ class _GatewayHostState:
 _MINT = object()
 _state_lock = threading.RLock()
 _invocation_states: weakref.WeakKeyDictionary[PluginCommandInvocation, _InvocationState]
-_factory_records: weakref.WeakKeyDictionary[RealtimeVoiceAttachmentFactory, _FactoryRecord]
+_factory_records: weakref.WeakKeyDictionary[
+    RealtimeVoiceAttachmentFactory, _FactoryRecord
+]
 _gateway_hosts: weakref.WeakKeyDictionary[object, _GatewayHostState]
 
 
@@ -86,7 +88,9 @@ class PluginCommandInvocation:
     def __reduce__(self):
         raise TypeError("plugin command invocations cannot be serialized")
 
-    def capture_realtime_voice_attachment_factory(self) -> "RealtimeVoiceAttachmentFactory":
+    def capture_realtime_voice_attachment_factory(
+        self,
+    ) -> "RealtimeVoiceAttachmentFactory":
         with _state_lock:
             state = _invocation_states.get(self)
             if state is None or not state.active:
@@ -105,6 +109,8 @@ class PluginCommandInvocation:
                 raise RealtimeVoiceInvocationError(
                     "realtime attachment capture is limited to the exact gateway dispatch task"
                 )
+            if state.provisional is not None:
+                return state.provisional[0]
             factory = RealtimeVoiceAttachmentFactory(_MINT)
             record = _FactoryRecord(
                 runner_ref=weakref.ref(state.runner),
@@ -113,7 +119,7 @@ class PluginCommandInvocation:
                 routing_generation=state.routing_generation,
                 binding=state.binding,
             )
-            state.provisional.append((factory, record))
+            state.provisional = (factory, record)
             return factory
 
 
@@ -167,7 +173,9 @@ def _exact_normalized_string(value: object, *, optional: bool = False) -> str | 
     if optional and value is None:
         return None
     if type(value) is not str or not value or value.strip() != value:
-        raise RealtimeVoiceInvocationError("Discord invocation facts must be normalized strings")
+        raise RealtimeVoiceInvocationError(
+            "Discord invocation facts must be normalized strings"
+        )
     return value
 
 
@@ -185,13 +193,17 @@ def _mint_invocation_state(
     from gateway.session import SessionSource, build_session_key
 
     if type(runner) is not GatewayRunner:
-        raise RealtimeVoiceInvocationError("invocation authority requires the exact gateway host")
+        raise RealtimeVoiceInvocationError(
+            "invocation authority requires the exact gateway host"
+        )
     with _state_lock:
         host_state = _gateway_hosts.get(runner)
     if host_state is None or host_state.runner_ref() is not runner:
         raise RealtimeVoiceInvocationError("gateway has no host-owned dispatch state")
     if authenticated is not True or internal is not False:
-        raise RealtimeVoiceInvocationError("invocation authority requires positive user authentication")
+        raise RealtimeVoiceInvocationError(
+            "invocation authority requires positive user authentication"
+        )
     if type(source) is not SessionSource or source.platform is not Platform.DISCORD:
         raise RealtimeVoiceInvocationError("realtime attachment is Discord-only")
 
@@ -215,10 +227,18 @@ def _mint_invocation_state(
     if not callable(exact_snapshot):
         raise RealtimeVoiceInvocationError("host has no atomic session snapshot lookup")
     entry, generation = exact_snapshot(route)
-    if entry is None or type(getattr(entry, "session_id", None)) is not str or not entry.session_id:
-        raise RealtimeVoiceInvocationError("realtime attachment requires an existing durable session")
+    if (
+        entry is None
+        or type(getattr(entry, "session_id", None)) is not str
+        or not entry.session_id
+    ):
+        raise RealtimeVoiceInvocationError(
+            "realtime attachment requires an existing durable session"
+        )
     if getattr(entry, "session_key", None) != route:
-        raise RealtimeVoiceInvocationError("existing session routing facts do not match")
+        raise RealtimeVoiceInvocationError(
+            "existing session routing facts do not match"
+        )
     if type(generation) is not int:
         raise RealtimeVoiceInvocationError("host routing generation is unavailable")
 
@@ -246,7 +266,7 @@ def _mint_invocation_state(
         binding=binding,
         owner_task=owner_task,
         owner_thread_id=threading.get_ident(),
-        provisional=[],
+        provisional=None,
     )
     with _state_lock:
         _invocation_states[invocation] = state
@@ -283,10 +303,10 @@ async def _invoke_plugin_command_with_context(
         with _state_lock:
             state.active = False
             _invocation_states.pop(invocation, None)
-            if succeeded:
-                for factory, record in state.provisional:
-                    _factory_records[factory] = record
-            state.provisional.clear()
+            if succeeded and state.provisional is not None:
+                factory, record = state.provisional
+                _factory_records[factory] = record
+            state.provisional = None
 
 
 def _is_host_realtime_voice_attachment_factory(value: object) -> bool:
@@ -303,7 +323,10 @@ def _validate_realtime_voice_attachment_factory(
 
     from gateway.run import GatewayRunner
 
-    if type(value) is not RealtimeVoiceAttachmentFactory or type(runner) is not GatewayRunner:
+    if (
+        type(value) is not RealtimeVoiceAttachmentFactory
+        or type(runner) is not GatewayRunner
+    ):
         raise RealtimeVoiceInvocationError("factory was not issued by this host")
     with _state_lock:
         record = _factory_records.get(value)
@@ -314,7 +337,9 @@ def _validate_realtime_voice_attachment_factory(
         or record.runner_ref() is not runner
         or current_host_state is not record.host_state
     ):
-        raise RealtimeVoiceInvocationError("factory belongs to a different gateway host")
+        raise RealtimeVoiceInvocationError(
+            "factory belongs to a different gateway host"
+        )
 
     store = getattr(runner, "session_store", None)
     snapshot = getattr(store, "get_exact_session_entry_snapshot", None)
