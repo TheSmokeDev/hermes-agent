@@ -2,13 +2,13 @@
 
 > **For Hermes:** Use subagent-driven development and strict RED → GREEN. This PRP receives one adversarial architecture review; after its concrete blockers are incorporated, move review to executable evidence and the final diff.
 
-**Status:** Implementation-ready after one adversarial review; live canary remains gated on green cross-repository tests and explicit local activation.
+**Status:** Implementation in progress after one adversarial review. The review narrowed this to an explicit, input-only, idle-session Discord canary; live activation remains gated on green cross-repository tests and final diff review.
 
 **Agent base:** `40b2a05e65504d7442611a8238bab1d30fae8dfe` (`feat/realtime-gateway-controller`)  
 **Talk base:** `28d7068521b3e3e4d2e37a17220a5698455d86aa` (`main`)  
 **Depends on:** PRP-002 final-transcript admission, PRP-003 controller, PRP-004 registered input-only Talk provider.
 
-**Goal:** Replace Discord `/talk join`'s legacy parallel executor with an invocation-scoped, host-issued attachment that admits Smoke's immutable Discord voice input into the exact canonical Hermes gateway session and returns the canonical response through the existing Discord adapter.
+**Goal:** Add an explicit `/talk core join` canary that uses an invocation-scoped, host-issued attachment to admit Smoke's immutable Discord voice input into the exact canonical Hermes gateway session. Keep legacy `/talk join` and standalone `hermes talk` accurately labeled and unchanged until the canary is proven.
 
 **Architecture:** The gateway owns session identity, authority, canonical turn execution, persistence, tools, approvals, and response delivery. Talk owns only Discord PCM capture and the registered input-only provider. A host-minted, non-serializable attachment capability is captured while the authenticated `/talk` command is dispatched, pinned to the exact source/routing key/durable session and invocation principal, and consumed through the existing gateway message/turn-lease path. The provider receives no Hermes tools and cannot execute work.
 
@@ -22,21 +22,23 @@ PRP-006A is the smallest safe Discord proof. It does **not** claim full Talk con
 
 In scope:
 
-- Agent-owned invocation context around gateway plugin slash-command dispatch.
-- A plugin-facing API that can capture one exact realtime attachment factory only during that invocation.
+- Explicit contextual slash-command registration; legacy one-argument handlers receive no voice authority.
+- A host-minted immutable invocation object whose narrow realtime service can capture one exact attachment factory only during the authenticated Discord invocation.
 - A concrete messaging-gateway realtime host that admits one final transcript through the installed canonical `_handle_message` path.
-- Exact durable-session/routing/principal proof, consume-once permits, busy-session serialization, and accepted-work survival.
+- Exact durable-session/routing/principal proof, consume-once permits, visible busy-session rejection, and accepted-work survival.
 - Talk Discord core adapter using the registered `talk_openai_realtime` input-only provider.
-- Operator-only audio for the first canary: only the immutable invoking/configured Discord operator ID may enter canonical work.
+- Operator-only audio for the first canary: the Agent attachment independently enforces that only PCM carrying the exact immutable invoking Discord user ID may reach the provider. Transport-generated silence uses a separate zero-only path and cannot smuggle content.
+- Idle-session-only canonical admission. A busy route is rejected visibly; it is never interrupted, steered, merged, replaced, or treated as accepted queue work.
+- A host-generated high-entropy turn marker persisted on the canonical user row and exact SessionDB read-back before completion is claimed.
 - Canonical response delivery through the existing Discord text adapter, with truthful status/failure receipts.
 
 Explicit non-goals:
 
 - PRP-005 Desktop HUD/RPC/audio work.
-- Interactive terminal migration (PRP-006B).
+- Interactive and standalone terminal migration. The former needs a `CliRealtimeTurnHost`; the latter remains blocked on a cross-process durable turn lease.
 - Non-operator conversational/read-only participant turns; shared-room attribution is a later PRP-006 slice and must not be guessed from provider metadata.
 - Provider-native output audio, provider-native Hermes tools, a second agent/session/executor, or legacy Talk tool dispatch.
-- Silent fallback to the legacy Talk executor. Unsupported core attachment fails visibly.
+- Replacement of legacy `/talk join`. Unsupported `/talk core join` fails visibly and never falls back to the legacy Talk executor.
 - New persistence schema, provider credentials in Agent/renderer, or a live production activation before tests pass.
 
 ## Required invariants
@@ -44,13 +46,14 @@ Explicit non-goals:
 1. Provider transcript roles, item IDs, display names, and metadata are never identity proof.
 2. The gateway derives and captures source principal, routing key, current durable session, platform/thread scope, and run generation.
 3. A private attachment proof cannot be serialized or replayed externally.
-4. Canonical acceptance pins the exact durable session before returning success; `/new`, `/resume`, compression rotation, source drift, route replacement, and recycled IDs fail closed or complete under the already-acquired canonical lease.
+4. Canonical acceptance requires the exact captured SessionEntry object/generation, routing claim, and resolved-session turn lease. `/new`, `/resume`, compression rotation, source drift, route replacement, and recycled public IDs fail closed before acceptance.
 5. The installed `_handle_message` and turn-lease path remain the only agent/tool/approval/persistence executor.
 6. Provider tool events remain inert. Talk core setup contains no tools and `automatic_response=False`.
 7. A Discord audio packet is admitted only when its immutable speaker user ID equals the host-authorized operator ID. Mixed/unknown/non-operator audio is dropped before provider admission and cannot become a canonical turn.
 8. Closing voice revokes unconsumed permits and provider/audio ownership but never cancels canonically accepted work or unrelated agents.
-9. Every terminal path clears attachment/pending state exactly once and emits a truthful receipt.
-10. Existing text messages, ordinary plugin commands, legacy terminal Talk, and turn-based voice behavior are unchanged when no private attachment is present.
+9. Completion requires exact marker read-back followed by the canonical assistant row after normal gateway unwind. Matching text, row counts, or caller-minted receipts are insufficient.
+10. Every terminal path clears attachment/pending state exactly once and emits a truthful receipt.
+11. Existing text messages, ordinary plugin commands, legacy `/talk join`, terminal Talk, and turn-based voice behavior are unchanged when no private attachment is present.
 
 ## Hard file scope
 
@@ -93,13 +96,13 @@ Do not modify Talk's legacy `run_talk_session()` executor in this slice. The Dis
 
 ### Task 1 — Invocation-scoped host capability
 
-**RED:** Prove a plugin command can capture a host-issued attachment factory only while dispatched from one authenticated gateway event. Calls outside dispatch, after return, from another source, or with a serialized lookalike fail closed. Ordinary plugin commands remain unchanged.
+**RED:** Prove only an explicitly contextual Discord plugin command receives a host-minted invocation service and can capture a factory. Legacy handlers still receive exactly one argument. Non-Discord, unauthenticated, outside-dispatch, post-return, foreign-source, copied, and serialized-lookalike paths fail closed. Remove/recreate under the same public IDs and a switched durable mapping are distinguishable by exact host identity.
 
-**GREEN:** Add a context-managed invocation object around the existing plugin handler call and an additive `PluginContext` API that returns the exact host-owned factory/capability. Do not place mutable current-session fields on the global PluginContext.
+**GREEN:** Add explicit contextual registration metadata plus an immutable host-minted invocation object around the existing plugin handler call. Capture exact runner, SessionEntry object/generation, source/principal/routing/durable authority privately. Do not place mutable current-session fields on the global PluginContext or expose host objects to plugins.
 
 ### Task 2 — Exact messaging-host permit and canonical ingress
 
-**RED:** Prove exact binding + exact operator utterance consumes one permit and enters the real `_handle_message`/turn-lease path once. Wrong/reused/foreign permits; stale route; durable-session replacement; `/new`/`/resume` drift; recycled IDs; wrong source/platform/thread/principal; and pre-claim races fail closed. Busy text and voice turns serialize without direct agent re-entry.
+**RED:** Prove exact binding + exact operator utterance consumes one permit and enters the real `_handle_message`/turn-lease path once. Wrong/reused/foreign permits; stale route; durable-session replacement; `/new`/`/resume` drift; recycled IDs; wrong source/platform/thread/principal; and pre-claim races fail closed. A busy route rejects visibly without interrupting, steering, merging, queueing, or direct agent re-entry. Completion requires exact durable marker read-back.
 
 **GREEN:** Implement one messaging host that captures immutable source/routing/durable authority, validates at the actual session-resolution/claim boundary, synthesizes the normal internal `MessageEvent`, and awaits the canonical handler. Return positive acceptance/finalization only from the real canonical result and persistence boundary.
 
@@ -111,7 +114,7 @@ Do not modify Talk's legacy `run_talk_session()` executor in this slice. The Dis
 
 ### Task 4 — Talk Discord operator-only transport
 
-**RED:** Prove `/talk join` selects the core attachment path, not `talk_cli.run_talk_session`; only audio packets whose immutable `user_id` equals the captured/configured operator enter the controller; unknown/non-operator/mixed packets are dropped; stop and bridge loss close audio/provider/attachment once. Missing host API or unavailable provider produces an explicit receipt and never silently starts legacy Talk.
+**RED:** Prove `/talk core join` selects the core attachment path, not `talk_cli.run_talk_session`; legacy `/talk join` remains unchanged and clearly labeled. Only packets carrying the exact immutable invoker `user_id` enter the controller; unknown/non-operator/mixed/coercive packets are dropped by the Agent attachment. Zero-only synthesized silence has a separate path. Stop and bridge loss close audio/provider/attachment once. Missing host API or unavailable provider produces an explicit receipt and never silently starts legacy Talk.
 
 **GREEN:** Add `talk_core_session.py` to build the input-only setup and feed bounded 24 kHz mono PCM from `DiscordAudio`. Preserve Discord connection borrowing/restoration and status/failure delivery.
 
@@ -187,9 +190,10 @@ Run repository-prescribed full Python, formatting, lint, packaging, and Windows 
 
 ## Acceptance criteria
 
-- [ ] Discord `/talk join` no longer launches the legacy parallel executor in the core path.
+- [ ] Discord `/talk core join` launches only the core input lane; legacy `/talk join` remains unchanged and is never mislabeled as core-backed.
 - [ ] Exactly one immutable Discord operator principal is authorized for the first canary.
-- [ ] Final transcripts enter the exact existing gateway/durable session through canonical ingress and serialization.
+- [ ] Final transcripts enter the exact existing idle gateway/durable session through canonical ingress and serialization; busy routes reject without queueing or interruption.
+- [ ] Completion is proven by a host-generated marker read back from the exact durable SessionDB row followed by the canonical assistant row.
 - [ ] Existing Hermes tools, approvals, persistence, memory, and response delivery remain authoritative.
 - [ ] Provider tool events cannot execute tools.
 - [ ] No second agent/session/gateway/executor is created.
