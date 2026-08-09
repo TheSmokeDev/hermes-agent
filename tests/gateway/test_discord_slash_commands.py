@@ -386,6 +386,7 @@ def test_build_slash_event_preserves_thread_context(adapter):
     interaction = SimpleNamespace(
         channel=_FakeThreadChannel(channel_id=555, name="Planning"),
         channel_id=555,
+        guild_id=1,
         user=SimpleNamespace(display_name="Jezza", id=42),
     )
 
@@ -395,6 +396,7 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.scope_id == "1"
     assert "TestGuild" in event.source.chat_name
 
 
@@ -600,5 +602,121 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
+
+
+class _FakeDmChannel(_discord_mod.DMChannel):
+    """isinstance(ch, discord.DMChannel) → True."""
+
+    def __init__(self, channel_id=300):
+        self.id = channel_id
+        self.name = "dm"
+        self.topic = None
+
+
+def _slash_invocation_runner(source):
+    from datetime import datetime
+
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.realtime_voice_invocation import _register_gateway_runner
+    from gateway.session import SessionEntry, build_session_key
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
+    )
+    runner.adapters = {Platform.DISCORD: MagicMock()}
+    entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="slash-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type=source.chat_type,
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 1)
+    _register_gateway_runner(runner)
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel", "expected_type"),
+    [
+        (_FakeTextChannel(channel_id=123), "group"),
+        (_FakeThreadChannel(channel_id=555), "thread"),
+    ],
+)
+async def test_native_slash_guild_event_can_capture_contextual_attachment(
+    adapter, channel, expected_type
+):
+    from gateway.realtime_voice_invocation import (
+        _invoke_plugin_command_with_context,
+        _validate_realtime_voice_attachment_factory,
+    )
+    from gateway.session import build_session_key
+
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=channel.id,
+        guild_id=456,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+    )
+    event = adapter._build_slash_event(interaction, "/talk join")
+    assert event.source.guild_id == "456"
+    assert event.source.scope_id == "456"
+    assert event.source.chat_type == expected_type
+    runner = _slash_invocation_runner(event.source)
+    captured = []
+
+    await _invoke_plugin_command_with_context(
+        runner=runner,
+        handler=lambda _args, invocation: captured.append(
+            invocation.capture_realtime_voice_attachment_factory()
+        ),
+        raw_args="join",
+        source=event.source,
+        routing_key=build_session_key(event.source),
+        authenticated=True,
+        internal=False,
+    )
+
+    binding = _validate_realtime_voice_attachment_factory(captured[0], runner)
+    assert binding.scope_id == "456"
+    assert binding.chat_type == expected_type
+
+
+@pytest.mark.asyncio
+async def test_native_slash_dm_remains_unscoped_and_cannot_capture_attachment(adapter):
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _invoke_plugin_command_with_context,
+    )
+    from gateway.session import build_session_key
+
+    channel = _FakeDmChannel()
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=channel.id,
+        guild_id=None,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+    )
+    event = adapter._build_slash_event(interaction, "/talk join")
+    assert event.source.guild_id is None
+    assert event.source.scope_id is None
+    runner = _slash_invocation_runner(event.source)
+
+    with pytest.raises(RealtimeVoiceInvocationError):
+        await _invoke_plugin_command_with_context(
+            runner=runner,
+            handler=lambda _args, _invocation: None,
+            raw_args="join",
+            source=event.source,
+            routing_key=build_session_key(event.source),
+            authenticated=True,
+            internal=False,
+        )
+    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
 
 

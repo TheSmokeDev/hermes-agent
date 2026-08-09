@@ -3478,6 +3478,9 @@ class SessionStore:
                                 for entry in self._entries.values():
                                     if entry.session_id == session_id:
                                         entry.session_id = child_id
+                                        self._advance_route_structural_generation_locked(
+                                            entry.session_key
+                                        )
                                 self._save()
                             if not pending:
                                 return

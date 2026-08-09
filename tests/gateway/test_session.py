@@ -1339,7 +1339,7 @@ class TestGatewaySessionDbRecovery:
         store = object.__new__(SessionStore)
         store._db = db
         store._lock = threading.RLock()
-        store._entries = {"route": SimpleNamespace(session_id="parent")}
+        store._entries = {"route": SimpleNamespace(session_key="route", session_id="parent")}
         store._loaded = True
         store._save = lambda: None
         store._transcript_retry_lock = threading.Lock()
@@ -1373,7 +1373,7 @@ class TestGatewaySessionDbRecovery:
         store = object.__new__(SessionStore)
         store._db = FakeDb()
         store._lock = threading.RLock()
-        store._entries = {"route": SimpleNamespace(session_id="parent")}
+        store._entries = {"route": SimpleNamespace(session_key="route", session_id="parent")}
         store._loaded = True
         store._save = lambda: None
         store._transcript_retry_lock = threading.Lock()

@@ -579,3 +579,103 @@ def test_route_tombstone_survives_remove_and_recreate():
     after = store.get_exact_session_entry_snapshot(route)
     assert after[0] is recreated
     assert after[1] != removed[1]
+
+
+@pytest.mark.asyncio
+async def test_compression_retry_reroute_invalidates_only_matching_route_factory():
+    from hermes_state import CompressionSessionClosedError
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _validate_realtime_voice_attachment_factory,
+    )
+    from gateway.session import SessionStore
+
+    source = _source(chat_id="compressed-room")
+    unrelated_source = _source(chat_id="unrelated-room")
+    route = build_session_key(source)
+    unrelated_route = build_session_key(unrelated_source)
+    now = datetime.now()
+    entry = SessionEntry(route, "parent", now, now, origin=source)
+    unrelated = SessionEntry(unrelated_route, "other", now, now, origin=unrelated_source)
+
+    class FakeDb:
+        def find_live_compression_child(self, session_id):
+            assert session_id == "parent"
+            return {"id": "child"}
+
+    store = object.__new__(SessionStore)
+    store._db = FakeDb()
+    store._entries = {route: entry, unrelated_route: unrelated}
+    store._loaded = True
+    store._lock = threading.RLock()
+    store._save = lambda: None
+    store._transcript_retry_lock = threading.Lock()
+    store._dirty_transcripts = {}
+    store._transcript_append_failures = {}
+    store._transcript_reroutes = {}
+    store._fts_rebuild_attempted = True
+
+    def append(session_id, _message):
+        if session_id == "parent":
+            raise CompressionSessionClosedError("parent")
+
+    store._append_transcript_message = append
+    runner, _ = _runner(source)
+    runner.session_store = store
+    captured = []
+    await _invoke(
+        runner,
+        source,
+        lambda _args, invocation: captured.append(
+            invocation.capture_realtime_voice_attachment_factory()
+        ),
+    )
+    before = store.get_exact_session_entry_snapshot(route)
+    unrelated_before = store.get_exact_session_entry_snapshot(unrelated_route)
+
+    store.append_to_transcript("parent", {"role": "assistant", "content": "reroute"})
+
+    after = store.get_exact_session_entry_snapshot(route)
+    assert entry.session_id == "child"
+    assert after[1] != before[1]
+    assert store.get_exact_session_entry_snapshot(unrelated_route) == unrelated_before
+    with pytest.raises(RealtimeVoiceInvocationError, match="stale"):
+        _validate_realtime_voice_attachment_factory(captured[0], runner)
+
+
+def test_compression_retry_without_matching_route_does_not_advance_generations():
+    from hermes_state import CompressionSessionClosedError
+    from gateway.session import SessionStore
+
+    source = _source(chat_id="unrelated-room")
+    route = build_session_key(source)
+    now = datetime.now()
+    entry = SessionEntry(route, "other", now, now, origin=source)
+
+    class FakeDb:
+        def find_live_compression_child(self, session_id):
+            assert session_id == "parent"
+            return {"id": "child"}
+
+    store = object.__new__(SessionStore)
+    store._db = FakeDb()
+    store._entries = {route: entry}
+    store._loaded = True
+    store._lock = threading.RLock()
+    store._save = lambda: None
+    store._transcript_retry_lock = threading.Lock()
+    store._dirty_transcripts = {}
+    store._transcript_append_failures = {}
+    store._transcript_reroutes = {}
+    store._fts_rebuild_attempted = True
+
+    def append(session_id, _message):
+        if session_id == "parent":
+            raise CompressionSessionClosedError("parent")
+
+    store._append_transcript_message = append
+    before = store.get_exact_session_entry_snapshot(route)
+
+    store.append_to_transcript("parent", {"role": "assistant", "content": "reroute"})
+
+    assert store.get_exact_session_entry_snapshot(route) == before
