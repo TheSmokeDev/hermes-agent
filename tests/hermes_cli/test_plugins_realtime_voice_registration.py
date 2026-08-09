@@ -8,6 +8,44 @@ from typing import Any, Dict
 
 import yaml
 
+from agent.realtime_voice_provider import RealtimeVoiceProvider, RealtimeVoiceSession
+from hermes_cli.plugins import PluginContext, PluginManifest
+
+
+class _Session(RealtimeVoiceSession):
+    async def send_audio(self, audio, **kwargs):
+        pass
+
+    async def _submit_tool_results(self, batch_id, results):
+        pass
+
+    def _events(self):
+        async def stream():
+            if False:
+                yield None
+
+        return stream()
+
+    async def _close(self):
+        pass
+
+
+class _Provider(RealtimeVoiceProvider):
+    def __init__(self, name="receipt-provider", *, api_version=2):
+        self._name = name
+        self.api_version = api_version
+
+    @property
+    def name(self):
+        return self._name
+
+    async def open_session(self, setup):
+        return _Session()
+
+
+def _context():
+    return PluginContext(PluginManifest(name="receipt-test"), object())
+
 
 def _write_plugin(
     root: Path,
@@ -48,6 +86,46 @@ def _enable(hermes_home: Path, name: str) -> None:
 
 
 class TestRegisterRealtimeVoiceProvider:
+    def test_returns_true_only_when_registry_accepts_provider(self):
+        from agent import realtime_voice_registry
+
+        realtime_voice_registry._reset_for_tests()
+        provider = _Provider()
+        try:
+            assert _context().register_realtime_voice_provider(provider) is True
+            assert realtime_voice_registry.get_provider(provider.name) is provider
+        finally:
+            realtime_voice_registry._reset_for_tests()
+
+    def test_returns_false_for_wrong_type_and_api_mismatch(self):
+        from agent import realtime_voice_registry
+
+        realtime_voice_registry._reset_for_tests()
+        try:
+            assert _context().register_realtime_voice_provider("not a provider") is False
+            assert (
+                _context().register_realtime_voice_provider(
+                    _Provider("old-receipt-provider", api_version=0)
+                )
+                is False
+            )
+            assert realtime_voice_registry.list_providers() == []
+        finally:
+            realtime_voice_registry._reset_for_tests()
+
+    def test_returns_false_without_replacing_builtin_collision(self):
+        from agent import realtime_voice_registry
+
+        realtime_voice_registry._reset_for_tests()
+        builtin = _Provider("reserved-receipt-provider")
+        plugin = _Provider("reserved-receipt-provider")
+        try:
+            assert realtime_voice_registry._register_builtin_provider(builtin)
+            assert _context().register_realtime_voice_provider(plugin) is False
+            assert realtime_voice_registry.get_provider(plugin.name) is builtin
+        finally:
+            realtime_voice_registry._reset_for_tests()
+
     def test_accepts_valid_provider(self):
         from hermes_cli.plugins import PluginManager
 
