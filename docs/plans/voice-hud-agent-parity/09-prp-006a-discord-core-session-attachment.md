@@ -4,8 +4,8 @@
 
 **Status:** Implementation in progress after one adversarial review. The review narrowed this to an explicit, input-only, idle-session Discord canary; live activation remains gated on green cross-repository tests and final diff review.
 
-**Agent base:** `40b2a05e65504d7442611a8238bab1d30fae8dfe` (`feat/realtime-gateway-controller`)  
-**Talk base:** `28d7068521b3e3e4d2e37a17220a5698455d86aa` (`main`)  
+**Agent base:** `40b2a05e65504d7442611a8238bab1d30fae8dfe` (`feat/realtime-gateway-controller`)
+**Talk base:** `28d7068521b3e3e4d2e37a17220a5698455d86aa` (`main`)
 **Depends on:** PRP-002 final-transcript admission, PRP-003 controller, PRP-004 registered input-only Talk provider.
 
 **Goal:** Add an explicit `/talk core join` canary that uses an invocation-scoped, host-issued attachment to admit Smoke's immutable Discord voice input into the exact canonical Hermes gateway session. Keep legacy `/talk join` and standalone `hermes talk` accurately labeled and unchanged until the canary is proven.
