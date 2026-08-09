@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import pickle
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -44,6 +46,7 @@ def _plugin_context() -> PluginContext:
 
 def _runner(source: SessionSource):
     from gateway.run import GatewayRunner
+    from gateway.realtime_voice_invocation import _register_gateway_runner
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -63,8 +66,10 @@ def _runner(source: SessionSource):
         chat_type="channel",
     )
     runner.session_store = MagicMock()
+    runner.session_store._routing_generation = 7
     runner.session_store._generate_session_key.return_value = entry.session_key
-    runner.session_store.peek_session_id.return_value = entry.session_id
+    runner.session_store.get_exact_session_entry.return_value = entry
+    runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 7)
     runner.session_store.get_or_create_session.return_value = entry
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = True
@@ -80,50 +85,84 @@ def _runner(source: SessionSource):
     runner._set_session_env = lambda _context: None
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
-    return runner
+    _register_gateway_runner(runner)
+    return runner, entry
+
+
+async def _invoke(runner, source, handler, *, authenticated=True, internal=False):
+    from gateway.realtime_voice_invocation import _invoke_plugin_command_with_context
+
+    return await _invoke_plugin_command_with_context(
+        runner=runner,
+        handler=handler,
+        raw_args="join",
+        source=source,
+        routing_key=build_session_key(source),
+        authenticated=authenticated,
+        internal=internal,
+    )
 
 
 def test_plugin_context_capture_fails_outside_gateway_dispatch():
     from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
 
-    with pytest.raises(RealtimeVoiceInvocationError, match="active gateway plugin command"):
+    with pytest.raises(RealtimeVoiceInvocationError, match="active opted-in plugin command"):
         _plugin_context().capture_realtime_voice_attachment_factory()
 
 
-def test_capture_requires_an_existing_durable_session_mapping():
+@pytest.mark.asyncio
+async def test_contextual_handler_receives_immutable_host_invocation_and_can_capture():
     from gateway.realtime_voice_invocation import (
+        PluginCommandInvocation,
         RealtimeVoiceInvocationError,
-        realtime_voice_plugin_invocation,
-    )
-
-    with realtime_voice_plugin_invocation(
-        source=_source(),
-        routing_key="agent:main:discord:channel:voice-room",
-        durable_session_id=lambda: None,
-    ):
-        with pytest.raises(RealtimeVoiceInvocationError, match="existing durable session"):
-            _plugin_context().capture_realtime_voice_attachment_factory()
-
-
-def test_exact_host_factory_is_opaque_and_lookalikes_fail_closed():
-    from gateway.realtime_voice_invocation import (
-        _binding_for_realtime_voice_attachment_factory,
-        _is_host_realtime_voice_attachment_factory,
-        realtime_voice_plugin_invocation,
+        _validate_realtime_voice_attachment_factory,
     )
 
     source = _source()
-    with realtime_voice_plugin_invocation(
-        source=source,
-        routing_key="route-1",
-        durable_session_id=lambda: "session-1",
-    ):
-        factory = _plugin_context().capture_realtime_voice_attachment_factory()
+    runner, entry = _runner(source)
+    captured = []
+    invocations = []
+
+    def handler(raw_args, invocation):
+        assert raw_args == "join"
+        assert type(invocation) is PluginCommandInvocation
+        with pytest.raises((AttributeError, TypeError)):
+            invocation.extra = True
+        invocations.append(invocation)
+        captured.append(invocation.capture_realtime_voice_attachment_factory())
+        return "joined"
+
+    assert await _invoke(runner, source, handler) == "joined"
+    binding = _validate_realtime_voice_attachment_factory(captured[0], runner)
+    assert binding.durable_session_id == entry.session_id
+    assert binding.principal_id == "operator"
+    with pytest.raises(RealtimeVoiceInvocationError, match="active opted-in"):
+        invocations[0].capture_realtime_voice_attachment_factory()
+
+
+@pytest.mark.asyncio
+async def test_exact_host_factory_is_opaque_and_lookalikes_fail_closed():
+    from gateway.realtime_voice_invocation import (
+        _is_host_realtime_voice_attachment_factory,
+        _validate_realtime_voice_attachment_factory,
+    )
+
+    source = _source()
+    runner, _entry = _runner(source)
+    captured = []
+    await _invoke(
+        runner,
+        source,
+        lambda _args, invocation: captured.append(
+            invocation.capture_realtime_voice_attachment_factory()
+        ),
+    )
+    factory = captured[0]
 
     assert _is_host_realtime_voice_attachment_factory(factory)
-    binding = _binding_for_realtime_voice_attachment_factory(factory)
-    assert binding.routing_key == "route-1"
-    assert binding.durable_session_id == "session-1"
+    binding = _validate_realtime_voice_attachment_factory(factory, runner)
+    assert binding.routing_key == build_session_key(source)
+    assert binding.durable_session_id == "durable-session-1"
     assert binding.principal_id == "operator"
     assert binding.chat_id == "voice-room"
     assert binding.thread_id == "thread-1"
@@ -133,7 +172,8 @@ def test_exact_host_factory_is_opaque_and_lookalikes_fail_closed():
 
     with pytest.raises(TypeError, match="cannot be serialized"):
         copy.copy(factory)
-    assert not _is_host_realtime_voice_attachment_factory(type(factory)(binding))
+    with pytest.raises(TypeError):
+        type(factory)(binding)
     with pytest.raises((pickle.PicklingError, TypeError)):
         pickle.dumps(factory)
     assert not _is_host_realtime_voice_attachment_factory(
@@ -142,39 +182,23 @@ def test_exact_host_factory_is_opaque_and_lookalikes_fail_closed():
 
 
 @pytest.mark.asyncio
-async def test_invocation_does_not_leak_to_background_tasks_or_after_exit():
-    from gateway.realtime_voice_invocation import (
-        RealtimeVoiceInvocationError,
-        realtime_voice_plugin_invocation,
-    )
+async def test_invocation_does_not_leak_to_background_tasks():
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
 
-    ctx = _plugin_context()
-    release = asyncio.Event()
+    runner, _entry = _runner(_source())
 
-    async def background_capture():
-        await release.wait()
-        return ctx.capture_realtime_voice_attachment_factory()
-
-    with realtime_voice_plugin_invocation(
-        source=_source(),
-        routing_key="route-1",
-        durable_session_id=lambda: "session-1",
-    ):
-        task = asyncio.create_task(background_capture())
-        assert ctx.capture_realtime_voice_attachment_factory() is not None
-        release.set()
-        with pytest.raises(RealtimeVoiceInvocationError, match="dispatch task"):
+    async def handler(_args, invocation):
+        task = asyncio.create_task(asyncio.to_thread(invocation.capture_realtime_voice_attachment_factory))
+        with pytest.raises(RealtimeVoiceInvocationError):
             await task
 
-    with pytest.raises(RealtimeVoiceInvocationError, match="active gateway plugin command"):
-        ctx.capture_realtime_voice_attachment_factory()
+    await _invoke(runner, _source(), handler)
 
 
 @pytest.mark.asyncio
 async def test_concurrent_invocations_capture_only_their_own_source():
     from gateway.realtime_voice_invocation import (
-        _binding_for_realtime_voice_attachment_factory,
-        realtime_voice_plugin_invocation,
+        _validate_realtime_voice_attachment_factory,
     )
 
     ready = asyncio.Event()
@@ -183,23 +207,26 @@ async def test_concurrent_invocations_capture_only_their_own_source():
 
     async def capture(user_id: str):
         nonlocal count
-        with realtime_voice_plugin_invocation(
-            source=_source(user_id=user_id, chat_id=f"room-{user_id}"),
-            routing_key=f"route-{user_id}",
-            durable_session_id=lambda: f"session-{user_id}",
-        ):
+        source = _source(user_id=user_id, chat_id=f"room-{user_id}")
+        runner, entry = _runner(source)
+        entry.session_id = f"session-{user_id}"
+
+        async def handler(_args, invocation):
+            nonlocal count
             async with lock:
                 count += 1
                 if count == 2:
                     ready.set()
             await ready.wait()
-            return _plugin_context().capture_realtime_voice_attachment_factory()
+            return invocation.capture_realtime_voice_attachment_factory()
+
+        return runner, await _invoke(runner, source, handler)
 
     first, second = await asyncio.gather(capture("one"), capture("two"))
-    first_binding = _binding_for_realtime_voice_attachment_factory(first)
-    second_binding = _binding_for_realtime_voice_attachment_factory(second)
-    assert (first_binding.principal_id, first_binding.routing_key) == ("one", "route-one")
-    assert (second_binding.principal_id, second_binding.routing_key) == ("two", "route-two")
+    first_binding = _validate_realtime_voice_attachment_factory(first[1], first[0])
+    second_binding = _validate_realtime_voice_attachment_factory(second[1], second[0])
+    assert first_binding.principal_id == "one"
+    assert second_binding.principal_id == "two"
 
 
 @pytest.mark.asyncio
@@ -212,69 +239,214 @@ async def test_gateway_plugin_dispatch_exposes_factory_and_preserves_ordinary_co
     from hermes_cli import plugins as plugins_mod
 
     source = _source()
-    runner = _runner(source)
-    ctx = _plugin_context()
+    runner, _entry = _runner(source)
     captured = []
 
-    def handler(args: str):
-        captured.append(ctx.capture_realtime_voice_attachment_factory())
+    def handler(args: str, invocation):
+        captured.append(invocation.capture_realtime_voice_attachment_factory())
         return f"joined {args}"
 
     monkeypatch.setattr(
         plugins_mod,
-        "get_plugin_command_handler",
-        lambda name: handler if name == "talk" else None,
+        "get_plugin_command_registration",
+        lambda name: {"handler": handler, "invocation_context": True} if name == "talk" else None,
     )
 
     assert await runner._handle_message(_event(source=source)) == "joined join"
-    binding = _binding_for_realtime_voice_attachment_factory(captured[0])
+    binding = _binding_for_realtime_voice_attachment_factory(captured[0], runner)
     assert binding.routing_key == build_session_key(source)
     assert binding.durable_session_id == "durable-session-1"
     assert binding.principal_id == "operator"
 
+    legacy_calls = []
+
+    def legacy_handler(*args):
+        from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+        legacy_calls.append(args)
+        with pytest.raises(RealtimeVoiceInvocationError):
+            _plugin_context().capture_realtime_voice_attachment_factory()
+        return f"ordinary {args[0]}"
+
     monkeypatch.setattr(
         plugins_mod,
-        "get_plugin_command_handler",
-        lambda name: (lambda args: f"ordinary {args}") if name == "plain" else None,
+        "get_plugin_command_registration",
+        lambda name: {
+            "handler": legacy_handler,
+            "invocation_context": False,
+        } if name == "plain" else None,
     )
     assert await runner._handle_message(_event("/plain works", source=source)) == "ordinary works"
-
-
-def test_exception_restores_prior_invocation_context():
-    from gateway.realtime_voice_invocation import (
-        RealtimeVoiceInvocationError,
-        realtime_voice_plugin_invocation,
-    )
-
-    ctx = _plugin_context()
-    with pytest.raises(RuntimeError, match="handler failed"):
-        with realtime_voice_plugin_invocation(
-            source=_source(),
-            routing_key="route-1",
-            durable_session_id=lambda: "session-1",
-        ):
-            raise RuntimeError("handler failed")
-
-    with pytest.raises(RealtimeVoiceInvocationError, match="active gateway plugin command"):
-        ctx.capture_realtime_voice_attachment_factory()
+    assert legacy_calls == [("works",)]
 
 
 @pytest.mark.asyncio
-async def test_cancellation_resets_invocation_before_task_continues():
-    from gateway.realtime_voice_invocation import (
-        RealtimeVoiceInvocationError,
-        realtime_voice_plugin_invocation,
+async def test_non_discord_context_opt_in_keeps_one_argument_legacy_dispatch(monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        user_id="operator",
+        chat_id="room",
+        chat_type="channel",
+        scope_id="workspace",
+    )
+    runner, _entry = _runner(source)
+    calls = []
+
+    def handler(*args):
+        calls.append(args)
+        return "legacy"
+
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_registration",
+        lambda _name: {"handler": handler, "invocation_context": True},
     )
 
-    ctx = _plugin_context()
-    with pytest.raises(asyncio.CancelledError):
-        with realtime_voice_plugin_invocation(
-            source=_source(),
-            routing_key="route-1",
-            durable_session_id=lambda: "session-1",
-        ):
-            asyncio.current_task().cancel()
-            await asyncio.sleep(0)
+    assert await runner._handle_message(_event("/talk", source=source)) == "legacy"
+    assert calls == [("",)]
+    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
 
-    with pytest.raises(RealtimeVoiceInvocationError, match="active gateway plugin command"):
-        ctx.capture_realtime_voice_attachment_factory()
+
+@pytest.mark.asyncio
+async def test_capture_then_exception_revokes_factory():
+    from gateway.realtime_voice_invocation import _is_host_realtime_voice_attachment_factory
+
+    runner, _entry = _runner(_source())
+    captured = []
+
+    def handler(_args, invocation):
+        captured.append(invocation.capture_realtime_voice_attachment_factory())
+        raise RuntimeError("handler failed")
+
+    with pytest.raises(RuntimeError, match="handler failed"):
+        await _invoke(runner, _source(), handler)
+    assert not _is_host_realtime_voice_attachment_factory(captured[0])
+
+
+@pytest.mark.asyncio
+async def test_capture_then_cancellation_revokes_factory():
+    from gateway.realtime_voice_invocation import _is_host_realtime_voice_attachment_factory
+
+    runner, _entry = _runner(_source())
+    captured = []
+
+    async def handler(_args, invocation):
+        captured.append(invocation.capture_realtime_voice_attachment_factory())
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _invoke(runner, _source(), handler)
+    assert not _is_host_realtime_voice_attachment_factory(captured[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,authenticated,internal",
+    [
+        (SessionSource(platform=Platform.SLACK, user_id="operator", chat_id="room", scope_id="guild"), True, False),
+        (_source(user_id=True), True, False),
+        (_source(user_id=" operator"), True, False),
+        (SessionSource(platform=Platform.DISCORD, user_id="operator", chat_id="room", scope_id=True), True, False),
+        (_source(), False, False),
+        (_source(), True, True),
+    ],
+)
+async def test_non_discord_unauthenticated_and_coercive_facts_fail_without_lookup(
+    source, authenticated, internal
+):
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    runner, _entry = _runner(_source())
+    with pytest.raises(RealtimeVoiceInvocationError):
+        await _invoke(runner, source, lambda _args, _invocation: None, authenticated=authenticated, internal=internal)
+    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_discord_bot_and_conflicting_guild_alias_fail_closed_before_lookup():
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    runner, _entry = _runner(_source())
+    bot_source = _source()
+    bot_source.is_bot = True
+    with pytest.raises(RealtimeVoiceInvocationError):
+        await _invoke(runner, bot_source, lambda _args, _invocation: None)
+
+    conflicting = _source()
+    conflicting.guild_id = "other-guild"
+    with pytest.raises(RealtimeVoiceInvocationError):
+        await _invoke(runner, conflicting, lambda _args, _invocation: None)
+    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_factory_validation_pins_runner_entry_identity_and_generation():
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _validate_realtime_voice_attachment_factory,
+    )
+
+    source = _source()
+    runner, entry = _runner(source)
+    captured = []
+    await _invoke(runner, source, lambda _a, inv: captured.append(inv.capture_realtime_voice_attachment_factory()))
+    factory = captured[0]
+
+    other_runner, _ = _runner(source)
+    with pytest.raises(RealtimeVoiceInvocationError):
+        _validate_realtime_voice_attachment_factory(factory, other_runner)
+
+    equivalent = dataclasses.replace(entry)
+    runner.session_store.get_exact_session_entry_snapshot.return_value = (equivalent, 7)
+    with pytest.raises(RealtimeVoiceInvocationError):
+        _validate_realtime_voice_attachment_factory(factory, runner)
+
+    runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 8)
+    runner.session_store._routing_generation += 1
+    with pytest.raises(RealtimeVoiceInvocationError):
+        _validate_realtime_voice_attachment_factory(factory, runner)
+
+
+@pytest.mark.asyncio
+async def test_missing_existing_entry_fails_without_creating_session():
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    source = _source()
+    runner, _entry = _runner(source)
+    runner.session_store.get_exact_session_entry_snapshot.return_value = (None, 7)
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="existing durable session"):
+        await _invoke(runner, source, lambda _args, _invocation: None)
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unregistered_runner_cannot_mint_even_with_valid_public_facts():
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+    from gateway.run import GatewayRunner
+
+    source = _source()
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = MagicMock()
+    with pytest.raises(RealtimeVoiceInvocationError, match="host-owned dispatch state"):
+        await _invoke(runner, source, lambda _args, _invocation: None)
+    runner.session_store.get_exact_session_entry_snapshot.assert_not_called()
+
+
+def test_session_store_exact_lookup_is_noncreating_and_identity_preserving():
+    from gateway.session import SessionStore
+
+    source = _source()
+    entry = SessionEntry(
+        session_key=build_session_key(source), session_id="sid", created_at=datetime.now(), updated_at=datetime.now()
+    )
+    store = object.__new__(SessionStore)
+    store._entries = {entry.session_key: entry}
+    store._loaded = True
+    store._lock = threading.Lock()
+
+    assert store.get_exact_session_entry(entry.session_key) is entry
+    assert store.get_exact_session_entry("missing") is None
+    assert store.get_exact_session_entry_snapshot(entry.session_key) == (entry, 0)

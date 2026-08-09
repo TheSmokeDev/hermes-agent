@@ -599,10 +599,14 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        invocation_context: bool = False,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
+        The legacy handler signature is exactly
+        ``fn(raw_args: str) -> str | None``. Commands which explicitly set
+        ``invocation_context=True`` instead receive
+        ``fn(raw_args, host_invocation)`` during authenticated host dispatch.
         It may also be an async callable — the gateway dispatch handles both.
 
         Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
@@ -644,6 +648,7 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "invocation_context": invocation_context is True,
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
@@ -2669,6 +2674,11 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
     """Return the handler for a plugin-registered slash command, or ``None``."""
     entry = _ensure_plugins_discovered()._plugin_commands.get(name)
     return entry["handler"] if entry else None
+
+
+def get_plugin_command_registration(name: str) -> Optional[Dict[str, Any]]:
+    """Return command dispatch metadata without changing the legacy getter."""
+    return _ensure_plugins_discovered()._plugin_commands.get(name)
 
 
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0

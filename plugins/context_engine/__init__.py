@@ -219,6 +219,7 @@ class _EngineCollector:
         handler,
         description: str = "",
         args_hint: str = "",
+        invocation_context: bool = False,
     ) -> None:
         """Forward to the global plugin command registry."""
         clean = (name or "").lower().strip().lstrip("/").replace(" ", "-")
@@ -259,6 +260,7 @@ class _EngineCollector:
                 "description": description or "Context engine command",
                 "plugin": f"context-engine:{self._engine_name}",
                 "args_hint": (args_hint or "").strip(),
+                "invocation_context": invocation_context is True,
             }
             self._registered_commands.append(clean)
             logger.debug(

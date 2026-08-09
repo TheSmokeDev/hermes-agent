@@ -5917,6 +5917,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        from gateway.realtime_voice_invocation import _register_gateway_runner
+        _register_gateway_runner(self)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -15687,29 +15689,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugin-registered slash commands
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command_handler,
+                    get_plugin_command_registration,
+                )
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
+                plugin_registration = get_plugin_command_registration(command.replace("_", "-"))
+                # Preserve legacy/custom callers which replace only the
+                # long-standing handler getter (including external hosts).
+                if plugin_registration is None:
+                    legacy_handler = get_plugin_command_handler(command.replace("_", "-"))
+                    if legacy_handler is not None:
+                        plugin_registration = {
+                            "handler": legacy_handler,
+                            "invocation_context": False,
+                        }
+                if plugin_registration:
+                    plugin_handler = plugin_registration["handler"]
                     user_args = event.get_command_args().strip()
-                    from gateway.realtime_voice_invocation import (
-                        realtime_voice_plugin_invocation,
-                    )
-
-                    def _current_durable_session_id() -> str | None:
-                        session_store = getattr(self, "session_store", None)
-                        peek_session_id = getattr(session_store, "peek_session_id", None)
-                        if not callable(peek_session_id):
-                            return None
-                        return peek_session_id(_quick_key)
-
-                    with realtime_voice_plugin_invocation(
-                        source=source,
-                        routing_key=_quick_key,
-                        durable_session_id=_current_durable_session_id,
+                    if (
+                        plugin_registration.get("invocation_context") is True
+                        and source.platform is Platform.DISCORD
+                        and not is_internal
                     ):
+                        from gateway.realtime_voice_invocation import (
+                            _invoke_plugin_command_with_context,
+                        )
+
+                        result = await _invoke_plugin_command_with_context(
+                            runner=self,
+                            handler=plugin_handler,
+                            raw_args=user_args,
+                            source=source,
+                            routing_key=_quick_key,
+                            authenticated=not is_internal,
+                            internal=is_internal,
+                        )
+                    else:
                         result = plugin_handler(user_args)
                         if asyncio.iscoroutine(result):
                             result = await result

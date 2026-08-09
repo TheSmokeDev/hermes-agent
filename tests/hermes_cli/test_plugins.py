@@ -1118,6 +1118,35 @@ class TestPreLlmCallTargetRouting:
 class TestPluginCommands:
     """Tests for plugin slash command registration via register_command()."""
 
+    def test_command_invocation_context_is_explicit_opt_in(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        mgr = PluginManager()
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        ctx = PluginContext(PluginManifest(name="test"), mgr)
+        legacy = lambda raw_args: raw_args
+        contextual = lambda raw_args, invocation: (raw_args, invocation)
+
+        ctx.register_command("legacy-capability-test", legacy)
+        ctx.register_command(
+            "contextual-capability-test",
+            contextual,
+            invocation_context=True,
+        )
+
+        assert get_plugin_command_handler("legacy-capability-test") is legacy
+        assert get_plugin_command_handler("contextual-capability-test") is contextual
+        assert mgr._plugin_commands["legacy-capability-test"]["invocation_context"] is False
+        assert mgr._plugin_commands["contextual-capability-test"]["invocation_context"] is True
+
+        # Non-gateway callers continue to receive the stored callable unchanged;
+        # calling it directly cannot manufacture the host-only second argument.
+        with pytest.raises(TypeError):
+            contextual("direct")
+        from gateway.realtime_voice_invocation import PluginCommandInvocation
+        with pytest.raises(TypeError, match="host-minted"):
+            PluginCommandInvocation()
+
 
 
     def test_register_command_empty_name_rejected(self, caplog):

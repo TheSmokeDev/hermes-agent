@@ -3330,6 +3330,24 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             return getattr(entry, "session_id", None) if entry else None
+
+    def get_exact_session_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the exact current in-memory entry without creating a route."""
+        if type(session_key) is not str or not session_key:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def get_exact_session_entry_snapshot(
+        self, session_key: str
+    ) -> tuple[Optional[SessionEntry], int]:
+        """Atomically snapshot exact entry identity and routing generation."""
+        if type(session_key) is not str or not session_key:
+            return None, -1
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key), getattr(self, "_routing_generation", 0)
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Serialize transcript draining across queue migration boundaries."""
