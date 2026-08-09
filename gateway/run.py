@@ -14636,7 +14636,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
+                        from gateway.realtime_voice_messaging_host import (
+                            _rewrite_realtime_voice_event,
+                        )
+                        event = _rewrite_realtime_voice_event(self, event, _new_text)
                         source = event.source
                     break
                 if _action == "allow":

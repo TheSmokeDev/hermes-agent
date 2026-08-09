@@ -11,6 +11,7 @@ import pytest
 from agent.realtime_voice_admission import RealtimeSessionBinding, RealtimeUtterance
 from agent.realtime_voice_provider import (
     RealtimeCapability,
+    RealtimeTool,
     RealtimeVoiceEvent,
     RealtimeVoiceProvider,
     RealtimeVoiceSession,
@@ -118,11 +119,19 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
             "content": "hello from voice",
             "display_metadata": None,
         },
-        {"id": 11, "role": "tool", "content": "inert", "display_metadata": None},
         {
-            "id": 12,
+            "id": 11,
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1"}],
+            "display_metadata": None,
+        },
+        {"id": 12, "role": "tool", "content": "inert", "display_metadata": None},
+        {
+            "id": 13,
             "role": "assistant",
             "content": "canonical answer",
+            "tool_calls": [],
             "display_metadata": None,
         },
     ]
@@ -157,7 +166,7 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
     assert seen[0].source is not source
     assert receipt.durable_session_id == entry.session_id
     assert receipt.user_message_id == 10
-    assert receipt.assistant_message_id == 12
+    assert receipt.assistant_message_id == 13
     assert host.validate_finalization(receipt)
     forged_equal_receipt = RealtimeVoiceFinalizationReceipt(
         durable_session_id=receipt.durable_session_id,
@@ -175,6 +184,75 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
 
     with pytest.raises(PermissionError, match="consumed"):
         await host.submit(binding, utterance, permit)
+
+
+@pytest.mark.asyncio
+async def test_field_equivalent_resolved_entry_is_rejected_before_canonical_work():
+    from dataclasses import replace
+
+    from gateway.realtime_voice_messaging_host import (
+        _create_messaging_host,
+        _preflight_realtime_voice_event,
+        _validate_realtime_voice_event_after_resolution,
+    )
+
+    runner, source, entry, captured, capture = _host_fixture()
+    await capture()
+    route = build_session_key(source)
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(get_messages=MagicMock(return_value=[]))
+    )
+
+    async def canonical(event: MessageEvent):
+        assert _preflight_realtime_voice_event(runner, event, route)
+        copied_entry = replace(entry)
+        assert copied_entry is not entry
+        assert copied_entry == entry
+        _validate_realtime_voice_event_after_resolution(runner, event, copied_entry)
+
+    runner._handle_message = canonical
+    host = _create_messaging_host(captured[0], runner)
+    binding = _binding(route)
+    utterance = _utterance()
+    permit = await host.authorize(binding, utterance)
+
+    with pytest.raises(PermissionError, match="exact captured session entry"):
+        await host.submit(binding, utterance, permit)
+
+
+@pytest.mark.asyncio
+async def test_legitimate_event_rewrite_preserves_and_revalidates_exact_claim():
+    from gateway.realtime_voice_messaging_host import (
+        _create_messaging_host,
+        _preflight_realtime_voice_event,
+        _rewrite_realtime_voice_event,
+        _validate_realtime_voice_event_after_resolution,
+    )
+
+    runner, source, entry, captured, capture = _host_fixture()
+    await capture()
+    route = build_session_key(source)
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(get_messages=MagicMock(return_value=[]))
+    )
+    seen = []
+
+    async def canonical(event: MessageEvent):
+        rewritten = _rewrite_realtime_voice_event(runner, event, "rewritten voice")
+        seen.append(rewritten)
+        assert _preflight_realtime_voice_event(runner, rewritten, route)
+        assert _validate_realtime_voice_event_after_resolution(runner, rewritten, entry)
+        raise RuntimeError("bounded stop after claim validation")
+
+    runner._handle_message = canonical
+    host = _create_messaging_host(captured[0], runner)
+    binding = _binding(route)
+    utterance = _utterance()
+    permit = await host.authorize(binding, utterance)
+
+    with pytest.raises(RuntimeError, match="bounded stop"):
+        await host.submit(binding, utterance, permit)
+    assert seen[0].text == "rewritten voice"
 
 
 @pytest.mark.asyncio
@@ -216,7 +294,7 @@ async def test_route_becoming_busy_after_authorize_rejects_before_handler_entry(
 
 
 @pytest.mark.asyncio
-async def test_route_becoming_busy_after_authorize_rejects_before_handler_entry():
+async def test_submit_rechecks_route_busy_after_authorize_before_handler_entry():
     from gateway.realtime_voice_messaging_host import _create_messaging_host
 
     runner, source, _entry, captured, capture = _host_fixture()
@@ -426,6 +504,35 @@ async def test_factory_open_enforces_caller_required_capabilities():
                 required_capabilities=frozenset({
                     RealtimeCapability.INPUT_COMMIT_EVENTS
                 }),
+            )
+        assert provider.opened == 0
+    finally:
+        _reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_factory_rejects_provider_tools_before_provider_open():
+    _reset_for_tests()
+    _runner, _source_value, _entry, captured, capture = _host_fixture()
+    await capture()
+    session = _Session()
+    provider = _Provider(session)
+    assert register_provider(provider)
+    setup = RealtimeVoiceSetup(
+        tools=(
+            RealtimeTool(
+                name="forbidden_tool",
+                description="must stay inert",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+    )
+    try:
+        with pytest.raises(PermissionError, match="provider tools"):
+            await captured[0].open(
+                provider.name,
+                setup,
+                provider_session_id="provider-attachment-1",
             )
         assert provider.opened == 0
     finally:

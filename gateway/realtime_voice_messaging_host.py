@@ -9,6 +9,7 @@ and following assistant row were durably persisted before returning a receipt.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ class _CanonicalClaim:
     utterance: RealtimeUtterance
     after_message_id: int
     turn_marker: str
+    captured_entry: object
     preflighted: bool = False
     resolved: bool = False
     receipt: RealtimeVoiceFinalizationReceipt | None = None
@@ -91,6 +93,15 @@ def _max_message_id(db: object, durable_session_id: str) -> int:
             if type(row.get("id")) is int and row.get("id", 0) > 0
         ),
         default=0,
+    )
+
+
+def _is_terminal_assistant_row(row: object) -> bool:
+    if type(row) is not dict or row.get("role") != "assistant":
+        return False
+    tool_calls = row.get("tool_calls")
+    return type(row.get("content")) is str and (
+        tool_calls is None or (type(tool_calls) is list and not tool_calls)
     )
 
 
@@ -219,6 +230,7 @@ class GatewayRealtimeVoiceMessagingHost:
             utterance=utterance,
             after_message_id=record.after_message_id,
             turn_marker=uuid.uuid4().hex,
+            captured_entry=self._captured_entry(),
         )
         setattr(event, _CLAIM_ATTR, claim)
         task = asyncio.create_task(runner._handle_message(event))
@@ -247,6 +259,18 @@ class GatewayRealtimeVoiceMessagingHost:
             type(receipt) is RealtimeVoiceFinalizationReceipt
             and receipt in self._finalizations
         )
+
+    def _captured_entry(self) -> object:
+        from gateway.realtime_voice_invocation import (
+            _record_for_realtime_voice_attachment_factory,
+        )
+
+        entry = _record_for_realtime_voice_attachment_factory(
+            self._factory, self._runner()
+        ).entry_ref()
+        if entry is None:
+            raise RealtimeVoiceIngressError("captured session entry is unavailable")
+        return entry
 
 
 def _create_messaging_host(
@@ -351,6 +375,10 @@ async def _open_attachment(
         raise ValueError("provider_session_id must be a nonblank normalized string")
     if type(setup) is not RealtimeVoiceSetup:
         raise TypeError("setup must be an exact RealtimeVoiceSetup")
+    if setup.tools:
+        raise RealtimeVoiceIngressError(
+            "provider tools are forbidden for the canonical messaging host"
+        )
     if type(required_capabilities) is not frozenset or any(
         type(capability) is not RealtimeCapability
         for capability in required_capabilities
@@ -393,6 +421,27 @@ def _claim_for(runner: object, event: object) -> _CanonicalClaim | None:
     return claim
 
 
+def _rewrite_realtime_voice_event(runner: object, event: object, text: str) -> object:
+    """Preserve only the exact host claim across a legitimate dataclass rewrite."""
+
+    claim = _claim_for(runner, event)
+    replacement = dataclasses.replace(event, text=text)
+    if claim is None:
+        return replacement
+    replacement_claim = getattr(replacement, _CLAIM_ATTR, None)
+    if replacement_claim is not None and replacement_claim is not claim:
+        raise RealtimeVoiceIngressError(
+            "rewritten realtime event substituted its canonical claim"
+        )
+    if replacement_claim is None:
+        setattr(replacement, _CLAIM_ATTR, claim)
+    if _claim_for(runner, replacement) is not claim:
+        raise RealtimeVoiceIngressError(
+            "rewritten realtime event lost its exact canonical claim"
+        )
+    return replacement
+
+
 def _preflight_realtime_voice_event(
     runner: object, event: object, routing_key: str
 ) -> bool:
@@ -418,10 +467,13 @@ def _validate_realtime_voice_event_after_resolution(
         return False
     if not claim.preflighted:
         raise RealtimeVoiceIngressError("realtime event bypassed canonical preflight")
+    if session_entry is not claim.captured_entry:
+        raise RealtimeVoiceIngressError(
+            "resolved session is not the exact captured session entry"
+        )
     if (
-        getattr(session_entry, "session_key", None) != claim.binding.routing_key
-        or getattr(session_entry, "session_id", None)
-        != claim.binding.durable_session_id
+        session_entry.session_key != claim.binding.routing_key
+        or session_entry.session_id != claim.binding.durable_session_id
     ):
         raise RealtimeVoiceIngressError(
             "realtime durable session changed before turn lease"
@@ -464,17 +516,11 @@ async def _finalize_realtime_voice_event(
         raise RealtimeVoiceIngressError(
             "canonical realtime user row does not match the accepted utterance"
         )
-    assistant = next(
-        (
-            row
-            for row in rows
-            if row["id"] > user["id"] and row.get("role") == "assistant"
-        ),
-        None,
-    )
-    if assistant is None:
+    following_rows = [row for row in rows if row["id"] > user["id"]]
+    assistant = following_rows[-1] if following_rows else None
+    if not _is_terminal_assistant_row(assistant):
         raise RealtimeVoiceIngressError(
-            "canonical assistant row was not durably persisted"
+            "terminal canonical assistant row was not durably persisted"
         )
     stamped = db.set_message_display_kind(
         durable_session_id,
