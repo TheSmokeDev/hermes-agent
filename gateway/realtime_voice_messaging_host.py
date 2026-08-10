@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -429,7 +430,7 @@ async def _open_attachment(
 
 
 def _claim_for(runner: object, event: object) -> _CanonicalClaim | None:
-    claim = getattr(event, _CLAIM_ATTR, None)
+    claim = inspect.getattr_static(event, _CLAIM_ATTR, None)
     if claim is None:
         return None
     if type(claim) is not _CanonicalClaim or claim.host._runner_ref() is not runner:
