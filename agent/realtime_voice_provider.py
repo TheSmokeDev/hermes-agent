@@ -615,6 +615,9 @@ class RealtimeVoiceSession(abc.ABC):
         self._completed_continuation_responses: OrderedDict[str, str] = OrderedDict()
         self._ordinary_response_ids: OrderedDict[str, None] = OrderedDict()
         self._in_flight_response_sends: set[RealtimeResponseRequest] = set()
+        self._response_send_tasks: dict[
+            RealtimeResponseRequest, asyncio.Task[None]
+        ] = {}
         self._accepted_response_send_tombstones: OrderedDict[
             RealtimeResponseRequest, None
         ] = OrderedDict()
@@ -683,10 +686,23 @@ class RealtimeVoiceSession(abc.ABC):
         ):
             raise ValueError("in-flight explicit response request send limit reached")
         self._in_flight_response_sends.add(request)
+        task = asyncio.create_task(self._run_response_send(request))
+        self._response_send_tasks[request] = task
+        task.add_done_callback(self._observe_response_send)
+        await asyncio.wait({task})
+        task.result()
+
+    def _observe_response_send(self, task: asyncio.Task[None]) -> None:
+        """Retrieve a late send exception when its original waiter was cancelled."""
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def _run_response_send(self, request: RealtimeResponseRequest) -> None:
         try:
             await self._start_response(request)
         except BaseException:
-            self._in_flight_response_sends.discard(request)
             if self._terminal_failure is None:
                 self._terminal_failure = SessionFailure(
                     code="explicit_response_failed",
@@ -699,8 +715,13 @@ class RealtimeVoiceSession(abc.ABC):
                 # remains retryable according to close().
                 pass
             raise
-        self._in_flight_response_sends.remove(request)
-        self._accepted_response_send_tombstones[request] = None
+        else:
+            self._accepted_response_send_tombstones[request] = None
+        finally:
+            self._in_flight_response_sends.discard(request)
+            current_task = asyncio.current_task()
+            if self._response_send_tasks.get(request) is current_task:
+                del self._response_send_tasks[request]
 
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
         """Send one request; return after provider acceptance, not response completion."""
@@ -735,10 +756,16 @@ class RealtimeVoiceSession(abc.ABC):
         except BaseException as exc:
             self._pending_continuation_batch_ids.clear()
             self._continuation_responses.clear()
+            externally_cancelled = (
+                isinstance(exc, asyncio.CancelledError)
+                and asyncio.current_task() is not None
+                and asyncio.current_task().cancelling() > 0
+            )
             if (
                 self._terminal_failure is not None
                 and not self._terminal_failure_delivered
-                and not isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                and not isinstance(exc, GeneratorExit)
+                and not externally_cancelled
             ):
                 self._terminal_failure_delivered = True
                 yield self._terminal_failure
