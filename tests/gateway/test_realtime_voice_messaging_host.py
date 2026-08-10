@@ -110,6 +110,29 @@ def _utterance(text: str = "hello from voice") -> RealtimeUtterance:
     )
 
 
+def test_magic_mock_event_without_installed_claim_is_ordinary():
+    from gateway.realtime_voice_messaging_host import _CLAIM_ATTR, _claim_for
+
+    event = MagicMock()
+    assert _CLAIM_ATTR not in vars(event)
+
+    assert _claim_for(object(), event) is None
+
+
+def test_explicit_noncanonical_claim_remains_rejected():
+    from gateway.realtime_voice_messaging_host import (
+        _CLAIM_ATTR,
+        RealtimeVoiceIngressError,
+        _claim_for,
+    )
+
+    event = MagicMock()
+    setattr(event, _CLAIM_ATTR, object())
+
+    with pytest.raises(RealtimeVoiceIngressError, match="invalid canonical realtime claim"):
+        _claim_for(object(), event)
+
+
 @pytest.mark.asyncio
 async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_receipt():
     from gateway.realtime_voice_messaging_host import (
