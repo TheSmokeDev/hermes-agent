@@ -17,6 +17,7 @@ from agent.realtime_voice_orchestrator import open_realtime_voice_session
 from agent.realtime_voice_provider import (
     InputTranscript,
     RealtimeCapability,
+    RealtimeResponseRequest,
     RealtimeVoiceEvent,
     RealtimeVoiceSession,
     RealtimeVoiceSetup,
@@ -90,6 +91,10 @@ class RealtimeControllerHost(Protocol):
     ) -> None: ...
 
     def validate_finalization(self, receipt: object) -> bool: ...
+
+    async def claim_native_response(
+        self, binding: RealtimeSessionBinding, finalization: object
+    ) -> RealtimeResponseRequest: ...
 
 
 class GatewayRealtimeVoiceController:

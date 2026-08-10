@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 from collections.abc import AsyncIterator
 from datetime import datetime
 from types import SimpleNamespace
@@ -214,6 +216,9 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
     assert receipt.user_message_id == 10
     assert receipt.assistant_message_id == 13
     assert host.validate_finalization(receipt)
+    native_request = await host.claim_native_response(binding, receipt)
+    assert native_request.canonical_text == "canonical answer"
+    assert not host.validate_finalization(receipt)
     forged_equal_receipt = RealtimeVoiceFinalizationReceipt(
         durable_session_id=receipt.durable_session_id,
         turn_marker=receipt.turn_marker,
@@ -230,6 +235,310 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
 
     with pytest.raises(PermissionError, match="consumed"):
         await host.submit(binding, utterance, permit)
+
+
+async def _native_response_host(rows):
+    from gateway.realtime_voice_messaging_host import (
+        RealtimeVoiceFinalizationReceipt,
+        _create_messaging_host,
+    )
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    db = MagicMock()
+    db.get_messages.return_value = rows
+    runner._session_db = SimpleNamespace(_db=db)
+    host = _create_messaging_host(captured[0], runner)
+    binding = _binding(build_session_key(source))
+    receipt = RealtimeVoiceFinalizationReceipt(
+        durable_session_id=binding.durable_session_id,
+        turn_marker="host-turn-marker",
+        user_message_id=10,
+        assistant_message_id=13,
+    )
+    host._finalizations.add(receipt)
+    return host, binding, receipt, db
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_rereads_exact_canonical_row_and_mints_request():
+    from agent.realtime_voice_provider import (
+        RealtimeOutputAudioFormat,
+        RealtimeResponseRequest,
+    )
+
+    canonical_text = "  Verbatim canonical answer. \n"
+    rows = [
+        {"id": 3, "role": "assistant", "content": "unrelated"},
+        {
+            "id": 13,
+            "role": "assistant",
+            "content": canonical_text,
+            "tool_calls": [],
+            "display_metadata": {"canonical_text": "spoofed"},
+            "provider_metadata": {"content_digest": "0" * 64},
+        },
+        {"id": 99, "role": "tool", "content": "ignored"},
+    ]
+    host, binding, receipt, db = await _native_response_host(rows)
+
+    assert tuple(inspect.signature(host.claim_native_response).parameters) == (
+        "binding",
+        "finalization",
+    )
+    request = await host.claim_native_response(binding, receipt)
+
+    assert type(request) is RealtimeResponseRequest
+    assert request.durable_session_id == binding.durable_session_id
+    assert request.assistant_message_id == 13
+    assert request.turn_marker == receipt.turn_marker
+    assert request.canonical_text == canonical_text
+    assert request.content_digest == hashlib.sha256(
+        canonical_text.encode("utf-8")
+    ).hexdigest()
+    assert request.output_audio_format == RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_rate_hz=24_000,
+        channels=1,
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+    )
+    assert request.allow_tools is False
+    db.get_messages.assert_called_once_with(
+        binding.durable_session_id, include_inactive=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_rejects_forged_equal_receipt_before_db_read():
+    from gateway.realtime_voice_messaging_host import RealtimeVoiceFinalizationReceipt
+
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    forged = RealtimeVoiceFinalizationReceipt(
+        durable_session_id=receipt.durable_session_id,
+        turn_marker=receipt.turn_marker,
+        user_message_id=receipt.user_message_id,
+        assistant_message_id=receipt.assistant_message_id,
+    )
+
+    with pytest.raises(PermissionError, match="finalization"):
+        await host.claim_native_response(binding, forged)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_consumes_before_db_and_replay():
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+
+    first, second = await asyncio.gather(
+        host.claim_native_response(binding, receipt),
+        host.claim_native_response(binding, receipt),
+        return_exceptions=True,
+    )
+
+    outcomes = (first, second)
+    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+    rejection = next(
+        outcome for outcome in outcomes if isinstance(outcome, BaseException)
+    )
+    assert isinstance(rejection, PermissionError)
+    assert "consumed" in str(rejection)
+    assert db.get_messages.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_db_failure_remains_consumed():
+    host, binding, receipt, db = await _native_response_host([])
+    db.get_messages.side_effect = RuntimeError("db unavailable")
+
+    with pytest.raises(RuntimeError, match="db unavailable"):
+        await host.claim_native_response(binding, receipt)
+    db.reset_mock()
+    db.get_messages.side_effect = None
+    db.get_messages.return_value = [
+        {"id": 13, "role": "assistant", "content": "canonical"}
+    ]
+
+    with pytest.raises(PermissionError, match="consumed"):
+        await host.claim_native_response(binding, receipt)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_requires_exact_binding_type_before_db_read():
+    class BindingLookalike:
+        def __init__(self, binding):
+            vars(self).update(
+                profile_id=binding.profile_id,
+                routing_key=binding.routing_key,
+                runtime_session_id=binding.runtime_session_id,
+                durable_session_id=binding.durable_session_id,
+                provider_session_id=binding.provider_session_id,
+                selection_generation=binding.selection_generation,
+            )
+
+        def __eq__(self, _other):
+            return True
+
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    lookalike = BindingLookalike(binding)
+
+    with pytest.raises(PermissionError, match="binding"):
+        await host.claim_native_response(lookalike, receipt)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_rejects_wrong_live_binding_before_db_read():
+    from dataclasses import replace
+
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+
+    for wrong in (
+        replace(binding, durable_session_id="other-durable"),
+        replace(binding, selection_generation=binding.selection_generation + 1),
+    ):
+        with pytest.raises(PermissionError, match="binding"):
+            await host.claim_native_response(wrong, receipt)
+    db.get_messages.assert_not_called()
+    assert host.validate_finalization(receipt)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"durable_session_id": "other-durable"},
+        {"turn_marker": ""},
+        {"turn_marker": " padded"},
+        {"turn_marker": "x" * 513},
+        {"turn_marker": "\ud800"},
+        {"user_message_id": True},
+        {"user_message_id": 0},
+        {"assistant_message_id": True},
+        {"assistant_message_id": 10},
+    ],
+)
+async def test_claim_native_response_rejects_malformed_finalization_before_db_read(
+    changes,
+):
+    from dataclasses import replace
+
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    malformed = replace(receipt, **changes)
+    host._finalizations.add(malformed)
+
+    with pytest.raises(PermissionError, match="finalization"):
+        await host.claim_native_response(binding, malformed)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        ([], "not found uniquely"),
+        (
+            [
+                {"id": 13, "role": "assistant", "content": "first"},
+                {"id": 13, "role": "assistant", "content": "duplicate"},
+            ],
+            "not found uniquely",
+        ),
+        ([{"id": True, "role": "assistant", "content": "wrong id"}], "not found"),
+        ([{"id": "13", "role": "assistant", "content": "wrong id"}], "not found"),
+        ([{"id": 13, "role": "user", "content": "wrong role"}], "not assistant"),
+        ([{"id": 13, "role": "assistant", "content": None}], "exact text"),
+        ([{"id": 13, "role": "assistant", "content": b"bytes"}], "exact text"),
+        ([{"id": 13, "role": "assistant", "content": ""}], "nonblank"),
+        ([{"id": 13, "role": "assistant", "content": " \t"}], "nonblank"),
+        ([{"id": 13, "role": "assistant", "content": "\ud800"}], "UTF-8"),
+        (
+            [{"id": 13, "role": "assistant", "content": "x" * 1_000_001}],
+            "UTF-8 byte limit",
+        ),
+        (
+            [{
+                "id": 13,
+                "role": "assistant",
+                "content": "canonical",
+                "tool_calls": [{"id": "call"}],
+            }],
+            "tool calls",
+        ),
+        (
+            [{
+                "id": 13,
+                "role": "assistant",
+                "content": "canonical",
+                "tool_calls": (),
+            }],
+            "tool calls",
+        ),
+        (
+            [{
+                "id": 13,
+                "role": "assistant",
+                "content": "canonical",
+                "tool_calls": {},
+            }],
+            "tool calls",
+        ),
+    ],
+)
+async def test_claim_native_response_fails_closed_for_noncanonical_assistant_row(
+    rows, message
+):
+    host, binding, receipt, db = await _native_response_host(rows)
+
+    with pytest.raises((PermissionError, ValueError), match=message):
+        await host.claim_native_response(binding, receipt)
+    assert db.get_messages.call_count == 1
+    assert not host.validate_finalization(receipt)
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_accepts_only_absent_none_or_exact_empty_tool_list():
+    for tool_shape in (None, []):
+        row = {"id": 13, "role": "assistant", "content": "canonical"}
+        if tool_shape is not None:
+            row["tool_calls"] = tool_shape
+        host, binding, receipt, _db = await _native_response_host([row])
+        request = await host.claim_native_response(binding, receipt)
+        assert request.canonical_text == "canonical"
+
+    host, binding, receipt, _db = await _native_response_host(
+        [{
+            "id": 13,
+            "role": "assistant",
+            "content": "canonical",
+            "tool_calls": None,
+        }]
+    )
+    assert (await host.claim_native_response(binding, receipt)).canonical_text == "canonical"
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_does_not_retain_canonical_text():
+    secret = "canonical secret text"
+    host, binding, receipt, _db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": secret}]
+    )
+
+    await host.claim_native_response(binding, receipt)
+
+    assert secret not in repr(vars(host))
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import uuid
 import weakref
@@ -17,6 +18,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent.realtime_voice_admission import RealtimeSessionBinding, RealtimeUtterance
+from agent.realtime_voice_provider import (
+    MAX_CANONICAL_RESPONSE_TEXT_BYTES,
+    MAX_IDENTIFIER_LENGTH,
+    RealtimeOutputAudioFormat,
+    RealtimeResponseRequest,
+)
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -276,6 +283,107 @@ class GatewayRealtimeVoiceMessagingHost:
         return (
             type(receipt) is RealtimeVoiceFinalizationReceipt
             and receipt in self._finalizations
+        )
+
+    async def claim_native_response(
+        self,
+        binding: RealtimeSessionBinding,
+        finalization: RealtimeVoiceFinalizationReceipt,
+    ) -> RealtimeResponseRequest:
+        """Consume one host receipt and resolve its canonical assistant row."""
+
+        if type(binding) is not RealtimeSessionBinding:
+            raise RealtimeVoiceIngressError("invalid exact realtime binding")
+        self._validate_binding(binding)
+        if type(finalization) is not RealtimeVoiceFinalizationReceipt:
+            raise RealtimeVoiceIngressError("invalid canonical finalization receipt")
+        turn_marker = finalization.turn_marker
+        if type(turn_marker) is not str:
+            raise RealtimeVoiceIngressError("invalid canonical finalization identity")
+        try:
+            turn_marker.encode("utf-8")
+        except UnicodeEncodeError:
+            raise RealtimeVoiceIngressError(
+                "invalid canonical finalization identity"
+            ) from None
+        if (
+            finalization.durable_session_id != binding.durable_session_id
+            or not turn_marker
+            or turn_marker.strip() != turn_marker
+            or len(turn_marker) > MAX_IDENTIFIER_LENGTH
+            or type(finalization.user_message_id) is not int
+            or finalization.user_message_id <= 0
+            or type(finalization.assistant_message_id) is not int
+            or finalization.assistant_message_id <= finalization.user_message_id
+        ):
+            raise RealtimeVoiceIngressError("invalid canonical finalization identity")
+
+        async with self._lock:
+            if finalization not in self._finalizations:
+                raise RealtimeVoiceIngressError(
+                    "canonical finalization was forged or already consumed"
+                )
+            self._finalizations.discard(finalization)
+
+        db = _sync_db(self._runner())
+        rows = db.get_messages(
+            binding.durable_session_id, include_inactive=True
+        )
+        matching_rows = [
+            row
+            for row in rows
+            if type(row) is dict
+            and type(row.get("id")) is int
+            and row["id"] == finalization.assistant_message_id
+        ]
+        if len(matching_rows) != 1:
+            raise RealtimeVoiceIngressError(
+                "exact canonical assistant row was not found uniquely"
+            )
+        row = matching_rows[0]
+        if type(row.get("role")) is not str or row["role"] != "assistant":
+            raise RealtimeVoiceIngressError("canonical response row is not assistant")
+        canonical_text = row.get("content")
+        if type(canonical_text) is not str:
+            raise RealtimeVoiceIngressError(
+                "canonical assistant content must be exact text"
+            )
+        tool_calls = row.get("tool_calls")
+        if tool_calls is not None and not (
+            type(tool_calls) is list and not tool_calls
+        ):
+            raise RealtimeVoiceIngressError(
+                "canonical assistant row contains tool calls"
+            )
+        if not canonical_text.strip():
+            raise RealtimeVoiceIngressError(
+                "canonical assistant content must be nonblank"
+            )
+        try:
+            canonical_bytes = canonical_text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise RealtimeVoiceIngressError(
+                "canonical assistant content must be valid UTF-8"
+            ) from None
+        if len(canonical_bytes) > MAX_CANONICAL_RESPONSE_TEXT_BYTES:
+            raise RealtimeVoiceIngressError(
+                "canonical assistant content exceeds the UTF-8 byte limit"
+            )
+        return RealtimeResponseRequest(
+            durable_session_id=binding.durable_session_id,
+            assistant_message_id=finalization.assistant_message_id,
+            turn_marker=finalization.turn_marker,
+            canonical_text=canonical_text,
+            content_digest=hashlib.sha256(canonical_bytes).hexdigest(),
+            output_audio_format=RealtimeOutputAudioFormat(
+                mime_type="audio/pcm",
+                sample_rate_hz=24_000,
+                channels=1,
+                sample_encoding="pcm_s16le",
+                sample_width_bytes=2,
+                endianness="little",
+            ),
+            allow_tools=False,
         )
 
     def _captured_entry(self) -> object:
