@@ -50,6 +50,25 @@ def test_setup_copies_and_freezes_provider_options() -> None:
     assert setup.provider_options == {"region": "local", "tags": frozenset({"local"})}
 
 
+def test_setup_preserves_legacy_sixth_positional_provider_options() -> None:
+    options = {"region": "local", "nested": ["value"]}
+
+    setup = RealtimeVoiceSetup(
+        "model",
+        "voice",
+        "instructions",
+        (),
+        RealtimeAudioFormat("audio/pcm", 24_000, 1),
+        options,
+    )
+    options["nested"].append("mutated")
+
+    assert setup.provider_options == {"region": "local", "nested": ("value",)}
+    assert setup.input_audio is None
+    assert setup.output_audio is None
+    assert setup.automatic_response is False
+
+
 def test_opaque_mappings_reject_values_that_cannot_be_frozen() -> None:
     class Mutable:
         pass
@@ -173,6 +192,43 @@ def test_exact_audio_formats_reject_numeric_lookalikes_and_pcm_contradictions() 
         RealtimeOutputAudioFormat(
             "audio/wav", 24_000, 1, "pcm_s16le", 2, "little"
         )
+
+
+def test_exact_audio_formats_require_every_exact_noncoercive_dimension() -> None:
+    class StrLookalike(str):
+        pass
+
+    class IntLookalike(int):
+        pass
+
+    valid = {
+        "mime_type": "audio/opus",
+        "sample_rate_hz": 24_000,
+        "channels": 1,
+        "sample_encoding": "opus",
+        "sample_width_bytes": 2,
+        "endianness": "little",
+    }
+    invalid_dimensions = (
+        ("sample_encoding", None),
+        ("sample_encoding", StrLookalike("pcm_s16le")),
+        ("sample_width_bytes", None),
+        ("sample_width_bytes", "2"),
+        ("sample_width_bytes", IntLookalike(2)),
+        ("endianness", None),
+        ("endianness", StrLookalike("little")),
+        ("sample_rate_hz", "24000"),
+        ("sample_rate_hz", IntLookalike(24_000)),
+        ("channels", "1"),
+        ("channels", IntLookalike(1)),
+    )
+
+    for format_type in (RealtimeInputAudioFormat, RealtimeOutputAudioFormat):
+        for field_name, invalid in invalid_dimensions:
+            values = dict(valid)
+            values[field_name] = invalid
+            with pytest.raises((TypeError, ValueError), match=field_name):
+                format_type(**values)
 
 
 @pytest.mark.parametrize("instructions", [1, b"text", object()])
@@ -600,7 +656,7 @@ async def test_start_response_is_capability_gated_exact_typed_and_replay_safe() 
         await session.start_response(object())
     await session.start_response(request)
     assert session.response_requests == [request]
-    with pytest.raises(ValueError, match="already started"):
+    with pytest.raises(ValueError, match="already accepted/sent"):
         await session.start_response(request)
     assert session.response_requests == [request]
 
@@ -609,6 +665,47 @@ async def test_start_response_is_capability_gated_exact_typed_and_replay_safe() 
     with pytest.raises(RuntimeError, match="closed"):
         await closed.start_response(_response_request(assistant_message_id=2))
     assert closed.response_requests == []
+
+
+@pytest.mark.asyncio
+async def test_start_response_replay_history_fails_closed_at_exact_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        realtime_voice_provider, "MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES", 2
+    )
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    oldest = _response_request(assistant_message_id=1)
+    newest = _response_request(assistant_message_id=2)
+    overflow = _response_request(assistant_message_id=3)
+
+    await session.start_response(oldest)
+    await session.start_response(newest)
+
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(oldest)
+    with pytest.raises(ValueError, match="replay tracking limit"):
+        await session.start_response(overflow)
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(oldest)
+
+    assert session.response_requests == [oldest, newest]
+
+
+@pytest.mark.asyncio
+async def test_explicit_response_bookkeeping_names_only_request_send_state() -> None:
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    request = _response_request()
+
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert not hasattr(session, "_active_response_requests")
+    assert not hasattr(session, "_completed_response_requests")
+
+    await session.start_response(request)
+
+    assert session._in_flight_response_sends == set()
+    assert list(session._accepted_response_send_tombstones) == [request]
 
 
 @pytest.mark.asyncio
