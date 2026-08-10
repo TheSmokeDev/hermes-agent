@@ -21,6 +21,8 @@ instances. Shared event families are:
     Session lifecycle.
 ``InputTranscript``
     User speech transcription in ``text``.
+``InputSpeechStarted``
+    Passive provider input-speech timing signal; never interruption authority.
 ``OutputTranscript``
     Assistant text in ``text``.
 ``OutputAudio``
@@ -56,6 +58,8 @@ MAX_TRACKED_ORDINARY_RESPONSES = 1024
 MAX_CANONICAL_RESPONSE_TEXT_BYTES = 1_000_000
 MAX_IN_FLIGHT_EXPLICIT_RESPONSE_SENDS = 128
 MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES = 1024
+MAX_IN_FLIGHT_RESPONSE_CANCELLATIONS = 128
+MAX_ACCEPTED_RESPONSE_CANCELLATION_TOMBSTONES = 1024
 
 
 class RealtimeCapability(StrEnum):
@@ -71,6 +75,7 @@ class RealtimeCapability(StrEnum):
     OUTPUT_TRANSCRIPTION = "output_transcription"
     CONTINUATION = "continuation"
     EXPLICIT_RESPONSE = "explicit_response"
+    RESPONSE_CANCELLATION = "response_cancellation"
 
 
 class UnsupportedRealtimeCapability(RuntimeError):
@@ -178,6 +183,31 @@ class SessionFailure(RealtimeVoiceEvent):
 
     def __post_init__(self) -> None:
         _validate_identifier(self.code, "code")
+        _freeze_provider_data(self)
+
+
+@dataclass(frozen=True, slots=True)
+class InputSpeechStarted(RealtimeVoiceEvent):
+    """Normalized passive input-speech signal with diagnostic provider data.
+
+    Hosts may use this signal as controller input, but it is not a transcript,
+    participant identity, response association, or interruption instruction.
+    """
+
+    item_id: str | None = None
+    offset_ms: int | None = None
+    provider_data: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.item_id is not None:
+            if type(self.item_id) is not str:
+                raise TypeError("item_id must be an exact str or None")
+            _validate_identifier(self.item_id, "item_id")
+        if self.offset_ms is not None:
+            if type(self.offset_ms) is not int:
+                raise TypeError("offset_ms must be a nonnegative exact int or None")
+            if self.offset_ms < 0:
+                raise ValueError("offset_ms must be nonnegative")
         _freeze_provider_data(self)
 
 
@@ -609,6 +639,7 @@ class RealtimeVoiceSession(abc.ABC):
 
     _CAPABILITY_HOOKS = {
         RealtimeCapability.EXPLICIT_RESPONSE: "_start_response",
+        RealtimeCapability.RESPONSE_CANCELLATION: "_cancel_response",
         RealtimeCapability.EXPLICIT_INTERRUPTION: "_interrupt",
         RealtimeCapability.OUTPUT_TRUNCATION: "_truncate_output",
         RealtimeCapability.INPUT_COMMIT_EVENTS: "_commit_audio",
@@ -641,6 +672,12 @@ class RealtimeVoiceSession(abc.ABC):
             _ResponseSendIdentity, None
         ] = OrderedDict()
         self._intentional_close_response_sends: set[_ResponseSendIdentity] = set()
+        self._in_flight_response_cancellations: set[str] = set()
+        self._response_cancellation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._accepted_response_cancellation_tombstones: OrderedDict[
+            str, None
+        ] = OrderedDict()
+        self._intentional_close_response_cancellations: set[str] = set()
         self._terminal_failure: SessionFailure | None = None
         self._terminal_failure_delivered = False
 
@@ -776,6 +813,101 @@ class RealtimeVoiceSession(abc.ABC):
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
         """Send one request; return after provider acceptance, not response completion."""
         raise UnsupportedRealtimeCapability(RealtimeCapability.EXPLICIT_RESPONSE)
+
+    async def cancel_response(self, response_id: str) -> None:
+        """Cancel one exact provider response at most once per session.
+
+        Return means the provider cancellation hook accepted/sent the request;
+        provider response terminality remains event-driven.
+        """
+        if type(response_id) is not str:
+            raise TypeError("response_id must be an exact str")
+        _validate_identifier(response_id, "response_id")
+        self._require(RealtimeCapability.RESPONSE_CANCELLATION)
+        if (
+            self._closed
+            or self._close_task is not None
+            or self._terminal_failure is not None
+        ):
+            raise RuntimeError("realtime session is closed")
+        if (
+            response_id in self._in_flight_response_cancellations
+            or response_id in self._accepted_response_cancellation_tombstones
+        ):
+            raise ValueError("response cancellation was already accepted/sent")
+        if (
+            len(self._accepted_response_cancellation_tombstones)
+            >= MAX_ACCEPTED_RESPONSE_CANCELLATION_TOMBSTONES
+        ):
+            raise ValueError("response cancellation replay tracking limit reached")
+        if (
+            len(self._in_flight_response_cancellations)
+            >= MAX_IN_FLIGHT_RESPONSE_CANCELLATIONS
+        ):
+            raise ValueError("in-flight response cancellation limit reached")
+
+        self._in_flight_response_cancellations.add(response_id)
+        task = asyncio.create_task(self._run_response_cancellation(response_id))
+        self._response_cancellation_tasks[response_id] = task
+        task.add_done_callback(
+            lambda completed, cancelled_response_id=response_id: (
+                self._observe_response_cancellation(
+                    cancelled_response_id, completed
+                )
+            )
+        )
+        if task.done():
+            self._cleanup_response_cancellation_task(response_id, task)
+        await asyncio.wait({task})
+        task.result()
+
+    def _cleanup_response_cancellation_task(
+        self, response_id: str, task: asyncio.Future[None]
+    ) -> None:
+        if self._response_cancellation_tasks.get(response_id) is task:
+            del self._response_cancellation_tasks[response_id]
+
+    def _observe_response_cancellation(
+        self, response_id: str, task: asyncio.Future[None]
+    ) -> None:
+        """Clean keyed state and retrieve late cancellation-hook errors."""
+        self._cleanup_response_cancellation_task(response_id, task)
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def _run_response_cancellation(self, response_id: str) -> None:
+        try:
+            await self._cancel_response(response_id)
+        except BaseException as exc:
+            intentional_close_cancel = (
+                isinstance(exc, asyncio.CancelledError)
+                and response_id in self._intentional_close_response_cancellations
+            )
+            if not intentional_close_cancel:
+                if self._terminal_failure is None:
+                    self._terminal_failure = SessionFailure(
+                        code="response_cancellation_failed",
+                        message="response cancellation provider send failed",
+                    )
+                try:
+                    await self.close()
+                except BaseException:
+                    pass
+            raise
+        else:
+            self._accepted_response_cancellation_tombstones[response_id] = None
+        finally:
+            self._in_flight_response_cancellations.discard(response_id)
+            self._intentional_close_response_cancellations.discard(response_id)
+            current_task = asyncio.current_task()
+            if self._response_cancellation_tasks.get(response_id) is current_task:
+                del self._response_cancellation_tasks[response_id]
+
+    async def _cancel_response(self, response_id: str) -> None:
+        """Provider-specific response-local cancellation send hook."""
+        raise UnsupportedRealtimeCapability(RealtimeCapability.RESPONSE_CANCELLATION)
 
     @abc.abstractmethod
     async def _submit_tool_results(
@@ -1023,6 +1155,9 @@ class RealtimeVoiceSession(abc.ABC):
             if task is None:
                 self._intentional_close_response_sends.update(
                     self._in_flight_response_sends
+                )
+                self._intentional_close_response_cancellations.update(
+                    self._in_flight_response_cancellations
                 )
                 task = asyncio.create_task(self._close())
                 self._close_task = task
