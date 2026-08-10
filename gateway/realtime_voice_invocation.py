@@ -245,12 +245,17 @@ def _mint_invocation_state(
     if type(source) is not SessionSource or source.platform is not Platform.DISCORD:
         raise RealtimeVoiceInvocationError("realtime attachment is Discord-only")
 
-    from plugins.platforms.discord.adapter import DiscordAdapter
-
     resolve_adapter = getattr(runner, "_adapter_for_source", None)
     adapter = resolve_adapter(source) if callable(resolve_adapter) else None
+    registered_adapters = getattr(runner, "adapters", None) or {}
+    profile_adapters = getattr(runner, "_profile_adapters", None) or {}
+    adapter_is_registered = adapter is registered_adapters.get(Platform.DISCORD) or any(
+        adapter is adapters.get(Platform.DISCORD)
+        for adapters in profile_adapters.values()
+    )
     if (
-        type(adapter) is not DiscordAdapter
+        adapter is None
+        or not adapter_is_registered
         or getattr(adapter, "gateway_runner", None) is not runner
     ):
         raise RealtimeVoiceInvocationError(
@@ -394,7 +399,6 @@ def _validate_realtime_voice_attachment_factory(
 
     from gateway.config import Platform
     from gateway.session import SessionSource
-    from plugins.platforms.discord.adapter import DiscordAdapter
 
     adapter = record.adapter_ref()
     resolve_adapter = getattr(runner, "_adapter_for_source", None)
@@ -409,7 +413,7 @@ def _validate_realtime_voice_attachment_factory(
         is_bot=False,
     )
     if (
-        type(adapter) is not DiscordAdapter
+        adapter is None
         or getattr(adapter, "gateway_runner", None) is not runner
         or not callable(resolve_adapter)
         or resolve_adapter(source) is not adapter

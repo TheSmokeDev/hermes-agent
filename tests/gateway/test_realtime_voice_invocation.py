@@ -197,6 +197,41 @@ async def test_production_discord_guild_sources_can_capture(chat_type):
 
 
 @pytest.mark.asyncio
+async def test_stable_plugin_namespace_discord_adapter_can_capture():
+    """Trust the exact runner-registered adapter, not its import alias identity."""
+
+    from gateway.realtime_voice_invocation import (
+        _validate_realtime_voice_attachment_factory,
+    )
+
+    source = _source()
+    runner, _entry = _runner(source)
+
+    # Production loads the bundled Discord plugin under the stable
+    # ``hermes_plugins.discord_platform`` namespace.  Importing the same source
+    # through ``plugins.platforms.discord`` creates a different class identity,
+    # even though the runner owns this exact live adapter instance.
+    class StableNamespaceDiscordAdapter:
+        pass
+
+    stable_namespace_adapter = StableNamespaceDiscordAdapter()
+    stable_namespace_adapter.gateway_runner = runner
+    runner.adapters[Platform.DISCORD] = stable_namespace_adapter
+    captured = []
+
+    await _invoke(
+        runner,
+        source,
+        lambda _args, invocation: captured.append(
+            invocation.capture_realtime_voice_attachment_factory()
+        ),
+    )
+
+    binding = _validate_realtime_voice_attachment_factory(captured[0], runner)
+    assert binding.routing_key == build_session_key(source)
+
+
+@pytest.mark.asyncio
 async def test_exact_host_factory_is_opaque_and_lookalikes_fail_closed():
     from gateway.realtime_voice_invocation import (
         _is_host_realtime_voice_attachment_factory,
