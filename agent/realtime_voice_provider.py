@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import hashlib
+import re
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
@@ -51,6 +53,9 @@ MAX_IDENTIFIER_LENGTH = 512
 MAX_OUTSTANDING_CONTINUATIONS = 128
 MAX_TRACKED_CONTINUATION_RESPONSES = 1024
 MAX_TRACKED_ORDINARY_RESPONSES = 1024
+MAX_CANONICAL_RESPONSE_TEXT_BYTES = 1_000_000
+MAX_ACTIVE_EXPLICIT_RESPONSES = 128
+MAX_TRACKED_EXPLICIT_RESPONSES = 1024
 
 
 class RealtimeCapability(StrEnum):
@@ -65,6 +70,7 @@ class RealtimeCapability(StrEnum):
     INPUT_TRANSCRIPTION = "input_transcription"
     OUTPUT_TRANSCRIPTION = "output_transcription"
     CONTINUATION = "continuation"
+    EXPLICIT_RESPONSE = "explicit_response"
 
 
 class UnsupportedRealtimeCapability(RuntimeError):
@@ -355,15 +361,126 @@ class RealtimeAudioFormat:
     mime_type: str
     sample_rate_hz: int
     channels: int
+    sample_encoding: str | None = None
+    sample_width_bytes: int | None = None
+    endianness: str | None = None
 
     def __post_init__(self) -> None:
+        if type(self.mime_type) is not str:
+            raise TypeError("mime_type must be an exact str")
         _validate_identifier(self.mime_type, "mime_type")
         for field_name in ("sample_rate_hz", "channels"):
             value = getattr(self, field_name)
-            if isinstance(value, bool) or not isinstance(value, int):
+            if type(value) is not int:
                 raise TypeError(f"{field_name} must be a positive integer")
             if value <= 0:
                 raise ValueError(f"{field_name} must be a positive integer")
+        if self.sample_encoding is not None:
+            if type(self.sample_encoding) is not str:
+                raise TypeError("sample_encoding must be an exact str")
+            _validate_identifier(self.sample_encoding, "sample_encoding")
+        if self.sample_width_bytes is not None:
+            if type(self.sample_width_bytes) is not int:
+                raise TypeError("sample_width_bytes must be a positive integer")
+            if self.sample_width_bytes <= 0:
+                raise ValueError("sample_width_bytes must be a positive integer")
+        if self.endianness is not None:
+            if type(self.endianness) is not str:
+                raise TypeError("endianness must be an exact str")
+            if self.endianness not in {"little", "big"}:
+                raise ValueError("endianness must be 'little' or 'big'")
+        pcm_match = (
+            re.fullmatch(r"pcm_[su](8|16|24|32)(le|be)?", self.sample_encoding)
+            if self.sample_encoding is not None
+            else None
+        )
+        if self.mime_type == "audio/pcm" or pcm_match is not None:
+            if pcm_match is not None and self.mime_type != "audio/pcm":
+                raise ValueError("mime_type contradicts PCM sample_encoding")
+            if pcm_match is None:
+                if any(
+                    value is not None
+                    for value in (
+                        self.sample_encoding,
+                        self.sample_width_bytes,
+                        self.endianness,
+                    )
+                ):
+                    raise ValueError("PCM fields require a canonical PCM sample_encoding")
+                return
+            bits, suffix = pcm_match.groups()
+            expected_width = int(bits) // 8
+            if self.sample_width_bytes != expected_width:
+                raise ValueError("sample_width_bytes contradicts PCM sample_encoding")
+            expected_endianness = {"le": "little", "be": "big"}.get(suffix)
+            if expected_endianness is None:
+                if expected_width != 1:
+                    raise ValueError("multi-byte PCM sample_encoding must declare endianness")
+            elif self.endianness != expected_endianness:
+                raise ValueError("endianness contradicts PCM sample_encoding")
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeInputAudioFormat(RealtimeAudioFormat):
+    """Exact provider-neutral input audio declaration."""
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeOutputAudioFormat(RealtimeAudioFormat):
+    """Exact provider-neutral output audio declaration."""
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeResponseRequest:
+    """One host-authoritative request for explicit provider-native output."""
+
+    durable_session_id: str
+    assistant_message_id: int
+    turn_marker: str
+    canonical_text: str
+    content_digest: str
+    output_audio_format: RealtimeOutputAudioFormat
+    allow_tools: bool
+
+    def __post_init__(self) -> None:
+        for field_name in ("durable_session_id", "turn_marker"):
+            value = getattr(self, field_name)
+            if type(value) is not str:
+                raise TypeError(f"{field_name} must be an exact str")
+            _validate_identifier(value, field_name)
+        if type(self.assistant_message_id) is not int:
+            raise TypeError("assistant_message_id must be a positive exact int")
+        if self.assistant_message_id <= 0:
+            raise ValueError("assistant_message_id must be a positive exact int")
+        if type(self.canonical_text) is not str:
+            raise TypeError("canonical_text must be an exact str")
+        if not self.canonical_text.strip():
+            raise ValueError("canonical_text must be nonblank")
+        try:
+            canonical_bytes = self.canonical_text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("canonical_text must be valid UTF-8 text") from exc
+        if len(canonical_bytes) > MAX_CANONICAL_RESPONSE_TEXT_BYTES:
+            raise ValueError("canonical_text exceeds the UTF-8 byte limit")
+        if type(self.content_digest) is not str or re.fullmatch(
+            r"[0-9a-f]{64}", self.content_digest
+        ) is None:
+            raise ValueError("content_digest must be lowercase SHA-256 hex")
+        if not hashlib.sha256(canonical_bytes).hexdigest() == self.content_digest:
+            raise ValueError("content_digest does not match canonical_text")
+        if type(self.output_audio_format) is not RealtimeOutputAudioFormat:
+            raise TypeError("output_audio_format must be RealtimeOutputAudioFormat")
+        if any(
+            value is None
+            for value in (
+                self.output_audio_format.sample_encoding,
+                self.output_audio_format.sample_width_bytes,
+                self.output_audio_format.endianness,
+            )
+        ):
+            raise ValueError("explicit response output_audio_format must be exact")
+        if self.allow_tools is not False:
+            raise ValueError("allow_tools must be exactly False")
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +509,9 @@ class RealtimeVoiceSetup:
     instructions: str | None = None
     tools: tuple[RealtimeTool, ...] = ()
     audio: RealtimeAudioFormat | None = None
+    input_audio: RealtimeInputAudioFormat | None = None
+    output_audio: RealtimeOutputAudioFormat | None = None
+    automatic_response: bool = False
     provider_options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -403,8 +523,27 @@ class RealtimeVoiceSetup:
             raise TypeError("instructions must be None or str")
         if self.audio is not None and not isinstance(self.audio, RealtimeAudioFormat):
             raise TypeError("audio must be None or RealtimeAudioFormat")
+        if self.input_audio is not None and type(
+            self.input_audio
+        ) is not RealtimeInputAudioFormat:
+            raise TypeError("input_audio must be None or RealtimeInputAudioFormat")
+        if self.output_audio is not None and type(
+            self.output_audio
+        ) is not RealtimeOutputAudioFormat:
+            raise TypeError("output_audio must be None or RealtimeOutputAudioFormat")
+        if type(self.automatic_response) is not bool:
+            raise TypeError("automatic_response must be a bool")
         provider_options = _freeze_mapping(self.provider_options, "provider_options")
-        shared_fields = {"audio", "instructions", "model", "tools", "voice"}
+        shared_fields = {
+            "audio",
+            "automatic_response",
+            "input_audio",
+            "instructions",
+            "model",
+            "output_audio",
+            "tools",
+            "voice",
+        }
         shadowed = shared_fields.intersection(provider_options)
         if shadowed:
             raise ValueError(
@@ -428,6 +567,7 @@ class RealtimeVoiceSession(abc.ABC):
     """One provider-neutral bidirectional session with immutable capabilities."""
 
     _CAPABILITY_HOOKS = {
+        RealtimeCapability.EXPLICIT_RESPONSE: "_start_response",
         RealtimeCapability.EXPLICIT_INTERRUPTION: "_interrupt",
         RealtimeCapability.OUTPUT_TRUNCATION: "_truncate_output",
         RealtimeCapability.INPUT_COMMIT_EVENTS: "_commit_audio",
@@ -454,6 +594,12 @@ class RealtimeVoiceSession(abc.ABC):
         self._continuation_responses: dict[str, str] = {}
         self._completed_continuation_responses: OrderedDict[str, str] = OrderedDict()
         self._ordinary_response_ids: OrderedDict[str, None] = OrderedDict()
+        self._active_response_requests: set[RealtimeResponseRequest] = set()
+        self._completed_response_requests: OrderedDict[
+            RealtimeResponseRequest, None
+        ] = OrderedDict()
+        self._terminal_failure: SessionFailure | None = None
+        self._terminal_failure_delivered = False
 
     @property
     def capabilities(self) -> frozenset[RealtimeCapability]:
@@ -486,6 +632,50 @@ class RealtimeVoiceSession(abc.ABC):
         self._require(RealtimeCapability.TOOL_CALLING)
         await self._submit_tool_results(batch_id, frozen_results)
 
+    async def start_response(self, request: RealtimeResponseRequest) -> None:
+        """Start one replay-safe provider-native response from canonical host text."""
+        if type(request) is not RealtimeResponseRequest:
+            raise TypeError("request must be an exact RealtimeResponseRequest")
+        self._require(RealtimeCapability.EXPLICIT_RESPONSE)
+        if (
+            self._closed
+            or self._close_task is not None
+            or self._terminal_failure is not None
+        ):
+            raise RuntimeError("realtime session is closed")
+        if (
+            request in self._active_response_requests
+            or request in self._completed_response_requests
+        ):
+            raise ValueError("explicit response request was already started")
+        if len(self._active_response_requests) >= MAX_ACTIVE_EXPLICIT_RESPONSES:
+            raise ValueError("active explicit response limit reached")
+        self._active_response_requests.add(request)
+        try:
+            await self._start_response(request)
+        except BaseException:
+            self._active_response_requests.discard(request)
+            if self._terminal_failure is None:
+                self._terminal_failure = SessionFailure(
+                    code="explicit_response_failed",
+                    message="explicit response provider send failed",
+                )
+            try:
+                await self.close()
+            except BaseException:
+                # Preserve the provider-send failure. The retained close lifecycle
+                # remains retryable according to close().
+                pass
+            raise
+        self._active_response_requests.remove(request)
+        self._completed_response_requests[request] = None
+        self._completed_response_requests.move_to_end(request)
+        if len(self._completed_response_requests) > MAX_TRACKED_EXPLICIT_RESPONSES:
+            self._completed_response_requests.popitem(last=False)
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        raise UnsupportedRealtimeCapability(RealtimeCapability.EXPLICIT_RESPONSE)
+
     @abc.abstractmethod
     async def _submit_tool_results(
         self, batch_id: str, results: tuple[RealtimeToolResult, ...]
@@ -497,14 +687,37 @@ class RealtimeVoiceSession(abc.ABC):
         return self._validated_events()
 
     async def _validated_events(self) -> AsyncIterator[RealtimeVoiceEvent]:
+        if self._terminal_failure is not None and not self._terminal_failure_delivered:
+            self._terminal_failure_delivered = True
+            yield self._terminal_failure
+            return
         try:
             async for event in self._events():
+                if (
+                    self._terminal_failure is not None
+                    and not self._terminal_failure_delivered
+                ):
+                    self._terminal_failure_delivered = True
+                    yield self._terminal_failure
+                    return
                 self._validate_continuation_event(event)
                 yield event
-        except BaseException:
+        except BaseException as exc:
             self._pending_continuation_batch_ids.clear()
             self._continuation_responses.clear()
+            if (
+                self._terminal_failure is not None
+                and not self._terminal_failure_delivered
+                and not isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+            ):
+                self._terminal_failure_delivered = True
+                yield self._terminal_failure
+                return
             raise
+        if self._terminal_failure is not None and not self._terminal_failure_delivered:
+            self._terminal_failure_delivered = True
+            yield self._terminal_failure
+            return
         if self._pending_continuation_batch_ids or self._continuation_responses:
             raise ValueError(
                 "event stream ended with unresolved continuation state "
