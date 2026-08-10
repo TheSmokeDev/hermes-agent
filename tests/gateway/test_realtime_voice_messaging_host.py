@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import inspect
 from collections.abc import AsyncIterator
@@ -249,6 +250,10 @@ async def _native_response_host(rows):
     db.get_messages.return_value = rows
     runner._session_db = SimpleNamespace(_db=db)
     host = _create_messaging_host(captured[0], runner)
+    # Production intentionally owns only a weak runner reference. Keep it alive
+    # explicitly for the complete helper-backed test lifetime.
+    host._test_runner = runner
+    gc.collect()
     binding = _binding(build_session_key(source))
     receipt = RealtimeVoiceFinalizationReceipt(
         durable_session_id=binding.durable_session_id,
@@ -352,9 +357,14 @@ async def test_claim_native_response_consumes_before_db_and_replay():
 
 
 @pytest.mark.asyncio
-async def test_claim_native_response_db_failure_remains_consumed():
+async def test_claim_native_response_db_failure_remains_consumed_without_holding_lock():
     host, binding, receipt, db = await _native_response_host([])
-    db.get_messages.side_effect = RuntimeError("db unavailable")
+
+    def fail_outside_lock(*_args, **_kwargs):
+        assert not host._lock.locked()
+        raise RuntimeError("db unavailable")
+
+    db.get_messages.side_effect = fail_outside_lock
 
     with pytest.raises(RuntimeError, match="db unavailable"):
         await host.claim_native_response(binding, receipt)
@@ -409,6 +419,51 @@ async def test_claim_native_response_rejects_wrong_live_binding_before_db_read()
     ):
         with pytest.raises(PermissionError, match="binding"):
             await host.claim_native_response(wrong, receipt)
+    db.get_messages.assert_not_called()
+    assert host.validate_finalization(receipt)
+
+
+@pytest.mark.asyncio
+async def test_claim_native_response_revalidates_live_binding_before_consumption():
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    runner = host._test_runner
+    entry, generation = (
+        runner.session_store.get_exact_session_entry_snapshot.return_value
+    )
+    assert generation == binding.selection_generation == 3
+    first_validation = asyncio.Event()
+    original_validate = host._validate_binding
+    validation_count = 0
+
+    def track_validation(candidate):
+        nonlocal validation_count
+        original_validate(candidate)
+        validation_count += 1
+        if validation_count == 1:
+            first_validation.set()
+
+    host._validate_binding = track_validation
+    await host._lock.acquire()
+    claim = asyncio.create_task(host.claim_native_response(binding, receipt))
+    await first_validation.wait()
+    runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 4)
+    host._lock.release()
+
+    with pytest.raises(PermissionError, match="stale"):
+        await claim
+    db.get_messages.assert_not_called()
+    assert host.validate_finalization(receipt)
+
+    # The old receipt stays owned by the now-stale host generation; a caller
+    # cannot transfer it to a freshly shaped generation-4 binding.
+    from dataclasses import replace
+
+    with pytest.raises(PermissionError, match="stale"):
+        await host.claim_native_response(
+            replace(binding, selection_generation=4), receipt
+        )
     db.get_messages.assert_not_called()
     assert host.validate_finalization(receipt)
 

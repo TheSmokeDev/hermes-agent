@@ -319,6 +319,10 @@ class GatewayRealtimeVoiceMessagingHost:
             raise RealtimeVoiceIngressError("invalid canonical finalization identity")
 
         async with self._lock:
+            # Live route authority and consume-once identity must be one atomic
+            # decision. A binding validated before waiting for this lock may
+            # have become stale while another route mutation held it.
+            self._validate_binding(binding)
             if finalization not in self._finalizations:
                 raise RealtimeVoiceIngressError(
                     "canonical finalization was forged or already consumed"
