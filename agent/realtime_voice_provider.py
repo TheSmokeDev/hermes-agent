@@ -702,18 +702,22 @@ class RealtimeVoiceSession(abc.ABC):
     async def _run_response_send(self, request: RealtimeResponseRequest) -> None:
         try:
             await self._start_response(request)
-        except BaseException:
-            if self._terminal_failure is None:
-                self._terminal_failure = SessionFailure(
-                    code="explicit_response_failed",
-                    message="explicit response provider send failed",
-                )
-            try:
-                await self.close()
-            except BaseException:
-                # Preserve the provider-send failure. The retained close lifecycle
-                # remains retryable according to close().
-                pass
+        except BaseException as exc:
+            intentional_close_cancel = isinstance(exc, asyncio.CancelledError) and (
+                self._close_task is not None or self._closed
+            )
+            if not intentional_close_cancel:
+                if self._terminal_failure is None:
+                    self._terminal_failure = SessionFailure(
+                        code="explicit_response_failed",
+                        message="explicit response provider send failed",
+                    )
+                try:
+                    await self.close()
+                except BaseException:
+                    # Preserve the provider-send failure. The retained close lifecycle
+                    # remains retryable according to close().
+                    pass
             raise
         else:
             self._accepted_response_send_tombstones[request] = None
