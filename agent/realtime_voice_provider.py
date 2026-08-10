@@ -54,8 +54,8 @@ MAX_OUTSTANDING_CONTINUATIONS = 128
 MAX_TRACKED_CONTINUATION_RESPONSES = 1024
 MAX_TRACKED_ORDINARY_RESPONSES = 1024
 MAX_CANONICAL_RESPONSE_TEXT_BYTES = 1_000_000
-MAX_ACTIVE_EXPLICIT_RESPONSES = 128
-MAX_TRACKED_EXPLICIT_RESPONSES = 1024
+MAX_IN_FLIGHT_EXPLICIT_RESPONSE_SENDS = 128
+MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES = 1024
 
 
 class RealtimeCapability(StrEnum):
@@ -424,10 +424,30 @@ class RealtimeAudioFormat:
 class RealtimeInputAudioFormat(RealtimeAudioFormat):
     """Exact provider-neutral input audio declaration."""
 
+    def __post_init__(self) -> None:
+        RealtimeAudioFormat.__post_init__(self)
+        for field_name in (
+            "sample_encoding",
+            "sample_width_bytes",
+            "endianness",
+        ):
+            if getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} is required for exact audio formats")
+
 
 @dataclass(frozen=True, slots=True)
 class RealtimeOutputAudioFormat(RealtimeAudioFormat):
     """Exact provider-neutral output audio declaration."""
+
+    def __post_init__(self) -> None:
+        RealtimeAudioFormat.__post_init__(self)
+        for field_name in (
+            "sample_encoding",
+            "sample_width_bytes",
+            "endianness",
+        ):
+            if getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} is required for exact audio formats")
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,10 +529,10 @@ class RealtimeVoiceSetup:
     instructions: str | None = None
     tools: tuple[RealtimeTool, ...] = ()
     audio: RealtimeAudioFormat | None = None
+    provider_options: Mapping[str, Any] = field(default_factory=dict)
     input_audio: RealtimeInputAudioFormat | None = None
     output_audio: RealtimeOutputAudioFormat | None = None
     automatic_response: bool = False
-    provider_options: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.model is not None:
@@ -594,8 +614,8 @@ class RealtimeVoiceSession(abc.ABC):
         self._continuation_responses: dict[str, str] = {}
         self._completed_continuation_responses: OrderedDict[str, str] = OrderedDict()
         self._ordinary_response_ids: OrderedDict[str, None] = OrderedDict()
-        self._active_response_requests: set[RealtimeResponseRequest] = set()
-        self._completed_response_requests: OrderedDict[
+        self._in_flight_response_sends: set[RealtimeResponseRequest] = set()
+        self._accepted_response_send_tombstones: OrderedDict[
             RealtimeResponseRequest, None
         ] = OrderedDict()
         self._terminal_failure: SessionFailure | None = None
@@ -633,7 +653,11 @@ class RealtimeVoiceSession(abc.ABC):
         await self._submit_tool_results(batch_id, frozen_results)
 
     async def start_response(self, request: RealtimeResponseRequest) -> None:
-        """Start one replay-safe provider-native response from canonical host text."""
+        """Send one replay-safe explicit response request from canonical host text.
+
+        A successful return records only that the provider hook accepted/sent the
+        request. Provider response completion is reported separately by events.
+        """
         if type(request) is not RealtimeResponseRequest:
             raise TypeError("request must be an exact RealtimeResponseRequest")
         self._require(RealtimeCapability.EXPLICIT_RESPONSE)
@@ -644,17 +668,25 @@ class RealtimeVoiceSession(abc.ABC):
         ):
             raise RuntimeError("realtime session is closed")
         if (
-            request in self._active_response_requests
-            or request in self._completed_response_requests
+            request in self._in_flight_response_sends
+            or request in self._accepted_response_send_tombstones
         ):
-            raise ValueError("explicit response request was already started")
-        if len(self._active_response_requests) >= MAX_ACTIVE_EXPLICIT_RESPONSES:
-            raise ValueError("active explicit response limit reached")
-        self._active_response_requests.add(request)
+            raise ValueError("explicit response request was already accepted/sent")
+        if (
+            len(self._accepted_response_send_tombstones)
+            >= MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES
+        ):
+            raise ValueError("explicit response replay tracking limit reached")
+        if (
+            len(self._in_flight_response_sends)
+            >= MAX_IN_FLIGHT_EXPLICIT_RESPONSE_SENDS
+        ):
+            raise ValueError("in-flight explicit response request send limit reached")
+        self._in_flight_response_sends.add(request)
         try:
             await self._start_response(request)
         except BaseException:
-            self._active_response_requests.discard(request)
+            self._in_flight_response_sends.discard(request)
             if self._terminal_failure is None:
                 self._terminal_failure = SessionFailure(
                     code="explicit_response_failed",
@@ -667,13 +699,11 @@ class RealtimeVoiceSession(abc.ABC):
                 # remains retryable according to close().
                 pass
             raise
-        self._active_response_requests.remove(request)
-        self._completed_response_requests[request] = None
-        self._completed_response_requests.move_to_end(request)
-        if len(self._completed_response_requests) > MAX_TRACKED_EXPLICIT_RESPONSES:
-            self._completed_response_requests.popitem(last=False)
+        self._in_flight_response_sends.remove(request)
+        self._accepted_response_send_tombstones[request] = None
 
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        """Send one request; return after provider acceptance, not response completion."""
         raise UnsupportedRealtimeCapability(RealtimeCapability.EXPLICIT_RESPONSE)
 
     @abc.abstractmethod
