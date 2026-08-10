@@ -220,7 +220,7 @@ class GatewayRealtimeVoiceMessagingHost:
         )
         event = MessageEvent(
             text=utterance.text,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.VOICE,
             source=source,
             user_id=authority.principal_id,
             metadata={},

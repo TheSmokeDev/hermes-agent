@@ -19,7 +19,7 @@ from agent.realtime_voice_provider import (
 )
 from agent.realtime_voice_registry import _reset_for_tests, register_provider
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -186,6 +186,7 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
 
     assert len(seen) == 1
     assert seen[0].text == utterance.text
+    assert seen[0].message_type is MessageType.VOICE
     assert seen[0].source is not source
     assert receipt.durable_session_id == entry.session_id
     assert receipt.user_message_id == 10
