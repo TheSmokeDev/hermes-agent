@@ -234,9 +234,25 @@ class GatewayRealtimeVoiceMessagingHost:
             captured_entry=self._captured_entry(),
         )
         setattr(event, _CLAIM_ATTR, claim)
-        task = asyncio.create_task(runner._handle_message(event))
+        from gateway.realtime_voice_invocation import (
+            _record_for_realtime_voice_attachment_factory,
+        )
+
+        adapter = _record_for_realtime_voice_attachment_factory(
+            self._factory, runner
+        ).adapter_ref()
+        process_attached = getattr(adapter, "_process_attached_message", None)
+        if not callable(process_attached):
+            raise RealtimeVoiceIngressError(
+                "captured Discord adapter has no canonical attached delivery path"
+            )
+        task = asyncio.create_task(process_attached(event, binding.routing_key))
         _retain_accepted_task(task)
-        await asyncio.shield(task)
+        adapter_completion = await asyncio.shield(task)
+        if adapter_completion is not True:
+            raise RealtimeVoiceIngressError(
+                "canonical Discord adapter returned no completion receipt"
+            )
         if claim.receipt is None:
             raise RealtimeVoiceIngressError(
                 "canonical handler returned without a durable realtime receipt"
@@ -565,12 +581,16 @@ async def _finalize_realtime_voice_event(
         raise RealtimeVoiceIngressError(
             "canonical realtime user row does not match the accepted utterance"
         )
-    following_rows = [row for row in rows if row["id"] > user["id"]]
-    assistant = following_rows[-1] if following_rows else None
-    if not _is_terminal_assistant_row(assistant):
+    terminal_assistants = [
+        row
+        for row in rows
+        if row["id"] > user["id"] and _is_terminal_assistant_row(row)
+    ]
+    if len(terminal_assistants) != 1:
         raise RealtimeVoiceIngressError(
-            "terminal canonical assistant row was not durably persisted"
+            "exact terminal canonical assistant row was not durably persisted"
         )
+    assistant = terminal_assistants[0]
     stamped = db.set_message_display_kind(
         durable_session_id,
         user["id"],

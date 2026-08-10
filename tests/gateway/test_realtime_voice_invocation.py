@@ -49,12 +49,15 @@ def _plugin_context() -> PluginContext:
 def _runner(source: SessionSource):
     from gateway.run import GatewayRunner
     from gateway.realtime_voice_invocation import _register_gateway_runner
+    from plugins.platforms.discord.adapter import DiscordAdapter
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
     )
-    runner.adapters = {Platform.DISCORD: MagicMock()}
+    adapter = DiscordAdapter(runner.config.platforms[Platform.DISCORD])
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.DISCORD: adapter}
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(
         emit=AsyncMock(), emit_collect=AsyncMock(return_value=[]), loaded_hooks=False

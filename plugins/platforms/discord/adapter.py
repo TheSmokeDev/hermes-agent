@@ -3633,7 +3633,7 @@ class DiscordAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Discord message with multiple attachments.
 
         Discord permits up to 10 file attachments per message. Batches are
@@ -3644,17 +3644,16 @@ class DiscordAdapter(BasePlatformAdapter):
         fall back to the base per-image loop.
         """
         if not self._client:
-            return
+            return SendResult(success=False, error="Discord client unavailable")
         if not images:
-            return
+            return SendResult(success=True)
 
         try:
             import discord as _discord_mod
             import io as _io
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         try:
             channel = self._client.get_channel(int(chat_id))
@@ -3662,15 +3661,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return
+                return SendResult(success=False, error=f"Discord channel {chat_id} not found")
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        failures: List[str] = []
+        last_message_id: Optional[str] = None
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -3686,11 +3686,13 @@ class DiscordAdapter(BasePlatformAdapter):
                         local_path = _unquote(image_url[7:])
                         if not os.path.exists(local_path):
                             logger.warning("[%s] Skipping missing image: %s", self.name, local_path)
+                            failures.append(f"missing image: {local_path}")
                             continue
                         files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
                     else:
                         if not is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
+                            failures.append("blocked unsafe image URL")
                             continue
                         # Download to BytesIO so it renders inline
                         try:
@@ -3711,6 +3713,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                     "[%s] Failed to download image (HTTP %d) in batch: %s",
                                     self.name, status, image_url[:80],
                                 )
+                                failures.append(f"image download failed with HTTP {status}")
                                 continue
                             ct = headers.get("content-type", "image/png")
                             ext = "png"
@@ -3723,6 +3726,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
+                            failures.append(str(dl_err) or "image download failed")
                             continue
 
                 if not files:
@@ -3736,26 +3740,41 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
 
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    chunk_result = await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
                         files=files,
                     )
+                    if not chunk_result.success:
+                        failures.append(chunk_result.error or "Discord forum image batch failed")
+                    elif chunk_result.message_id:
+                        last_message_id = chunk_result.message_id
                 else:
-                    await channel.send(content=content, files=files)
+                    message = await channel.send(content=content, files=files)
+                    last_message_id = str(message.id)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
                     self.name, chunk_idx + 1, len(chunks), e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                fallback_result = await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                if not fallback_result.success:
+                    failures.append(fallback_result.error or "Discord image fallback failed")
+                elif fallback_result.message_id:
+                    last_message_id = fallback_result.message_id
             finally:
                 if aiohttp_session is not None:
                     try:
                         await aiohttp_session.close()
                     except Exception:
                         pass
+
+        if failures:
+            return SendResult(success=False, error="; ".join(failures))
+        return SendResult(success=True, message_id=last_message_id)
 
     async def play_tts(
         self,

@@ -613,19 +613,22 @@ class _FakeDmChannel(_discord_mod.DMChannel):
         self.topic = None
 
 
-def _slash_invocation_runner(source):
+def _slash_invocation_runner(source, adapter):
     from datetime import datetime
 
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
     from gateway.realtime_voice_invocation import _register_gateway_runner
     from gateway.session import SessionEntry, build_session_key
+    from plugins.platforms.discord.adapter import DiscordAdapter
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="***")}
     )
-    runner.adapters = {Platform.DISCORD: MagicMock()}
+    assert type(adapter) is DiscordAdapter
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.DISCORD: adapter}
     entry = SessionEntry(
         session_key=build_session_key(source),
         session_id="slash-session",
@@ -667,7 +670,7 @@ async def test_native_slash_guild_event_can_capture_contextual_attachment(
     assert event.source.guild_id == "1"
     assert event.source.scope_id == "1"
     assert event.source.chat_type == expected_type
-    runner = _slash_invocation_runner(event.source)
+    runner = _slash_invocation_runner(event.source, adapter)
     captured = []
 
     await _invoke_plugin_command_with_context(
@@ -738,7 +741,7 @@ async def test_native_slash_dm_remains_unscoped_and_cannot_capture_attachment(ad
     event = adapter._build_slash_event(interaction, "/talk join")
     assert event.source.guild_id is None
     assert event.source.scope_id is None
-    runner = _slash_invocation_runner(event.source)
+    runner = _slash_invocation_runner(event.source, adapter)
 
     with pytest.raises(RealtimeVoiceInvocationError):
         await _invoke_plugin_command_with_context(

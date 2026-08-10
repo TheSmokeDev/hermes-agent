@@ -36,6 +36,7 @@ class _RealtimeVoiceAttachmentBinding:
 @dataclass(frozen=True, slots=True)
 class _FactoryRecord:
     runner_ref: weakref.ReferenceType[object]
+    adapter_ref: weakref.ReferenceType[object]
     host_state: "_GatewayHostState"
     entry_ref: weakref.ReferenceType[object]
     routing_generation: int
@@ -45,6 +46,7 @@ class _FactoryRecord:
 @dataclass(slots=True)
 class _InvocationState:
     runner: object
+    adapter: object
     host_state: "_GatewayHostState"
     entry: object
     routing_generation: int
@@ -114,6 +116,7 @@ class PluginCommandInvocation:
             factory = RealtimeVoiceAttachmentFactory(_MINT)
             record = _FactoryRecord(
                 runner_ref=weakref.ref(state.runner),
+                adapter_ref=weakref.ref(state.adapter),
                 host_state=state.host_state,
                 entry_ref=weakref.ref(state.entry),
                 routing_generation=state.routing_generation,
@@ -242,6 +245,18 @@ def _mint_invocation_state(
     if type(source) is not SessionSource or source.platform is not Platform.DISCORD:
         raise RealtimeVoiceInvocationError("realtime attachment is Discord-only")
 
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    resolve_adapter = getattr(runner, "_adapter_for_source", None)
+    adapter = resolve_adapter(source) if callable(resolve_adapter) else None
+    if (
+        type(adapter) is not DiscordAdapter
+        or getattr(adapter, "gateway_runner", None) is not runner
+    ):
+        raise RealtimeVoiceInvocationError(
+            "realtime attachment requires the exact live Discord adapter"
+        )
+
     principal_id = _exact_normalized_string(source.user_id)
     chat_id = _exact_normalized_string(source.chat_id)
     chat_type = _exact_normalized_string(source.chat_type)
@@ -295,6 +310,7 @@ def _mint_invocation_state(
     invocation = PluginCommandInvocation(_MINT)
     state = _InvocationState(
         runner=runner,
+        adapter=adapter,
         host_state=host_state,
         entry=entry,
         routing_generation=generation,
@@ -374,6 +390,32 @@ def _validate_realtime_voice_attachment_factory(
     ):
         raise RealtimeVoiceInvocationError(
             "factory belongs to a different gateway host"
+        )
+
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    adapter = record.adapter_ref()
+    resolve_adapter = getattr(runner, "_adapter_for_source", None)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=record.binding.chat_id,
+        chat_type=record.binding.chat_type,
+        user_id=record.binding.principal_id,
+        thread_id=record.binding.thread_id,
+        scope_id=record.binding.scope_id,
+        profile=record.binding.profile,
+        is_bot=False,
+    )
+    if (
+        type(adapter) is not DiscordAdapter
+        or getattr(adapter, "gateway_runner", None) is not runner
+        or not callable(resolve_adapter)
+        or resolve_adapter(source) is not adapter
+    ):
+        raise RealtimeVoiceInvocationError(
+            "factory Discord adapter is no longer the exact live route adapter"
         )
 
     store = getattr(runner, "session_store", None)

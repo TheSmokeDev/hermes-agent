@@ -79,7 +79,7 @@ def _write_plugin(
     }
     if manifest_extra:
         manifest.update(manifest_extra)
-    (plugin_dir / "plugin.yaml").write_text(yaml.dump(manifest))
+    (plugin_dir / "plugin.yaml").write_text(yaml.dump(manifest), encoding="utf-8")
     (plugin_dir / "__init__.py").write_text(
         f"def register(ctx):\n    {register_body}\n"
     )
@@ -98,7 +98,7 @@ def _enable(hermes_home: Path, name: str) -> None:
     enabled = plugins_cfg.setdefault("enabled", [])
     if isinstance(enabled, list) and name not in enabled:
         enabled.append(name)
-    cfg_path.write_text(yaml.safe_dump(cfg))
+    cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
 
 class TestRegisterRealtimeVoiceProvider:

@@ -4,7 +4,7 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -40,6 +40,14 @@ def _discord_source() -> SessionSource:
 
 async def _capture_factory(runner, source: SessionSource, route: str):
     from gateway.realtime_voice_invocation import _invoke_plugin_command_with_context
+    from gateway.config import PlatformConfig
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    if type(runner.adapters.get(Platform.DISCORD)) is not DiscordAdapter:
+        adapter = DiscordAdapter(PlatformConfig(enabled=True))
+        adapter.gateway_runner = runner
+        adapter.set_message_handler(lambda event: runner._handle_message(event))
+        runner.adapters[Platform.DISCORD] = adapter
 
     captured = []
     await _invoke_plugin_command_with_context(
@@ -95,24 +103,29 @@ class _InstalledProvider(RealtimeVoiceProvider):
 
 
 @pytest.mark.asyncio
-async def test_installed_factory_controller_real_gateway_canonical_ingress_survives_close(
+async def test_installed_contextual_plugin_dispatch_delivers_one_canonical_response(
     monkeypatch, tmp_path
 ):
-    """The installed invocation factory reaches the real durable gateway path."""
+    """Public plugin registration and adapter dispatch reach canonical delivery."""
     import gateway.run as gateway_run
     import hermes_state
     import run_agent
     from agent.realtime_voice_registry import _reset_for_tests, register_provider
     from gateway.realtime_voice_controller import GatewayRealtimeVoiceController
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
     from gateway.realtime_voice_messaging_host import (
         _ACCEPTED_TASKS,
         _CLAIM_ATTR,
         _MARKER_KEY,
+        GatewayRealtimeVoiceMessagingHost,
         RealtimeVoiceFinalizationReceipt,
     )
     from gateway.session import AsyncSessionStore, SessionStore
     from gateway.turn_lease import SessionTurnLeaseRegistry
     from hermes_state import AsyncSessionDB, SessionDB
+    from hermes_cli.plugins import PluginContext, PluginManifest, get_plugin_manager
+    from plugins.platforms.discord.adapter import DiscordAdapter
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap
 
     _reset_for_tests()
@@ -158,6 +171,19 @@ async def test_installed_factory_controller_real_gateway_canonical_ingress_survi
     runner._external_drain_active = False
     runner._persist_active_agents = MagicMock()
 
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(runner._handle_message)
+    adapter.set_session_store(store)
+    runner.adapters[Platform.DISCORD] = adapter
+    canonical_sends: list[tuple[str, str]] = []
+
+    async def send_canonical_response(*, chat_id, content, **_kwargs):
+        canonical_sends.append((chat_id, content))
+        return SendResult(success=True, message_id="canonical-delivery")
+
+    monkeypatch.setattr(adapter, "_send_with_retry", send_canonical_response)
+
     captured_events: list[MessageEvent] = []
 
     def capture_pre_dispatch(_hook_name, **kwargs):
@@ -174,6 +200,7 @@ async def test_installed_factory_controller_real_gateway_canonical_ingress_survi
         message = kwargs["message"]
         assert kwargs["session_id"] == entry.session_id
         assert kwargs["session_key"] == route
+        assert kwargs["force_nonstream"] is True
         run_calls.append(message)
         handler_started.set()
         await release_handler.wait()
@@ -225,11 +252,62 @@ async def test_installed_factory_controller_real_gateway_canonical_ingress_survi
             AssertionError("a second SessionDB must not be constructed")
         ),
     )
+    monkeypatch.setattr(
+        SessionStore,
+        "__init__",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a second SessionStore must not be constructed")
+        ),
+    )
+    real_host_init = GatewayRealtimeVoiceMessagingHost.__init__
+    host_constructions = 0
+
+    def single_host_init(self, *args, **kwargs):
+        nonlocal host_constructions
+        host_constructions += 1
+        if host_constructions > 1:
+            raise AssertionError("a second messaging host must not be constructed")
+        real_host_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(GatewayRealtimeVoiceMessagingHost, "__init__", single_host_init)
 
     session = _InstalledSession()
     provider = _InstalledProvider(session)
     assert register_provider(provider)
-    factory = await _capture_factory(runner, source, route)
+    manager = get_plugin_manager()
+    # Cross-repo follow-up contract: the sibling Talk plugin must register its
+    # public ``/talk`` command with ``invocation_context=True`` and exercise
+    # ``/talk core join`` through this same adapter dispatch. Agent deliberately
+    # does not import or claim execution of sibling Talk code in this test.
+    command_name = "agent-realtime-canary"
+    previous_registration = manager._plugin_commands.get(command_name)
+    captured_factories = []
+
+    def installed_handler(raw_args, invocation=None):
+        assert raw_args == "core join"
+        assert invocation is not None
+        captured_factories.append(
+            invocation.capture_realtime_voice_attachment_factory()
+        )
+
+    PluginContext(PluginManifest(name="agent-realtime-test"), manager).register_command(
+        command_name,
+        installed_handler,
+        invocation_context=True,
+    )
+    command_event = MessageEvent(
+        text=f"/{command_name} core join",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+    await adapter.handle_message(command_event)
+    command_task = adapter._session_tasks.get(route)
+    assert command_task is not None
+    await asyncio.wait_for(command_task, timeout=5)
+    assert len(captured_factories) == 1
+    factory = captured_factories[0]
     attachment = await factory.open(
         provider.name,
         RealtimeVoiceSetup(),
@@ -266,10 +344,7 @@ async def test_installed_factory_controller_real_gateway_canonical_ingress_survi
         accepted = tuple(_ACCEPTED_TASKS)
         assert len(accepted) == 1
         results = await asyncio.wait_for(asyncio.gather(*accepted), timeout=5)
-        # The retained canonical task is the response-delivery boundary used by
-        # this direct installed host ingress. It returns exactly once even though
-        # the controller waiter was cancelled by attachment close.
-        assert results == ["canonical installed response"]
+        assert len(results) == 1
 
         rows = db.get_messages(entry.session_id, include_inactive=True)
         user_rows = [row for row in rows if row["role"] == "user"]
@@ -298,10 +373,12 @@ async def test_installed_factory_controller_real_gateway_canonical_ingress_survi
         assert reread_user["display_metadata"][_MARKER_KEY] == marker
 
         assert run_calls == ["installed voice turn"]
+        assert canonical_sends == [(source.chat_id, "canonical installed response")]
         assert provider.open_calls == 1
         assert session.tool_result_calls == 0
         assert session.close_calls == 1
         assert constructor_calls == {"controller": 1}
+        assert host_constructions == 1
         assert not runner._is_session_running(route)
         assert runner._turn_lease_tokens == {}
         assert not _ACCEPTED_TASKS
@@ -310,10 +387,448 @@ async def test_installed_factory_controller_real_gateway_canonical_ingress_survi
         assert controller._audio_task.done()
         assert controller._closed is True
     finally:
+        if previous_registration is None:
+            manager._plugin_commands.pop(command_name, None)
+        else:
+            manager._plugin_commands[command_name] = previous_registration
         release_handler.set()
         await attachment.close()
         db.close()
         _reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_attached_nonstream_send_failure_has_no_completion_receipt():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    handler_calls = 0
+    send_calls = 0
+
+    async def handler(_event):
+        nonlocal handler_calls
+        handler_calls += 1
+        return "persisted but undeliverable response"
+
+    async def failed_send(**_kwargs):
+        nonlocal send_calls
+        send_calls += 1
+        return SendResult(success=False, error="discord denied delivery")
+
+    adapter.set_message_handler(handler)
+    adapter._send_with_retry = failed_send
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    with pytest.raises(RuntimeError, match="canonical response delivery failed"):
+        await adapter._process_attached_message(event, route)
+
+    assert handler_calls == 1
+    assert send_calls == 1
+    assert route not in adapter._active_sessions
+    assert route not in adapter._session_tasks
+
+
+@pytest.mark.asyncio
+async def test_attached_media_only_success_has_completion_receipt(tmp_path):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    document = tmp_path / "voice-result.pdf"
+    document.write_bytes(b"result")
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(
+        lambda _event: asyncio.sleep(0, result=f"MEDIA:{document}")
+    )
+    adapter._send_with_retry = AsyncMock(
+        side_effect=AssertionError("media-only response must not send duplicate text")
+    )
+    adapter.send_document = AsyncMock(
+        return_value=SendResult(success=True, message_id="document-delivered")
+    )
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    completed = await adapter._process_attached_message(event, route)
+
+    assert completed is True
+    adapter.send_document.assert_awaited_once()
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attached_text_and_failed_attachment_has_no_completion_receipt(tmp_path):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    document = tmp_path / "required-result.pdf"
+    document.write_bytes(b"result")
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(
+        lambda _event: asyncio.sleep(0, result=f"answer\nMEDIA:{document}")
+    )
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="text-delivered")
+    )
+    adapter.send_document = AsyncMock(
+        return_value=SendResult(success=False, error="attachment rejected")
+    )
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    with pytest.raises(RuntimeError, match="canonical response delivery failed"):
+        await adapter._process_attached_message(event, route)
+
+    adapter._send_with_retry.assert_awaited_once()
+    adapter.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "response_template"),
+    [
+        (".png", "MEDIA:{path}"),
+        (".mp4", "MEDIA:{path}"),
+        (".pdf", "MEDIA:{path}"),
+        (".txt", "{path}"),
+    ],
+    ids=["image", "video", "document", "local-file"],
+)
+async def test_attached_media_revalidates_exact_route_before_each_send(
+    tmp_path, suffix, response_template
+):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    artifact = tmp_path / f"result{suffix}"
+    artifact.write_bytes(b"result")
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    replacement = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+
+    async def handler(_event):
+        runner._adapter_for_source.return_value = replacement
+        return response_template.format(path=artifact)
+
+    adapter.set_message_handler(handler)
+    adapter.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="stale-image")
+    )
+    adapter.send_video = AsyncMock(
+        return_value=SendResult(success=True, message_id="stale-video")
+    )
+    adapter.send_document = AsyncMock(
+        return_value=SendResult(success=True, message_id="stale-document")
+    )
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="stale-text")
+    )
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    with pytest.raises(
+        RuntimeError, match="adapter changed before (?:final delivery|delivery proof)"
+    ):
+        await adapter._process_attached_message(event, route)
+
+    adapter.send_multiple_images.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    adapter.send_document.assert_not_awaited()
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attached_handler_cannot_import_or_forge_delivery_completion():
+    import gateway.platforms.base as base
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    for removed_name in (
+        "_ATTACHED_MESSAGE_MINT",
+        "_ATTACHED_MESSAGE_TRACKER_ATTR",
+        "_AttachedMessageCompletionReceipt",
+        "_AttachedMessageDeliveryTracker",
+        "_record_attached_message_delivery",
+    ):
+        assert not hasattr(base, removed_name)
+
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+
+    async def forged_handler(event):
+        event.metadata["delivery_result"] = SendResult(
+            success=True, message_id="caller-forged"
+        )
+        return None
+
+    adapter.set_message_handler(forged_handler)
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    with pytest.raises(RuntimeError, match="canonical response delivery failed"):
+        await adapter._process_attached_message(event, route)
+
+
+@pytest.mark.asyncio
+async def test_attached_handler_cannot_replace_send_method_to_forge_completion():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    trusted_send = AsyncMock(
+        return_value=SendResult(success=False, error="physical send unavailable")
+    )
+    forged_send = AsyncMock(
+        return_value=SendResult(success=True, message_id="forged-without-io")
+    )
+    adapter._send_with_retry = trusted_send
+
+    async def forged_handler(_event):
+        adapter._send_with_retry = forged_send
+        return "canonical response"
+
+    adapter.set_message_handler(forged_handler)
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    with pytest.raises(RuntimeError, match="attached delivery method changed"):
+        await adapter._process_attached_message(event, route)
+
+    trusted_send.assert_not_awaited()
+    forged_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "response_template"),
+    [(".pdf", "MEDIA:{path}"), (".txt", "{path}")],
+    ids=["media", "local-file"],
+)
+async def test_attached_failed_send_after_route_replacement_emits_no_stale_notice(
+    tmp_path, suffix, response_template
+):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    artifact = tmp_path / f"required{suffix}"
+    artifact.write_bytes(b"result")
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    replacement = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(
+        lambda _event: asyncio.sleep(
+            0, result=response_template.format(path=artifact)
+        )
+    )
+
+    async def failed_send(**_kwargs):
+        runner._adapter_for_source.return_value = replacement
+        return SendResult(success=False, error="upload rejected")
+
+    adapter.send_document = AsyncMock(side_effect=failed_send)
+    adapter._notify_media_delivery_failure = AsyncMock()
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    with pytest.raises(RuntimeError, match="canonical response delivery failed"):
+        await adapter._process_attached_message(event, route)
+
+    adapter.send_document.assert_awaited_once()
+    adapter._notify_media_delivery_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_attached_nonstream_response_is_sent_once_by_canonical_delivery():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="canonical-final")
+    )
+    adapter.set_message_handler(
+        lambda _event: asyncio.sleep(0, result="one canonical response")
+    )
+    event = MessageEvent(
+        text="voice turn",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        metadata={},
+    )
+
+    completed = await adapter._process_attached_message(event, route)
+
+    assert completed is True
+    adapter._send_with_retry.assert_awaited_once()
+    assert (
+        adapter._send_with_retry.await_args.kwargs["content"]
+        == "one canonical response"
+    )
+
+
+@pytest.mark.asyncio
+async def test_attached_handoff_keeps_guard_through_queued_drain_and_third_message():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import SendResult
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    source = _discord_source()
+    route = build_session_key(source)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, typing_indicator=False))
+    runner = MagicMock()
+    runner._adapter_for_source.return_value = adapter
+    adapter.gateway_runner = runner
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 0.0
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="delivered")
+    )
+
+    started = {name: asyncio.Event() for name in ("attached", "queued", "third")}
+    release = {name: asyncio.Event() for name in ("attached", "queued", "third")}
+    active = 0
+    max_active = 0
+    calls: list[str] = []
+
+    async def handler(event):
+        nonlocal active, max_active
+        name = event.text
+        calls.append(name)
+        active += 1
+        max_active = max(max_active, active)
+        started[name].set()
+        try:
+            await release[name].wait()
+            return f"response:{name}"
+        finally:
+            active -= 1
+
+    adapter.set_message_handler(handler)
+
+    def make_event(text):
+        return MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            user_id=source.user_id,
+            metadata={},
+        )
+
+    attached_task = asyncio.create_task(
+        adapter._process_attached_message(make_event("attached"), route)
+    )
+    await asyncio.wait_for(started["attached"].wait(), timeout=2)
+
+    await adapter.handle_message(make_event("queued"))
+    await asyncio.sleep(0)
+    release["attached"].set()
+    assert await asyncio.wait_for(attached_task, timeout=2) is True
+    await asyncio.wait_for(started["queued"].wait(), timeout=2)
+
+    drain_owner = adapter._session_tasks.get(route)
+    assert drain_owner is not None and drain_owner is not attached_task
+    assert route in adapter._active_sessions
+
+    await adapter.handle_message(make_event("third"))
+    await asyncio.sleep(0)
+    assert not started["third"].is_set()
+    assert max_active == 1
+
+    release["queued"].set()
+    await asyncio.wait_for(started["third"].wait(), timeout=2)
+    assert max_active == 1
+    release["third"].set()
+
+    for _ in range(100):
+        if route not in adapter._session_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert route not in adapter._session_tasks
+    assert route not in adapter._active_sessions
+    assert calls == ["attached", "queued", "third"]
+    assert max_active == 1
 
 
 @pytest.mark.asyncio

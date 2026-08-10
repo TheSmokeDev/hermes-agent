@@ -4513,7 +4513,7 @@ class TurnRunner:
             ctx.user_config, platform_key, "streaming"
         )
         # None = no per-platform override → follow global config
-        _streaming_enabled = (
+        _streaming_enabled = not ctx.force_nonstream and (
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
@@ -14997,10 +14997,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
-            # Contextual plugin commands can capture host-owned capabilities.
-            # They are deliberately idle-only: an unrecognized plugin slash
-            # command must never fall through to the ordinary text path and
-            # interrupt, steer, merge, or queue against the active turn.
+            # Contextual plugin controls must run before generic busy handling.
+            # They own their own subcommand policy (for example Talk leave,
+            # status, and core join) and must never steer, interrupt, persist,
+            # merge, or queue against the canonically accepted turn.
             if _evt_cmd and _cmd_def_inner is None:
                 try:
                     from hermes_cli.plugins import get_plugin_command_registration
@@ -15013,10 +15013,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if (
                     _busy_plugin_registration is not None
                     and _busy_plugin_registration.get("invocation_context") is True
+                    and callable(_busy_plugin_registration.get("handler"))
+                    and source.platform is Platform.DISCORD
+                    and not is_internal
+                    and self._is_user_authorized(source)
                 ):
+                    _busy_plugin_handler = _busy_plugin_registration["handler"]
+                    _busy_plugin_args = event.get_command_args().strip()
+                    from gateway.realtime_voice_invocation import (
+                        _invoke_plugin_command_with_context,
+                    )
+
+                    _busy_plugin_result = await _invoke_plugin_command_with_context(
+                        runner=self,
+                        handler=_busy_plugin_handler,
+                        raw_args=_busy_plugin_args,
+                        source=source,
+                        routing_key=_quick_key,
+                        authenticated=True,
+                        internal=False,
+                    )
                     return (
-                        "⏳ This session is busy with an active turn. "
-                        "Wait for it to finish, then retry the command."
+                        str(_busy_plugin_result)
+                        if _busy_plugin_result
+                        else None
                     )
 
             # /status and /context are intentionally pre-gate so users
@@ -17972,6 +17992,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            from gateway.realtime_voice_messaging_host import _claim_for
+
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -17986,6 +18008,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                force_nonstream=_claim_for(self, event) is not None,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -18577,6 +18600,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                _stream_adapter = self._adapter_for_source(source)
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
@@ -19758,6 +19782,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
+                if self._adapter_for_source(event.source) is not adapter:
+                    raise RuntimeError("route adapter changed before voice delivery")
                 await adapter.send_voice(**send_kwargs)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
@@ -19792,6 +19818,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
+
+        def current_adapter():
+            resolve = getattr(self, "_adapter_for_source", None)
+            if callable(resolve) and resolve(event.source) is not adapter:
+                raise RuntimeError("route adapter changed before media delivery")
+            return adapter
 
         try:
             # Capture [[as_document]] before extract_media strips it, so the
@@ -19841,8 +19873,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    images = [("file://" + _quote(p, safe=":/\\"), "") for p in image_paths]
+                    await current_adapter().send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
@@ -19854,19 +19886,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        await current_adapter().send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        await current_adapter().send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        await current_adapter().send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
@@ -24450,6 +24482,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        force_nonstream: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -24550,7 +24583,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
         )
-        _streaming_enabled = (
+        _streaming_enabled = not force_nonstream and (
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
@@ -24741,6 +24774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        force_nonstream: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -24760,6 +24794,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                force_nonstream=force_nonstream,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -24772,6 +24807,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                force_nonstream=force_nonstream,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24894,6 +24930,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        force_nonstream: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24918,6 +24955,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                force_nonstream=force_nonstream,
             )
 
         from run_agent import AIAgent
@@ -25178,6 +25216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            force_nonstream=force_nonstream,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -26589,17 +26628,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _transformed_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transformed_result, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

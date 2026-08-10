@@ -3927,7 +3927,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3942,6 +3942,8 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        failures: list[str] = []
+        last_message_id: Optional[str] = None
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3973,10 +3975,19 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                if not img_result.success:
+                if img_result.success:
+                    if img_result.message_id:
+                        last_message_id = img_result.message_id
+                else:
+                    failures.append(img_result.error or "image delivery failed")
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
+                failures.append(str(img_err) or "image delivery raised")
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+
+        if failures:
+            return SendResult(success=False, error="; ".join(failures))
+        return SendResult(success=True, message_id=last_message_id)
 
     async def send_image(
         self,
@@ -5560,6 +5571,52 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    async def _process_attached_message(
+        self, event: MessageEvent, session_key: str
+    ) -> bool:
+        """Await one idle-only host attachment and its local delivery ledger."""
+
+        owner_task = asyncio.current_task()
+        if owner_task is None or not self._message_handler:
+            raise RuntimeError("attached message processing is unavailable")
+        expected_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+        if expected_key != session_key or event.source.platform is not self.platform:
+            raise RuntimeError("attached message routing does not match this adapter")
+
+        self._heal_stale_session_lock(session_key)
+        if (
+            session_key in self._active_sessions
+            or session_key in self._session_tasks
+            or session_key in self._pending_messages
+            or session_key in self._text_debounce_store()
+        ):
+            raise RuntimeError("attached message route is busy")
+
+        guard = asyncio.Event()
+        self._active_sessions[session_key] = guard
+        self._session_tasks[session_key] = owner_task
+        try:
+            completed = await self._process_message_background(
+                event, session_key, require_delivery_completion=True
+            )
+        finally:
+            # _process_message_background may transfer both task and guard
+            # ownership to a queued drain. Never release state owned by it.
+            if self._session_tasks.get(session_key) is owner_task:
+                self._cleanup_finished_session_task(session_key, guard)
+
+        if completed is not True:
+            raise RuntimeError("attached canonical response delivery failed")
+        return True
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -5616,7 +5673,14 @@ class BasePlatformAdapter(ABC):
                 should_bypass_active_session,
             )
 
-            if should_bypass_active_session(cmd):
+            bypass_active_session = should_bypass_active_session(
+                cmd,
+                event=event,
+                adapter=self,
+                runner=getattr(self, "gateway_runner", None),
+            )
+
+            if bypass_active_session:
                 # /stop, /new, /reset must cancel the in-flight adapter task
                 # and preserve ordering of queued follow-ups.  Route those
                 # through the dedicated handoff path that serializes
@@ -5792,19 +5856,100 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
-    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
-        """Background task that actually processes the message."""
-        # Track delivery outcomes for the processing-complete hook
+    async def _process_message_background(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        require_delivery_completion: bool = False,
+    ) -> Optional[bool]:
+        """Background task that actually processes the message.
+
+        Attached ingress gets a response-local authoritative ledger. Only the
+        concrete delivery branches below can mutate it; handler return values
+        and direct handler-owned adapter calls carry no completion authority.
+        """
         delivery_attempted = False
         delivery_succeeded = False
+        required_deliveries = 0
+        successful_deliveries = 0
+        processing_failed = False
+
+        # Bind every attached-turn delivery operation before the canonical
+        # handler runs. The handler shares this adapter object, so consulting
+        # mutable instance attributes afterward would let it replace a send
+        # method and forge a successful SendResult without platform I/O.
+        # These references remain invocation-local and carry no completion
+        # authority outside this exact call.
+        _attached_delivery_methods = (
+            {
+                name: getattr(self, name)
+                for name in (
+                    "_send_with_retry",
+                    "play_tts",
+                    "send_multiple_images",
+                    "send_voice",
+                    "send_video",
+                    "send_document",
+                )
+            }
+            if require_delivery_completion
+            else {}
+        )
+
+        def _same_callable(left, right) -> bool:
+            if left is right:
+                return True
+            if not (inspect.ismethod(left) and inspect.ismethod(right)):
+                return False
+            return (
+                left.__self__ is right.__self__
+                and left.__func__ is right.__func__
+            )
+
+        def _delivery_method(name: str):
+            owner = _delivery_owner()
+            current = getattr(owner, name)
+            if not require_delivery_completion:
+                return current
+            trusted = _attached_delivery_methods[name]
+            if not _same_callable(current, trusted):
+                raise RuntimeError(
+                    "attached delivery method changed before final delivery"
+                )
+            return trusted
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
+            nonlocal required_deliveries, successful_deliveries
+            if require_delivery_completion:
+                required_deliveries += 1
+                if isinstance(result, SendResult) and result.success is True:
+                    successful_deliveries += 1
             if result is None:
                 return
             delivery_attempted = True
-            if getattr(result, "success", False):
+            if isinstance(result, SendResult) and result.success:
                 delivery_succeeded = True
+
+        def _delivery_owner():
+            if (
+                require_delivery_completion
+                and self._final_delivery_adapter(event.source) is not self
+            ):
+                raise RuntimeError(
+                    "attached message adapter changed before final delivery"
+                )
+            return self
+
+        def _attached_completed() -> Optional[bool]:
+            if not require_delivery_completion:
+                return None
+            return (
+                not processing_failed
+                and required_deliveries > 0
+                and successful_deliveries == required_deliveries
+            )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6020,12 +6165,13 @@ class BasePlatformAdapter(ABC):
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
+                        tts_result = await _delivery_method("play_tts")(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -6048,6 +6194,13 @@ class BasePlatformAdapter(ABC):
                 # the current transport before sending it.
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = self._final_delivery_adapter(event.source)
+                    if (
+                        require_delivery_completion
+                        and delivery_adapter is not self
+                    ):
+                        raise RuntimeError(
+                            "attached message adapter changed before final delivery"
+                        )
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
                         delivery_adapter.name,
@@ -6097,7 +6250,12 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
+                    send_with_retry = (
+                        _delivery_method("_send_with_retry")
+                        if require_delivery_completion
+                        else delivery_adapter._send_with_retry
+                    )
+                    result = await send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
@@ -6145,13 +6303,17 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await _delivery_method("send_multiple_images")(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
+                        _record_delivery(None)
+                        if require_delivery_completion:
+                            raise
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -6186,14 +6348,18 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        _batch = [("file://" + _quote(p, safe=":/\\"), "") for p in _image_paths]
+                        image_result = await _delivery_method("send_multiple_images")(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
+                        _record_delivery(None)
+                        if require_delivery_completion:
+                            raise
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
@@ -6208,7 +6374,7 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(media_path).suffix.lower()
                         if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
+                            media_result = await _delivery_method("send_voice")(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
@@ -6220,27 +6386,32 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 event.source.chat_id,
                             )
-                            media_result = await self.send_video(
+                            media_result = await _delivery_method("send_video")(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            media_result = await self.send_document(
+                            media_result = await _delivery_method("send_document")(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                media_path,
-                                is_voice=is_voice,
-                                metadata=_final_thread_metadata,
-                            )
+                            if not require_delivery_completion:
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    media_path,
+                                    is_voice=is_voice,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as media_err:
+                        _record_delivery(None)
+                        if require_delivery_completion:
+                            raise
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -6250,17 +6421,18 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            file_result = await self.send_video(
+                            file_result = await _delivery_method("send_video")(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            file_result = await self.send_document(
+                            file_result = await _delivery_method("send_document")(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -6268,12 +6440,16 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
-                                event.source.chat_id,
-                                file_path,
-                                metadata=_final_thread_metadata,
-                            )
+                            if not require_delivery_completion:
+                                await self._notify_media_delivery_failure(
+                                    event.source.chat_id,
+                                    file_path,
+                                    metadata=_final_thread_metadata,
+                                )
                     except Exception as file_err:
+                        _record_delivery(None)
+                        if require_delivery_completion:
+                            raise
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -6349,9 +6525,12 @@ class BasePlatformAdapter(ABC):
                 except TypeError:
                     # Tests stub create_task() with non-hashable sentinels; tolerate.
                     pass
-                return  # Drain task owns the session now.
+                return _attached_completed()  # Drain task owns the session now.
+
+            return _attached_completed()
                 
         except asyncio.CancelledError:
+            processing_failed = True
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6359,8 +6538,11 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            processing_failed = True
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if require_delivery_completion:
+                raise
             # Send the error to the user so they aren't left with radio silence
             try:
                 error_type = type(e).__name__

@@ -97,6 +97,7 @@ class TurnContext:
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
+    force_nonstream: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------
     AIAgent: Any = None

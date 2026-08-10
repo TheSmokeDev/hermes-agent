@@ -473,27 +473,55 @@ def is_interrupt_then_dispatch(command_name: str | None) -> bool:
     return cmd is not None and cmd.busy_policy == "interrupt_then_dispatch"
 
 
-def should_bypass_active_session(command_name: str | None) -> bool:
-    """Return True for any resolvable slash command.
+def should_bypass_active_session(
+    command_name: str | None,
+    *,
+    event: Any = None,
+    adapter: Any = None,
+    runner: Any = None,
+) -> bool:
+    """Return whether a slash command may bypass an active-session guard.
 
-    Rationale: every gateway-registered slash command either has a
-    specific Level-2 handler in gateway/run.py (/stop, /new, /model,
-    /approve, etc.) or reaches the running-agent catch-all that returns
-    a "busy — wait or /stop first" response. In both paths the command
-    is dispatched, not queued.
-
-    Queueing is always wrong for a recognized slash command because the
-    safety net in gateway.run discards any command text that reaches
-    the pending queue — which meant a mid-run /model (or /reasoning,
-    /voice, /insights, /title, /resume, /retry, /undo, /compress,
-    /usage, /reload-mcp, /sethome, /reset) would silently
-    interrupt the agent AND get discarded, producing a zero-char
-    response. See issue #5057 / PRs #6252, #10370, #4665.
-
-    ACTIVE_SESSION_BYPASS_COMMANDS remains the subset of commands with
-    explicit Level-2 handlers; the rest fall through to the catch-all.
+    Built-in commands retain their registry-declared behavior. Contextual plugin
+    commands are admitted only for an external, positively authorized Discord
+    event routed through the exact live adapter and gateway runner. This keeps
+    control commands such as ``/talk leave`` out of the conversational queue
+    without turning plugin registration metadata into an authorization signal.
     """
-    return resolve_command(command_name) is not None if command_name else False
+
+    if not command_name:
+        return False
+    if resolve_command(command_name) is not None:
+        return True
+
+    try:
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+        from hermes_cli.plugins import get_plugin_command_registration
+
+        registration = get_plugin_command_registration(
+            command_name.replace("_", "-")
+        )
+        source = getattr(event, "source", None)
+        resolve_adapter = getattr(runner, "_adapter_for_source", None)
+        authorize = getattr(runner, "_is_user_authorized", None)
+        return bool(
+            isinstance(registration, dict)
+            and registration.get("invocation_context") is True
+            and callable(registration.get("handler"))
+            and type(runner) is GatewayRunner
+            and type(source) is SessionSource
+            and source.platform is Platform.DISCORD
+            and getattr(event, "internal", None) is False
+            and getattr(adapter, "gateway_runner", None) is runner
+            and callable(resolve_adapter)
+            and resolve_adapter(source) is adapter
+            and callable(authorize)
+            and authorize(source) is True
+        )
+    except Exception:
+        return False
 
 
 def _resolve_config_gates() -> set[str]:

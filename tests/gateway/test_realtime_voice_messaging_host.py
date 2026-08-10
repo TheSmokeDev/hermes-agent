@@ -18,8 +18,8 @@ from agent.realtime_voice_provider import (
     RealtimeVoiceSetup,
 )
 from agent.realtime_voice_registry import _reset_for_tests, register_provider
-from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -40,6 +40,7 @@ def _host_fixture():
         _invoke_plugin_command_with_context,
         _register_gateway_runner,
     )
+    from plugins.platforms.discord.adapter import DiscordAdapter
 
     source = _source()
     route = build_session_key(source)
@@ -52,10 +53,22 @@ def _host_fixture():
         chat_type="group",
     )
     runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)}
+    )
     runner.session_store = MagicMock()
     runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 3)
     runner._running_agents = {}
     runner._is_session_running = lambda key: key in runner._running_agents
+    adapter = DiscordAdapter(runner.config.platforms[Platform.DISCORD])
+    adapter.gateway_runner = runner
+    adapter.set_message_handler(lambda event: runner._handle_message(event))
+
+    async def send_success(**_kwargs):
+        return SendResult(success=True, message_id="delivered")
+
+    adapter._send_with_retry = send_success
+    runner.adapters = {Platform.DISCORD: adapter}
     _register_gateway_runner(runner)
 
     captured = []
@@ -136,6 +149,12 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
             "tool_calls": [],
             "display_metadata": None,
         },
+        {
+            "id": 14,
+            "role": "session_meta",
+            "content": None,
+            "display_metadata": None,
+        },
     ]
     db.get_messages.side_effect = lambda *_args, **_kwargs: list(rows)
 
@@ -155,7 +174,7 @@ async def test_exact_permit_enters_canonical_handler_once_and_returns_durable_re
         assert _validate_realtime_voice_event_after_resolution(runner, event, entry)
         rows.extend(completed_rows)
         await _finalize_realtime_voice_event(runner, event, entry.session_id)
-        return {"final_response": "canonical answer"}
+        return "canonical answer"
 
     runner._handle_message = canonical
     host = _create_messaging_host(captured[0], runner)

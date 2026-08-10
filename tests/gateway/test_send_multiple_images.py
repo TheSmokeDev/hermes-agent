@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
 def _run(coro):
@@ -176,6 +176,53 @@ class TestDiscordMultiImage:
         a = DiscordAdapter(config)
         a._client = MagicMock()
         return a
+
+    def test_image_only_batch_returns_successful_aggregate(self, adapter, tmp_path):
+        image = tmp_path / "only.png"
+        image.write_bytes(b"\x89PNG")
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=MagicMock(id=41))
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        result = _run(
+            adapter.send_multiple_images("67890", [(f"file://{image}", "")])
+        )
+
+        assert result == SendResult(success=True, message_id="41")
+
+    def test_text_plus_images_partial_fallback_failure_returns_failure(
+        self, adapter, tmp_path
+    ):
+        paths = []
+        for index in range(11):
+            path = tmp_path / f"image-{index}.png"
+            path.write_bytes(b"\x89PNG")
+            paths.append(path)
+        channel = MagicMock()
+        channel.send = AsyncMock(
+            side_effect=[MagicMock(id=50), RuntimeError("second chunk rejected")]
+        )
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+        adapter.send_image_file = AsyncMock(
+            return_value=SendResult(success=False, error="fallback rejected")
+        )
+
+        result = _run(
+            adapter.send_multiple_images(
+                "67890",
+                [
+                    (f"file://{path}", "caption" if index == 0 else "")
+                    for index, path in enumerate(paths)
+                ],
+            )
+        )
+
+        assert result.success is False
+        assert "fallback rejected" in str(result.error)
+        assert channel.send.await_count == 2
+        adapter.send_image_file.assert_awaited_once()
 
 
     def test_url_batch_follows_safe_redirect_location_header(self, adapter, monkeypatch):

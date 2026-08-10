@@ -100,13 +100,22 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
-    async def test_contextual_plugin_command_rejects_busy_without_interrupt(self, monkeypatch):
-        """`/talk core join`-shaped commands are idle-only capability capture."""
+    @pytest.mark.parametrize("raw_args", ["leave", "status", "core join"])
+    async def test_contextual_plugin_command_dispatches_once_while_busy(
+        self, monkeypatch, raw_args
+    ):
+        """Native Discord ingress dispatches contextual controls before busy policy."""
+        import asyncio
+
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import SendResult
         from gateway.run import GatewayRunner
         import hermes_cli.plugins as plugin_registry
+        from plugins.platforms.discord.adapter import DiscordAdapter
 
         runner, _sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
+        runner._is_user_authorized = MagicMock(return_value=True)
         source = SessionSource(
             platform=Platform.DISCORD,
             chat_id="222",
@@ -115,7 +124,7 @@ class TestBusySessionAck:
             scope_id="333",
         )
         event = MessageEvent(
-            text="/talk core join",
+            text=f"/talk {raw_args}",
             message_type=MessageType.TEXT,
             source=source,
             message_id="busy-core-join",
@@ -125,7 +134,7 @@ class TestBusySessionAck:
         agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
         runner._running_agents[session_key] = agent
         runner._running_agents_ts[session_key] = time.time()
-        handler = MagicMock()
+        handler = MagicMock(return_value=f"handled {raw_args}")
         monkeypatch.setattr(
             plugin_registry,
             "get_plugin_command_registration",
@@ -136,11 +145,120 @@ class TestBusySessionAck:
             ),
         )
 
-        result = await GatewayRunner._handle_message(runner, event)
+        async def invoke_context(**kwargs):
+            return kwargs["handler"](kwargs["raw_args"], object())
 
-        assert "busy" in str(result).lower()
-        handler.assert_not_called()
+        monkeypatch.setattr(
+            "gateway.realtime_voice_invocation._invoke_plugin_command_with_context",
+            invoke_context,
+        )
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, typing_indicator=False)
+        )
+        adapter.gateway_runner = runner
+        adapter.set_message_handler(lambda inbound: GatewayRunner._handle_message(runner, inbound))
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="busy-control-reply")
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._session_tasks[session_key] = asyncio.current_task()
+
+        await adapter.handle_message(event)
+
+        handler.assert_called_once()
+        runner._is_user_authorized.assert_called_with(source)
+        assert handler.call_args.args[0] == raw_args
+        assert len(handler.call_args.args) == 2
+        adapter._send_with_retry.assert_awaited_once()
         agent.interrupt.assert_not_called()
+        agent.steer.assert_not_called()
+        assert adapter._pending_messages == {}
+        assert runner._pending_messages == {}
+        assert getattr(runner, "_queued_events", {}) == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("platform", "internal", "authorized", "invocation_context"),
+        [
+            (Platform.DISCORD, True, True, True),
+            (Platform.DISCORD, False, False, True),
+            (Platform.TELEGRAM, False, True, True),
+            (Platform.DISCORD, False, True, False),
+        ],
+        ids=["internal", "unauthorized", "non-discord", "ordinary-plugin"],
+    )
+    async def test_contextual_busy_bypass_is_fail_closed_to_exact_live_authority(
+        self, monkeypatch, platform, internal, authorized, invocation_context
+    ):
+        """Only authorized external Discord contextual calls may bypass busy policy."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import SendResult
+        from gateway.run import GatewayRunner
+        import hermes_cli.plugins as plugin_registry
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "queue"
+        runner._queued_events = {}
+        runner._is_user_authorized = MagicMock(return_value=authorized)
+        source = SessionSource(
+            platform=platform,
+            chat_id="222",
+            chat_type="group",
+            user_id="111",
+            scope_id="333",
+        )
+        event = MessageEvent(
+            text="/talk status",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="busy-negative-context",
+            internal=internal,
+        )
+        session_key = build_session_key(source)
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+        runner._running_agents[session_key] = agent
+        runner._running_agents_ts[session_key] = time.time()
+        handler = MagicMock(return_value="must not dispatch")
+        monkeypatch.setattr(
+            plugin_registry,
+            "get_plugin_command_registration",
+            lambda command: (
+                {"handler": handler, "invocation_context": invocation_context}
+                if command == "talk"
+                else None
+            ),
+        )
+
+        async def invoke_context(**kwargs):
+            return kwargs["handler"](kwargs["raw_args"], object())
+
+        monkeypatch.setattr(
+            "gateway.realtime_voice_invocation._invoke_plugin_command_with_context",
+            invoke_context,
+        )
+
+        adapter = DiscordAdapter(
+            PlatformConfig(enabled=True, typing_indicator=False)
+        )
+        adapter.gateway_runner = runner
+        adapter.set_message_handler(
+            lambda inbound: GatewayRunner._handle_message(runner, inbound)
+        )
+        adapter._send_with_retry = AsyncMock(
+            return_value=SendResult(success=True, message_id="unexpected-bypass")
+        )
+        runner.adapters[platform] = adapter
+        adapter._active_sessions[session_key] = __import__("asyncio").Event()
+        adapter._session_tasks[session_key] = __import__("asyncio").current_task()
+
+        await adapter.handle_message(event)
+
+        handler.assert_not_called()
+        assert adapter._pending_messages.get(session_key) is event
+        adapter._send_with_retry.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
@@ -489,7 +607,7 @@ class TestBusySessionOnboardingHint:
 
         # The flag is now persisted to tmp_path/config.yaml
         import yaml
-        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
         assert cfg["onboarding"]["seen"]["busy_input_prompt"] is True
 
 
