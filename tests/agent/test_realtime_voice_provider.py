@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 
@@ -14,6 +15,9 @@ from agent.realtime_voice_provider import (
     OutputTranscript,
     RealtimeCapability,
     RealtimeAudioFormat,
+    RealtimeInputAudioFormat,
+    RealtimeOutputAudioFormat,
+    RealtimeResponseRequest,
     ResponseCompleted,
     ResponseStarted,
     SessionClosed,
@@ -126,6 +130,51 @@ def test_audio_format_requires_positive_non_bool_integer_primitives(
         RealtimeAudioFormat(**values)
 
 
+def test_setup_distinguishes_exact_input_and_output_audio_from_legacy_audio() -> None:
+    legacy = RealtimeAudioFormat("audio/pcm", 24_000, 1)
+    input_audio = RealtimeInputAudioFormat(
+        "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+    )
+    output_audio = RealtimeOutputAudioFormat(
+        "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+    )
+
+    setup = RealtimeVoiceSetup(
+        audio=legacy,
+        input_audio=input_audio,
+        output_audio=output_audio,
+    )
+
+    assert setup.audio is legacy
+    assert setup.input_audio is input_audio
+    assert setup.output_audio is output_audio
+    assert setup.automatic_response is False
+    with pytest.raises(ValueError, match="sample_width_bytes"):
+        RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", 4, "little"
+        )
+    with pytest.raises(ValueError, match="endianness"):
+        RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", 2, "big"
+        )
+
+
+def test_exact_audio_formats_reject_numeric_lookalikes_and_pcm_contradictions() -> None:
+    class IntLookalike(int):
+        pass
+
+    with pytest.raises(TypeError, match="sample_rate_hz"):
+        RealtimeInputAudioFormat("audio/pcm", IntLookalike(24_000), 1)
+    with pytest.raises(TypeError, match="sample_width_bytes"):
+        RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", IntLookalike(2), "little"
+        )
+    with pytest.raises(ValueError, match="mime_type"):
+        RealtimeOutputAudioFormat(
+            "audio/wav", 24_000, 1, "pcm_s16le", 2, "little"
+        )
+
+
 @pytest.mark.parametrize("instructions", [1, b"text", object()])
 def test_setup_instructions_must_be_none_or_string(instructions) -> None:
     with pytest.raises(TypeError, match="instructions"):
@@ -166,7 +215,73 @@ def test_capabilities_are_explicit_and_immutable() -> None:
         "input_transcription",
         "output_transcription",
         "continuation",
+        "explicit_response",
     }
+
+
+def test_response_request_is_immutable_and_causally_bound_to_canonical_text() -> None:
+    text = " Canonical assistant reply. "
+    output_format = RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+        sample_rate_hz=24_000,
+        channels=1,
+    )
+
+    request = RealtimeResponseRequest(
+        durable_session_id="durable-session",
+        assistant_message_id=17,
+        turn_marker="turn-marker",
+        canonical_text=text,
+        content_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        output_audio_format=output_format,
+        allow_tools=False,
+    )
+
+    assert request.output_audio_format is output_format
+    assert request.allow_tools is False
+    with pytest.raises(AttributeError):
+        request.turn_marker = "changed"
+
+
+def test_response_request_rejects_noncanonical_causal_identity_and_digest() -> None:
+    text = "Canonical reply"
+    values = {
+        "durable_session_id": "durable",
+        "assistant_message_id": 1,
+        "turn_marker": "turn",
+        "canonical_text": text,
+        "content_digest": hashlib.sha256(text.encode()).hexdigest(),
+        "output_audio_format": RealtimeOutputAudioFormat(
+            mime_type="audio/pcm",
+            sample_encoding="pcm_s16le",
+            sample_width_bytes=2,
+            endianness="little",
+            sample_rate_hz=24_000,
+            channels=1,
+        ),
+        "allow_tools": False,
+    }
+
+    invalid_values = (
+        ("durable_session_id", " padded"),
+        ("assistant_message_id", True),
+        ("assistant_message_id", 0),
+        ("turn_marker", ""),
+        ("canonical_text", " \t"),
+        ("canonical_text", "\ud800"),
+        ("content_digest", "A" * 64),
+        ("content_digest", "0" * 64),
+        ("allow_tools", True),
+        ("allow_tools", 0),
+    )
+    for field_name, invalid in invalid_values:
+        candidate = dict(values)
+        candidate[field_name] = invalid
+        with pytest.raises((TypeError, ValueError), match=field_name):
+            RealtimeResponseRequest(**candidate)
 
 
 def test_shared_event_vocabulary_is_typed_and_provider_data_is_opaque() -> None:
@@ -370,6 +485,7 @@ class _Session(RealtimeVoiceSession):
         self.submitted = []
         self.continuations = []
         self.event_values = []
+        self.response_requests = []
 
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -386,6 +502,9 @@ class _Session(RealtimeVoiceSession):
 
     async def _continue_response(self, batch_id: str) -> None:
         self.continuations.append(batch_id)
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
 
     async def _close(self) -> None:
         await asyncio.sleep(0)
@@ -424,6 +543,15 @@ class _FailingContinuationSession(_Session):
         raise RuntimeError("continuation write failed")
 
 
+class _FailingResponseSession(_Session):
+    def __init__(self) -> None:
+        super().__init__({RealtimeCapability.EXPLICIT_RESPONSE})
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        raise RuntimeError("native response write failed")
+
+
 class _NoOptionalHooksSession(RealtimeVoiceSession):
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -440,6 +568,65 @@ class _NoOptionalHooksSession(RealtimeVoiceSession):
 
     async def _close(self) -> None:
         return None
+
+
+def _response_request(
+    *, assistant_message_id: int = 1, canonical_text: str = "Canonical reply"
+) -> RealtimeResponseRequest:
+    return RealtimeResponseRequest(
+        durable_session_id="durable",
+        assistant_message_id=assistant_message_id,
+        turn_marker=f"turn-{assistant_message_id}",
+        canonical_text=canonical_text,
+        content_digest=hashlib.sha256(canonical_text.encode()).hexdigest(),
+        output_audio_format=RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+        ),
+        allow_tools=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_response_is_capability_gated_exact_typed_and_replay_safe() -> None:
+    request = _response_request()
+    unsupported = _Session()
+    with pytest.raises(UnsupportedRealtimeCapability) as exc_info:
+        await unsupported.start_response(request)
+    assert exc_info.value.capability is RealtimeCapability.EXPLICIT_RESPONSE
+    assert unsupported.response_requests == []
+
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    with pytest.raises(TypeError, match="RealtimeResponseRequest"):
+        await session.start_response(object())
+    await session.start_response(request)
+    assert session.response_requests == [request]
+    with pytest.raises(ValueError, match="already started"):
+        await session.start_response(request)
+    assert session.response_requests == [request]
+
+    closed = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    await closed.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await closed.start_response(_response_request(assistant_message_id=2))
+    assert closed.response_requests == []
+
+
+@pytest.mark.asyncio
+async def test_start_response_failure_is_terminal_and_host_visible() -> None:
+    session = _FailingResponseSession()
+    request = _response_request()
+
+    with pytest.raises(RuntimeError, match="native response write failed"):
+        await session.start_response(request)
+
+    assert session.closed_count == 1
+    events = [event async for event in session.events()]
+    assert len(events) == 1
+    assert isinstance(events[0], SessionFailure)
+    assert events[0].code == "explicit_response_failed"
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.start_response(_response_request(assistant_message_id=2))
+    assert session.response_requests == [request]
 
 
 @pytest.mark.asyncio
@@ -814,6 +1001,7 @@ async def test_optional_operations_fail_with_typed_capability_error() -> None:
 @pytest.mark.parametrize(
     "capability",
     [
+        RealtimeCapability.EXPLICIT_RESPONSE,
         RealtimeCapability.EXPLICIT_INTERRUPTION,
         RealtimeCapability.OUTPUT_TRUNCATION,
         RealtimeCapability.INPUT_COMMIT_EVENTS,
