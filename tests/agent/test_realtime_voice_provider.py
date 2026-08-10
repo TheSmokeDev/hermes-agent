@@ -639,6 +639,24 @@ class _ControlledResponseSession(_Session):
         self.release_events.set()
 
 
+class _CloseCancelsResponseSession(_ControlledResponseSession):
+    def __init__(self) -> None:
+        super().__init__(asyncio.CancelledError())
+        self.response_exited = asyncio.Event()
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        try:
+            await super()._start_response(request)
+        finally:
+            self.response_exited.set()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_response.set()
+        await self.response_exited.wait()
+        self.release_events.set()
+
+
 class _NoOptionalHooksSession(RealtimeVoiceSession):
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -789,6 +807,75 @@ async def test_external_event_consumer_cancellation_is_not_reclassified_as_failu
         await receiving
     assert session._terminal_failure is None
     assert session._terminal_failure_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_intentional_close_does_not_reclassify_provider_cancelled_send() -> None:
+    session = _CloseCancelsResponseSession()
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        receiving = asyncio.create_task(anext(session.events()))
+        await session.events_entered.wait()
+        sending = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+
+        await session.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        with pytest.raises(asyncio.CancelledError):
+            await receiving
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session._closed
+    assert session.closed_count == 1
+    assert session._terminal_failure is None
+    assert session._terminal_failure_delivered is False
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
+
+
+@pytest.mark.asyncio
+async def test_spontaneous_provider_cancelled_send_remains_terminal_failure() -> None:
+    session = _ControlledResponseSession(asyncio.CancelledError())
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        receiving = asyncio.create_task(anext(session.events()))
+        await session.events_entered.wait()
+        sending = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+
+        session.release_response.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        failure = await receiving
+        assert isinstance(failure, SessionFailure)
+        assert failure.code == "explicit_response_failed"
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session._closed
+    assert session.closed_count == 1
+    assert session._terminal_failure is failure
+    assert session._terminal_failure_delivered is True
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
 
 
 @pytest.mark.asyncio
