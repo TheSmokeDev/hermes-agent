@@ -504,6 +504,27 @@ class RealtimeResponseRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class _ResponseSendIdentity:
+    """Compact replay authority for one validated explicit response request."""
+
+    durable_session_id: str
+    assistant_message_id: int
+    turn_marker: str
+    content_digest: str
+    output_audio_format: RealtimeOutputAudioFormat
+
+    @classmethod
+    def from_request(cls, request: RealtimeResponseRequest) -> "_ResponseSendIdentity":
+        return cls(
+            durable_session_id=request.durable_session_id,
+            assistant_message_id=request.assistant_message_id,
+            turn_marker=request.turn_marker,
+            content_digest=request.content_digest,
+            output_audio_format=request.output_audio_format,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RealtimeTool:
     name: str
     description: str
@@ -614,13 +635,12 @@ class RealtimeVoiceSession(abc.ABC):
         self._continuation_responses: dict[str, str] = {}
         self._completed_continuation_responses: OrderedDict[str, str] = OrderedDict()
         self._ordinary_response_ids: OrderedDict[str, None] = OrderedDict()
-        self._in_flight_response_sends: set[RealtimeResponseRequest] = set()
-        self._response_send_tasks: dict[
-            RealtimeResponseRequest, asyncio.Task[None]
-        ] = {}
+        self._in_flight_response_sends: set[_ResponseSendIdentity] = set()
+        self._response_send_tasks: dict[_ResponseSendIdentity, asyncio.Task[None]] = {}
         self._accepted_response_send_tombstones: OrderedDict[
-            RealtimeResponseRequest, None
+            _ResponseSendIdentity, None
         ] = OrderedDict()
+        self._intentional_close_response_sends: set[_ResponseSendIdentity] = set()
         self._terminal_failure: SessionFailure | None = None
         self._terminal_failure_delivered = False
 
@@ -670,9 +690,10 @@ class RealtimeVoiceSession(abc.ABC):
             or self._terminal_failure is not None
         ):
             raise RuntimeError("realtime session is closed")
+        identity = _ResponseSendIdentity.from_request(request)
         if (
-            request in self._in_flight_response_sends
-            or request in self._accepted_response_send_tombstones
+            identity in self._in_flight_response_sends
+            or identity in self._accepted_response_send_tombstones
         ):
             raise ValueError("explicit response request was already accepted/sent")
         if (
@@ -685,26 +706,50 @@ class RealtimeVoiceSession(abc.ABC):
             >= MAX_IN_FLIGHT_EXPLICIT_RESPONSE_SENDS
         ):
             raise ValueError("in-flight explicit response request send limit reached")
-        self._in_flight_response_sends.add(request)
-        task = asyncio.create_task(self._run_response_send(request))
-        self._response_send_tasks[request] = task
-        task.add_done_callback(self._observe_response_send)
+        self._in_flight_response_sends.add(identity)
+        task = asyncio.create_task(self._run_response_send(identity, request))
+        self._response_send_tasks[identity] = task
+        task.add_done_callback(
+            lambda completed, send_identity=identity: self._observe_response_send(
+                send_identity, completed
+            )
+        )
+        if task.done():
+            self._cleanup_response_send_task(identity, task)
         await asyncio.wait({task})
         task.result()
 
-    def _observe_response_send(self, task: asyncio.Task[None]) -> None:
-        """Retrieve a late send exception when its original waiter was cancelled."""
+    def _cleanup_response_send_task(
+        self,
+        identity: _ResponseSendIdentity,
+        task: asyncio.Future[None],
+    ) -> None:
+        if self._response_send_tasks.get(identity) is task:
+            del self._response_send_tasks[identity]
+
+    def _observe_response_send(
+        self,
+        identity: _ResponseSendIdentity,
+        task: asyncio.Future[None],
+    ) -> None:
+        """Clean keyed state and retrieve a late error after waiter cancellation."""
+        self._cleanup_response_send_task(identity, task)
         try:
             task.result()
         except BaseException:
             pass
 
-    async def _run_response_send(self, request: RealtimeResponseRequest) -> None:
+    async def _run_response_send(
+        self,
+        identity: _ResponseSendIdentity,
+        request: RealtimeResponseRequest,
+    ) -> None:
         try:
             await self._start_response(request)
         except BaseException as exc:
-            intentional_close_cancel = isinstance(exc, asyncio.CancelledError) and (
-                self._close_task is not None or self._closed
+            intentional_close_cancel = (
+                isinstance(exc, asyncio.CancelledError)
+                and identity in self._intentional_close_response_sends
             )
             if not intentional_close_cancel:
                 if self._terminal_failure is None:
@@ -720,12 +765,13 @@ class RealtimeVoiceSession(abc.ABC):
                     pass
             raise
         else:
-            self._accepted_response_send_tombstones[request] = None
+            self._accepted_response_send_tombstones[identity] = None
         finally:
-            self._in_flight_response_sends.discard(request)
+            self._in_flight_response_sends.discard(identity)
+            self._intentional_close_response_sends.discard(identity)
             current_task = asyncio.current_task()
-            if self._response_send_tasks.get(request) is current_task:
-                del self._response_send_tasks[request]
+            if self._response_send_tasks.get(identity) is current_task:
+                del self._response_send_tasks[identity]
 
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
         """Send one request; return after provider acceptance, not response completion."""
@@ -975,6 +1021,9 @@ class RealtimeVoiceSession(abc.ABC):
                 return
             task = self._close_task
             if task is None:
+                self._intentional_close_response_sends.update(
+                    self._in_flight_response_sends
+                )
                 task = asyncio.create_task(self._close())
                 self._close_task = task
                 task.add_done_callback(self._finalize_close_task)

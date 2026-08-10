@@ -608,6 +608,11 @@ class _FailingResponseSession(_Session):
         raise RuntimeError("native response write failed")
 
 
+class _ImmediateFailingResponseSession(_FailingResponseSession):
+    async def _close(self) -> None:
+        self.closed_count += 1
+
+
 class _ControlledResponseSession(_Session):
     def __init__(self, outcome: BaseException | None = None) -> None:
         super().__init__({RealtimeCapability.EXPLICIT_RESPONSE})
@@ -657,6 +662,28 @@ class _CloseCancelsResponseSession(_ControlledResponseSession):
         self.release_events.set()
 
 
+class _FailedCloseCancelsResponseSession(_ControlledResponseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.response_released = asyncio.Event()
+        self.surface_response_cancel = asyncio.Event()
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        self.response_entered.set()
+        await self.release_response.wait()
+        self.response_released.set()
+        await self.surface_response_cancel.wait()
+        raise asyncio.CancelledError
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_response.set()
+        await self.response_released.wait()
+        if self.closed_count == 1:
+            raise RuntimeError("original close failure")
+
+
 class _NoOptionalHooksSession(RealtimeVoiceSession):
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -689,6 +716,26 @@ def _response_request(
         ),
         allow_tools=False,
     )
+
+
+def _faithful_eager_task_factory(loop, coro, **_kwargs):
+    """Python 3.11 probe for coroutines that finish during task construction."""
+    try:
+        coro.send(None)
+    except StopIteration as exc:
+        completed = loop.create_future()
+        completed.set_result(exc.value)
+        return completed
+    except BaseException as exc:
+        completed = loop.create_future()
+        completed.set_exception(exc)
+        return completed
+    return asyncio.Task(coro, loop=loop)
+
+
+_EAGER_TASK_FACTORIES = [_faithful_eager_task_factory]
+if hasattr(asyncio, "eager_task_factory"):
+    _EAGER_TASK_FACTORIES.append(asyncio.eager_task_factory)
 
 
 @pytest.mark.asyncio
@@ -742,19 +789,34 @@ async def test_start_response_replay_history_fails_closed_at_exact_capacity(
 
 
 @pytest.mark.asyncio
-async def test_explicit_response_bookkeeping_names_only_request_send_state() -> None:
+async def test_accepted_response_history_retains_only_compact_replay_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        realtime_voice_provider, "MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES", 2
+    )
     session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
-    request = _response_request()
+    large_text = "x" * realtime_voice_provider.MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    oldest = _response_request(assistant_message_id=1, canonical_text=large_text)
+    newest = _response_request(assistant_message_id=2, canonical_text=large_text)
+
+    await session.start_response(oldest)
+    await session.start_response(newest)
 
     assert session._in_flight_response_sends == set()
-    assert session._accepted_response_send_tombstones == {}
+    assert session._response_send_tasks == {}
+    assert len(session._accepted_response_send_tombstones) == 2
+    for key, value in session._accepted_response_send_tombstones.items():
+        assert not isinstance(key, RealtimeResponseRequest)
+        assert not isinstance(value, RealtimeResponseRequest)
+        assert not hasattr(key, "canonical_text")
+        assert large_text not in repr((key, value))
+        assert len(repr((key, value))) < 2_048
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(oldest)
+
     assert not hasattr(session, "_active_response_requests")
     assert not hasattr(session, "_completed_response_requests")
-
-    await session.start_response(request)
-
-    assert session._in_flight_response_sends == set()
-    assert list(session._accepted_response_send_tombstones) == [request]
 
 
 @pytest.mark.asyncio
@@ -844,6 +906,40 @@ async def test_intentional_close_does_not_reclassify_provider_cancelled_send() -
 
 
 @pytest.mark.asyncio
+async def test_failed_close_intent_stays_pinned_until_overlapping_send_exits() -> None:
+    session = _FailedCloseCancelsResponseSession()
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        sending = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+
+        with pytest.raises(RuntimeError, match="original close failure"):
+            await session.close()
+        assert session.closed_count == 1
+        assert session._terminal_failure is None
+
+        session.surface_response_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session.closed_count == 1
+    assert session._terminal_failure is None
+    assert session._close_task is None
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._intentional_close_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
+
+
+@pytest.mark.asyncio
 async def test_spontaneous_provider_cancelled_send_remains_terminal_failure() -> None:
     session = _ControlledResponseSession(asyncio.CancelledError())
     request = _response_request()
@@ -891,17 +987,20 @@ async def test_cancelled_start_response_waiter_does_not_cancel_accepted_send() -
         await waiter
     assert not session._closed
     assert session._terminal_failure is None
-    assert request in session._in_flight_response_sends
+    assert len(session._in_flight_response_sends) == 1
+    identity = next(iter(session._in_flight_response_sends))
+    assert not isinstance(identity, RealtimeResponseRequest)
+    assert not hasattr(identity, "canonical_text")
     with pytest.raises(ValueError, match="already accepted/sent"):
         await session.start_response(request)
 
-    send_task = session._response_send_tasks[request]
+    send_task = session._response_send_tasks[identity]
     session.release_response.set()
     await asyncio.wait({send_task})
 
     assert session._response_send_tasks == {}
     assert session._in_flight_response_sends == set()
-    assert list(session._accepted_response_send_tombstones) == [request]
+    assert list(session._accepted_response_send_tombstones) == [identity]
     assert session.closed_count == 0
 
 
@@ -918,7 +1017,8 @@ async def test_cancelled_start_response_waiter_late_failure_is_retained_and_obse
         await session.events_entered.wait()
         waiter = asyncio.create_task(session.start_response(request))
         await session.response_entered.wait()
-        send_task = session._response_send_tasks[request]
+        identity = next(iter(session._in_flight_response_sends))
+        send_task = session._response_send_tasks[identity]
 
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -937,6 +1037,60 @@ async def test_cancelled_start_response_waiter_late_failure_is_retained_and_obse
     assert session._in_flight_response_sends == set()
     assert session._accepted_response_send_tombstones == {}
     assert orphaned == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_factory", _EAGER_TASK_FACTORIES)
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+async def test_eager_explicit_response_send_cleans_all_keyed_state(
+    task_factory, fails
+) -> None:
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    session = (
+        _ImmediateFailingResponseSession()
+        if fails
+        else _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    )
+    request = _response_request(canonical_text="compact replay text")
+    try:
+        loop.set_task_factory(task_factory)
+        if fails:
+            with pytest.raises(RuntimeError, match="native response write failed"):
+                await session.start_response(request)
+        else:
+            await session.start_response(request)
+    finally:
+        loop.set_task_factory(previous_factory)
+
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._intentional_close_response_sends == set()
+    if fails:
+        assert session._accepted_response_send_tombstones == {}
+        assert session._terminal_failure is not None
+    else:
+        assert len(session._accepted_response_send_tombstones) == 1
+        identity = next(iter(session._accepted_response_send_tombstones))
+        assert not isinstance(identity, RealtimeResponseRequest)
+        assert not hasattr(identity, "canonical_text")
+
+
+@pytest.mark.asyncio
+async def test_old_send_done_callback_cannot_clear_identity_replacement() -> None:
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    identity = realtime_voice_provider._ResponseSendIdentity.from_request(
+        _response_request()
+    )
+    old = asyncio.get_running_loop().create_future()
+    replacement = asyncio.get_running_loop().create_future()
+    old.set_result(None)
+    session._response_send_tasks[identity] = replacement
+
+    session._observe_response_send(identity, old)
+
+    assert session._response_send_tasks[identity] is replacement
+    replacement.cancel()
 
 
 @pytest.mark.asyncio
