@@ -608,6 +608,37 @@ class _FailingResponseSession(_Session):
         raise RuntimeError("native response write failed")
 
 
+class _ControlledResponseSession(_Session):
+    def __init__(self, outcome: BaseException | None = None) -> None:
+        super().__init__({RealtimeCapability.EXPLICIT_RESPONSE})
+        self.response_entered = asyncio.Event()
+        self.release_response = asyncio.Event()
+        self.events_entered = asyncio.Event()
+        self.release_events = asyncio.Event()
+        self.response_outcome = outcome
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        self.response_entered.set()
+        await self.release_response.wait()
+        if self.response_outcome is not None:
+            raise self.response_outcome
+
+    def _events(self):
+        async def stream():
+            self.events_entered.set()
+            await self.release_events.wait()
+            raise asyncio.CancelledError
+            if False:
+                yield RealtimeVoiceEvent()
+
+        return stream()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_events.set()
+
+
 class _NoOptionalHooksSession(RealtimeVoiceSession):
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -724,6 +755,101 @@ async def test_start_response_failure_is_terminal_and_host_visible() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         await session.start_response(_response_request(assistant_message_id=2))
     assert session.response_requests == [request]
+
+
+@pytest.mark.asyncio
+async def test_terminal_send_failure_converges_when_close_cancels_provider_events() -> None:
+    session = _ControlledResponseSession(RuntimeError("native response write failed"))
+    events = session.events()
+    receiving = asyncio.create_task(anext(events))
+    await session.events_entered.wait()
+    sending = asyncio.create_task(session.start_response(_response_request()))
+    await session.response_entered.wait()
+
+    session.release_response.set()
+
+    with pytest.raises(RuntimeError, match="native response write failed"):
+        await sending
+    failure = await receiving
+    assert isinstance(failure, SessionFailure)
+    assert failure.code == "explicit_response_failed"
+    with pytest.raises(StopAsyncIteration):
+        await anext(events)
+
+
+@pytest.mark.asyncio
+async def test_external_event_consumer_cancellation_is_not_reclassified_as_failure() -> None:
+    session = _ControlledResponseSession()
+    receiving = asyncio.create_task(anext(session.events()))
+    await session.events_entered.wait()
+
+    receiving.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await receiving
+    assert session._terminal_failure is None
+    assert session._terminal_failure_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_response_waiter_does_not_cancel_accepted_send() -> None:
+    session = _ControlledResponseSession()
+    request = _response_request()
+    waiter = asyncio.create_task(session.start_response(request))
+    await session.response_entered.wait()
+
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not session._closed
+    assert session._terminal_failure is None
+    assert request in session._in_flight_response_sends
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(request)
+
+    send_task = session._response_send_tasks[request]
+    session.release_response.set()
+    await asyncio.wait({send_task})
+
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert list(session._accepted_response_send_tombstones) == [request]
+    assert session.closed_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_response_waiter_late_failure_is_retained_and_observed() -> None:
+    session = _ControlledResponseSession(RuntimeError("late native write failure"))
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        receiving = asyncio.create_task(anext(session.events()))
+        await session.events_entered.wait()
+        waiter = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+        send_task = session._response_send_tasks[request]
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        session.release_response.set()
+
+        failure = await receiving
+        assert isinstance(failure, SessionFailure)
+        assert failure.code == "explicit_response_failed"
+        await asyncio.wait({send_task})
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session.closed_count == 1
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
 
 
 @pytest.mark.asyncio
