@@ -702,6 +702,24 @@ async def test_claim_native_response_rejects_malformed_finalization_before_db_re
 
 
 @pytest.mark.asyncio
+async def test_duplicate_assistant_rows_reject_without_secondary_collection():
+    row = {"id": 13, "role": "assistant", "content": "canonical"}
+    rows = [row] * 1_000_000
+    host, binding, receipt, _db = await _native_response_host(rows)
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(PermissionError, match="not found uniquely"):
+            await host.claim_native_response(binding, receipt)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 200_000
+    assert not host.validate_finalization(receipt)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("rows", "message"),
     [

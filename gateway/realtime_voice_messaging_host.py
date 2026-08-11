@@ -329,18 +329,23 @@ class GatewayRealtimeVoiceMessagingHost:
         rows = db.get_messages(
             binding.durable_session_id, include_inactive=True
         )
-        matching_rows = [
-            row
-            for row in rows
-            if type(row) is dict
-            and type(row.get("id")) is int
-            and row["id"] == finalization.assistant_message_id
-        ]
-        if len(matching_rows) != 1:
+        matching_row = None
+        for candidate in rows:
+            if (
+                type(candidate) is dict
+                and type(candidate.get("id")) is int
+                and candidate["id"] == finalization.assistant_message_id
+            ):
+                if matching_row is not None:
+                    raise RealtimeVoiceIngressError(
+                        "exact canonical assistant row was not found uniquely"
+                    )
+                matching_row = candidate
+        if matching_row is None:
             raise RealtimeVoiceIngressError(
                 "exact canonical assistant row was not found uniquely"
             )
-        row = matching_rows[0]
+        row = matching_row
         if type(row.get("role")) is not str or row["role"] != "assistant":
             raise RealtimeVoiceIngressError("canonical response row is not assistant")
         canonical_text = row.get("content")
