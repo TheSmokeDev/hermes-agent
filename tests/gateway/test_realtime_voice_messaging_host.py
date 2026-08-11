@@ -4,6 +4,7 @@ import asyncio
 import gc
 import hashlib
 import inspect
+import threading
 from collections.abc import AsyncIterator
 from datetime import datetime
 from types import SimpleNamespace
@@ -316,6 +317,72 @@ async def test_claim_native_response_rereads_exact_canonical_row_and_mints_reque
 
 
 @pytest.mark.asyncio
+async def test_oversize_character_count_rejects_before_digest(monkeypatch):
+    from agent.realtime_voice_provider import MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    import gateway.realtime_voice_messaging_host as messaging_host
+
+    canonical_text = "x" * (MAX_CANONICAL_RESPONSE_TEXT_BYTES + 1)
+    host, binding, receipt, _db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": canonical_text}]
+    )
+    digest = MagicMock(side_effect=AssertionError("digest must not run"))
+    monkeypatch.setattr(messaging_host.hashlib, "sha256", digest)
+
+    with pytest.raises(PermissionError, match="UTF-8 byte limit"):
+        await host.claim_native_response(binding, receipt)
+
+    digest.assert_not_called()
+    assert not host.validate_finalization(receipt)
+
+
+@pytest.mark.asyncio
+async def test_exact_character_limit_reaches_digest_and_preserves_text(monkeypatch):
+    from agent.realtime_voice_provider import MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    import gateway.realtime_voice_messaging_host as messaging_host
+
+    canonical_text = "x" * MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    host, binding, receipt, _db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": canonical_text}]
+    )
+    real_sha256 = hashlib.sha256
+    digest_lengths = []
+
+    def digest_spy(data):
+        digest_lengths.append(len(data))
+        return real_sha256(data)
+
+    monkeypatch.setattr(messaging_host.hashlib, "sha256", digest_spy)
+
+    request = await host.claim_native_response(binding, receipt)
+
+    assert request.canonical_text is canonical_text
+    assert digest_lengths
+    assert all(
+        length == MAX_CANONICAL_RESPONSE_TEXT_BYTES for length in digest_lengths
+    )
+
+
+@pytest.mark.asyncio
+async def test_bounded_multibyte_text_rejects_after_encoding_before_digest(monkeypatch):
+    from agent.realtime_voice_provider import MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    import gateway.realtime_voice_messaging_host as messaging_host
+
+    canonical_text = "é" * ((MAX_CANONICAL_RESPONSE_TEXT_BYTES // 2) + 1)
+    assert len(canonical_text) <= MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    host, binding, receipt, _db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": canonical_text}]
+    )
+    digest = MagicMock(side_effect=AssertionError("digest must not run"))
+    monkeypatch.setattr(messaging_host.hashlib, "sha256", digest)
+
+    with pytest.raises(PermissionError, match="UTF-8 byte limit"):
+        await host.claim_native_response(binding, receipt)
+
+    digest.assert_not_called()
+    assert not host.validate_finalization(receipt)
+
+
+@pytest.mark.asyncio
 async def test_claim_native_response_rejects_forged_equal_receipt_before_db_read():
     from gateway.realtime_voice_messaging_host import RealtimeVoiceFinalizationReceipt
 
@@ -331,6 +398,36 @@ async def test_claim_native_response_rejects_forged_equal_receipt_before_db_read
 
     with pytest.raises(PermissionError, match="finalization"):
         await host.claim_native_response(binding, forged)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_forged_equal_receipt_stops_before_destructive_revalidation():
+    from gateway.realtime_voice_messaging_host import RealtimeVoiceFinalizationReceipt
+
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    forged = RealtimeVoiceFinalizationReceipt(
+        durable_session_id=receipt.durable_session_id,
+        turn_marker=receipt.turn_marker,
+        user_message_id=receipt.user_message_id,
+        assistant_message_id=receipt.assistant_message_id,
+    )
+    original_validate = host._validate_binding
+    validations = []
+
+    def track_validation(candidate):
+        validations.append(host._lock.locked())
+        original_validate(candidate)
+
+    host._validate_binding = track_validation
+
+    with pytest.raises(PermissionError, match="forged"):
+        await host.claim_native_response(binding, forged)
+
+    assert validations == [False, True]
+    assert host.validate_finalization(receipt)
     db.get_messages.assert_not_called()
 
 
@@ -424,7 +521,7 @@ async def test_claim_native_response_rejects_wrong_live_binding_before_db_read()
 
 
 @pytest.mark.asyncio
-async def test_claim_native_response_revalidates_live_binding_before_consumption():
+async def test_claim_native_response_consumes_then_rejects_generation_drift_before_db():
     host, binding, receipt, db = await _native_response_host(
         [{"id": 13, "role": "assistant", "content": "canonical"}]
     )
@@ -433,39 +530,116 @@ async def test_claim_native_response_revalidates_live_binding_before_consumption
         runner.session_store.get_exact_session_entry_snapshot.return_value
     )
     assert generation == binding.selection_generation == 3
-    first_validation = asyncio.Event()
+    current_generation = 3
+    first_in_lock_validation = threading.Event()
+    generation_advanced = threading.Event()
+    snapshot_lock_states = []
+    validation_lock_states = []
+
+    def advance_generation():
+        nonlocal current_generation
+        assert first_in_lock_validation.wait(timeout=1)
+        current_generation = 4
+        generation_advanced.set()
+
+    mutation = threading.Thread(target=advance_generation)
+    mutation.start()
+
+    def snapshot(*_args, **_kwargs):
+        snapshot_lock_states.append(host._lock.locked())
+        return entry, current_generation
+
+    runner.session_store.get_exact_session_entry_snapshot.side_effect = snapshot
     original_validate = host._validate_binding
-    validation_count = 0
 
     def track_validation(candidate):
-        nonlocal validation_count
         original_validate(candidate)
-        validation_count += 1
-        if validation_count == 1:
-            first_validation.set()
+        validation_lock_states.append(host._lock.locked())
+        if validation_lock_states == [False, True]:
+            first_in_lock_validation.set()
+            assert generation_advanced.wait(timeout=1)
 
     host._validate_binding = track_validation
+
+    with pytest.raises(PermissionError, match="stale"):
+        await host.claim_native_response(binding, receipt)
+    mutation.join(timeout=1)
+    assert not mutation.is_alive()
+    assert generation_advanced.is_set()
+    assert validation_lock_states == [False, True]
+    assert snapshot_lock_states == [False, True, True]
+    db.get_messages.assert_not_called()
+    assert not host.validate_finalization(receipt)
+
+    current_generation = 3
+    with pytest.raises(PermissionError, match="consumed"):
+        await host.claim_native_response(binding, receipt)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generation_mutation_after_second_snapshot_is_post_linearization():
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    runner = host._test_runner
+    entry, generation = (
+        runner.session_store.get_exact_session_entry_snapshot.return_value
+    )
+    snapshot_lock_states = []
+
+    def snapshot(*_args, **_kwargs):
+        snapshot_lock_states.append(host._lock.locked())
+        return entry, generation
+
+    runner.session_store.get_exact_session_entry_snapshot.side_effect = snapshot
+    mutated = threading.Event()
+
+    def mutate_generation():
+        runner.session_store.get_exact_session_entry_snapshot.side_effect = None
+        runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 4)
+        mutated.set()
+
+    def rows_after_linearization(*_args, **_kwargs):
+        assert not host._lock.locked()
+        mutation = threading.Thread(target=mutate_generation)
+        mutation.start()
+        assert mutated.wait(timeout=1)
+        mutation.join(timeout=1)
+        return [{"id": 13, "role": "assistant", "content": "canonical"}]
+
+    db.get_messages.side_effect = rows_after_linearization
+
+    request = await host.claim_native_response(binding, receipt)
+
+    assert request.canonical_text == "canonical"
+    assert snapshot_lock_states == [False, True, True]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_waiting_for_claim_lock_leaves_receipt_available():
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    reached_lock_wait = asyncio.Event()
+    original_validate = host._validate_binding
+
+    def track_early_validation(candidate):
+        original_validate(candidate)
+        reached_lock_wait.set()
+
+    host._validate_binding = track_early_validation
     await host._lock.acquire()
     claim = asyncio.create_task(host.claim_native_response(binding, receipt))
-    await first_validation.wait()
-    runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 4)
+    await reached_lock_wait.wait()
+    claim.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await claim
     host._lock.release()
 
-    with pytest.raises(PermissionError, match="stale"):
-        await claim
-    db.get_messages.assert_not_called()
     assert host.validate_finalization(receipt)
-
-    # The old receipt stays owned by the now-stale host generation; a caller
-    # cannot transfer it to a freshly shaped generation-4 binding.
-    from dataclasses import replace
-
-    with pytest.raises(PermissionError, match="stale"):
-        await host.claim_native_response(
-            replace(binding, selection_generation=4), receipt
-        )
     db.get_messages.assert_not_called()
-    assert host.validate_finalization(receipt)
+    assert (await host.claim_native_response(binding, receipt)).canonical_text == "canonical"
 
 
 @pytest.mark.asyncio

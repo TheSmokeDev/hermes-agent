@@ -139,33 +139,24 @@ class GatewayRealtimeVoiceMessagingHost:
 
     def _validate_binding(self, binding: RealtimeSessionBinding) -> None:
         from gateway.realtime_voice_invocation import (
-            _validate_realtime_voice_attachment_factory,
+            _record_for_realtime_voice_attachment_factory,
         )
 
         runner = self._runner()
-        authority = _validate_realtime_voice_attachment_factory(self._factory, runner)
+        record = _record_for_realtime_voice_attachment_factory(self._factory, runner)
+        authority = record.binding
         expected = RealtimeSessionBinding(
             profile_id=authority.profile or "default",
             routing_key=authority.routing_key,
             runtime_session_id=authority.routing_key,
             durable_session_id=authority.durable_session_id,
             provider_session_id=binding.provider_session_id,
-            selection_generation=self._factory_generation(),
+            selection_generation=record.routing_generation,
         )
         if binding != expected:
             raise RealtimeVoiceIngressError(
                 "realtime binding does not match captured host authority"
             )
-
-    def _factory_generation(self) -> int:
-        from gateway.realtime_voice_invocation import (
-            _record_for_realtime_voice_attachment_factory,
-        )
-
-        record = _record_for_realtime_voice_attachment_factory(
-            self._factory, self._runner()
-        )
-        return record.routing_generation
 
     async def authorize(
         self, binding: RealtimeSessionBinding, utterance: RealtimeUtterance
@@ -328,6 +319,9 @@ class GatewayRealtimeVoiceMessagingHost:
                     "canonical finalization was forged or already consumed"
                 )
             self._finalizations.discard(finalization)
+            # Consumption and two equal live snapshots form a seqlock-style
+            # linearization. Drift after this second snapshot is post-claim.
+            self._validate_binding(binding)
 
         db = _sync_db(self._runner())
         rows = db.get_messages(
@@ -351,6 +345,12 @@ class GatewayRealtimeVoiceMessagingHost:
         if type(canonical_text) is not str:
             raise RealtimeVoiceIngressError(
                 "canonical assistant content must be exact text"
+            )
+        if len(canonical_text) > MAX_CANONICAL_RESPONSE_TEXT_BYTES:
+            # UTF-8 cannot encode fewer bytes than there are Python characters.
+            # Reject before strip or encoding can scan/allocate an unbounded row.
+            raise RealtimeVoiceIngressError(
+                "canonical assistant content exceeds the UTF-8 byte limit"
             )
         tool_calls = row.get("tool_calls")
         if tool_calls is not None and not (
