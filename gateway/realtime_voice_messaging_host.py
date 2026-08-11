@@ -289,7 +289,11 @@ class GatewayRealtimeVoiceMessagingHost:
         if type(finalization) is not RealtimeVoiceFinalizationReceipt:
             raise RealtimeVoiceIngressError("invalid canonical finalization receipt")
         turn_marker = finalization.turn_marker
-        if type(turn_marker) is not str:
+        if (
+            type(turn_marker) is not str
+            or not turn_marker
+            or len(turn_marker) > MAX_IDENTIFIER_LENGTH
+        ):
             raise RealtimeVoiceIngressError("invalid canonical finalization identity")
         try:
             turn_marker.encode("utf-8")
@@ -299,9 +303,7 @@ class GatewayRealtimeVoiceMessagingHost:
             ) from None
         if (
             finalization.durable_session_id != binding.durable_session_id
-            or not turn_marker
             or turn_marker.strip() != turn_marker
-            or len(turn_marker) > MAX_IDENTIFIER_LENGTH
             or type(finalization.user_message_id) is not int
             or finalization.user_message_id <= 0
             or type(finalization.assistant_message_id) is not int

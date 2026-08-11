@@ -5,6 +5,7 @@ import gc
 import hashlib
 import inspect
 import threading
+import tracemalloc
 from collections.abc import AsyncIterator
 from datetime import datetime
 from types import SimpleNamespace
@@ -398,6 +399,33 @@ async def test_claim_native_response_rejects_forged_equal_receipt_before_db_read
 
     with pytest.raises(PermissionError, match="finalization"):
         await host.claim_native_response(binding, forged)
+    db.get_messages.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_oversized_forged_turn_marker_rejects_before_utf8_allocation():
+    from gateway.realtime_voice_messaging_host import RealtimeVoiceFinalizationReceipt
+
+    host, binding, receipt, db = await _native_response_host(
+        [{"id": 13, "role": "assistant", "content": "canonical"}]
+    )
+    forged = RealtimeVoiceFinalizationReceipt(
+        durable_session_id=receipt.durable_session_id,
+        turn_marker="x" * 1_000_000,
+        user_message_id=receipt.user_message_id,
+        assistant_message_id=receipt.assistant_message_id,
+    )
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(PermissionError, match="finalization identity"):
+            await host.claim_native_response(binding, forged)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 200_000
+    assert host.validate_finalization(receipt)
     db.get_messages.assert_not_called()
 
 
