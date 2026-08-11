@@ -165,6 +165,7 @@ class _NativeOutputState:
     transport_generation: int
     content_digest: str | None = None
     output_format: RealtimeOutputAudioFormat | None = None
+    send_dispatched: bool = False
     send_accepted: bool = False
     response_id: str | None = None
     lease: NativeAudioPlaybackLease | None = None
@@ -383,6 +384,26 @@ class GatewayRealtimeVoiceController:
             self._emit(ControllerLifecycle.LISTENING, generation=generation)
             return
         if isinstance(event, SessionFailure):
+            native_unresolved = (
+                self._native_output is not None
+                or (
+                    self._output_send_task is not None
+                    and not self._output_send_task.done()
+                )
+                or (
+                    self._output_drain_task is not None
+                    and not self._output_drain_task.done()
+                )
+            )
+            if native_unresolved:
+                self._emit(
+                    ControllerLifecycle.FAILED,
+                    detail=event.message,
+                    provider_event=event,
+                    generation=generation,
+                )
+                await self.close(reason="terminal provider failure during native output")
+                return
             await self._fence_native_output()
             session = self._session
             if (
@@ -495,7 +516,7 @@ class GatewayRealtimeVoiceController:
                 state is None
                 or state.transport_generation != generation
                 or state.turn_marker != event.turn_id
-                or not state.send_accepted
+                or not state.send_dispatched
                 or state.response_id is not None
                 or state.output_format is None
                 or event.continuation_of_batch_id is not None
@@ -510,29 +531,45 @@ class GatewayRealtimeVoiceController:
             return
         assert state is not None
         assert binding is not None and sink is not None and output_format is not None
+        lease: NativeAudioPlaybackLease | None = None
         try:
             lease = await sink.open_lease(
                 binding, event.response_id, event.turn_id, output_format, generation
             )
+            # Retain acquired ownership before touching adapter properties so every
+            # validation/property failure has one exact close-attempt record.
+            state.lease = lease
             lease_id = lease.lease_id
             lease_response_id = lease.response_id
             lease_turn_marker = lease.turn_marker
             lease_generation = lease.transport_generation
             _validate_native_identifier(lease_id, "lease_id")
+            _validate_native_identifier(lease_response_id, "lease response_id")
+            _validate_native_identifier(lease_turn_marker, "lease turn_marker")
             valid_lease = (
                 lease_response_id == event.response_id
                 and lease_turn_marker == event.turn_id
                 and type(lease_generation) is int
                 and lease_generation == generation
             )
+        except asyncio.CancelledError:
+            if not self._closing and not self._reconnecting:
+                await self._fail_native("native playback lease open cancelled")
+            raise
         except BaseException:
+            if lease is not None:
+                try:
+                    await self._close_native_lease(state)
+                except BaseException:
+                    pass
             await self._fail_native("native playback lease open failed")
             return
         if not valid_lease:
             try:
-                await lease.close()
-            finally:
-                await self._fail_native("native playback lease identity mismatch")
+                await self._close_native_lease(state)
+            except BaseException:
+                pass
+            await self._fail_native("native playback lease identity mismatch")
             return
         async with self._output_lock:
             if self._native_output is not state or self._closing:
@@ -570,6 +607,10 @@ class GatewayRealtimeVoiceController:
             return
         try:
             await lease.write_pcm(event.data)
+        except asyncio.CancelledError:
+            if not self._closing and not self._reconnecting:
+                await self._fail_native("native PCM write cancelled")
+            raise
         except BaseException:
             await self._fail_native("native PCM write failed")
             return
@@ -661,6 +702,8 @@ class GatewayRealtimeVoiceController:
                 self._native_output = None
             self._emit(ControllerLifecycle.NATIVE_DRAINED, generation=state.transport_generation)
         except asyncio.CancelledError:
+            if not self._closing and not self._reconnecting:
+                await self._fail_native("native playback drain cancelled")
             raise
         except BaseException:
             await self._fail_native("native playback drain failed")
@@ -679,7 +722,6 @@ class GatewayRealtimeVoiceController:
     async def _fence_native_output(self) -> None:
         async with self._output_lock:
             state = self._native_output
-            self._native_output = None
         current = asyncio.current_task()
         failure_owner = self._native_failure_owner
         tasks = [
@@ -691,8 +733,18 @@ class GatewayRealtimeVoiceController:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        if state is not None:
-            await self._close_native_lease(state)
+        failure: BaseException | None = None
+        try:
+            if state is not None:
+                await self._close_native_lease(state)
+        except BaseException as exc:
+            failure = exc
+        finally:
+            async with self._output_lock:
+                if self._native_output is state:
+                    self._native_output = None
+        if failure is not None:
+            raise failure
 
     async def _pump_audio(self) -> None:
         try:
@@ -810,7 +862,7 @@ class GatewayRealtimeVoiceController:
             raise RuntimeError("host projection does not match the live attachment")
         if projection.status is HostProjectionStatus.COMPLETED and (
             projection.finalization is None
-            or not self._host.validate_finalization(projection.finalization)
+            or self._host.validate_finalization(projection.finalization) is not True
         ):
             raise RuntimeError("completed projection requires canonical persistence receipt")
         if (
@@ -897,7 +949,11 @@ class GatewayRealtimeVoiceController:
                 or request.allow_tools is not False
             ):
                 raise RuntimeError("canonical native response claim identity mismatch")
-            async with self._output_lock:
+            session = self._session
+            if session is None:
+                raise RuntimeError("realtime provider session is unavailable")
+            await self._output_lock.acquire()
+            try:
                 if (
                     self._native_output is not state
                     or state.transport_generation != self._transport_generation
@@ -906,9 +962,11 @@ class GatewayRealtimeVoiceController:
                     return
                 state.content_digest = request.content_digest
                 state.output_format = request.output_audio_format
-            session = self._session
-            if session is None:
-                raise RuntimeError("realtime provider session is unavailable")
+                # Publish at the wire-race boundary. Releasing an asyncio.Lock is
+                # synchronous, so no task can observe the provider event before this.
+                state.send_dispatched = True
+            finally:
+                self._output_lock.release()
             await session.start_response(request)
             async with self._output_lock:
                 if self._native_output is state and not self._closing:
@@ -942,7 +1000,6 @@ class GatewayRealtimeVoiceController:
         if not self._closing:
             self._closing = True
             self._emit(ControllerLifecycle.CLOSING, detail=reason)
-        await self._fence_native_output()
         open_task = self._open_task
         if open_task is not None and open_task is not asyncio.current_task():
             try:
@@ -951,12 +1008,6 @@ class GatewayRealtimeVoiceController:
                 late_session = None
             if late_session is not None and self._session is None:
                 self._session = late_session
-        admission = self._admission
-        if admission is not None:
-            await admission.close()
-        close_attachment = getattr(self._host, "close_attachment", None)
-        if close_attachment is not None:
-            await close_attachment(self._binding)
         current = asyncio.current_task()
         failure_owner = self._native_failure_owner
         tasks = [
@@ -968,11 +1019,39 @@ class GatewayRealtimeVoiceController:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        native_cleanup_error: BaseException | None = None
+        try:
+            await self._fence_native_output()
+        except BaseException as exc:
+            native_cleanup_error = exc
+
+        cleanup_error: BaseException | None = None
+        admission = self._admission
+        if admission is not None:
+            try:
+                await admission.close()
+            except BaseException as exc:
+                cleanup_error = exc
+        close_attachment = getattr(self._host, "close_attachment", None)
+        if close_attachment is not None:
+            try:
+                await close_attachment(self._binding)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
         session = self._session
         if session is not None:
-            await session.close()
+            try:
+                await session.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if native_cleanup_error is None and cleanup_error is not None:
+            raise cleanup_error
         self._closed = True
         self._emit(ControllerLifecycle.CLOSED, detail=reason)
+        if native_cleanup_error is not None:
+            raise native_cleanup_error
 
 
 __all__ = [
