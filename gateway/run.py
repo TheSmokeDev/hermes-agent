@@ -25458,7 +25458,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
         if (
-            _stts_adapter is not None
+            not force_nonstream
+            and _stts_adapter is not None
             and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
         ):

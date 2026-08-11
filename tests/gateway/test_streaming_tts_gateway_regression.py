@@ -155,3 +155,73 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+def _run_voice_turn_with_streaming_tts_boundary(monkeypatch, tmp_path, *, force_nonstream):
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    runner = _make_runner()
+    adapter = SimpleNamespace(
+        _should_auto_tts_for_chat=lambda chat_id: True,
+        get_pending_message=lambda session_key: None,
+    )
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_adapter_for_source",
+        lambda self, source: adapter,
+    )
+
+    consumer = SimpleNamespace(
+        active=True,
+        done=True,
+        suppress_whole_file=False,
+        start=MagicMock(),
+        finish=MagicMock(),
+        wait_complete=AsyncMock(return_value=True),
+        abort=MagicMock(),
+    )
+    consumer_factory = MagicMock(return_value=consumer)
+    monkeypatch.setattr(
+        "gateway.streaming_tts_consumer.StreamingTTSConsumer",
+        consumer_factory,
+    )
+    monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {})
+
+    async def _run():
+        return await runner._run_agent(
+            message="Hello Jarvis",
+            context_prompt="",
+            history=[],
+            source=_make_voice_source(),
+            session_id="session-1",
+            session_key="agent:main:telegram:dm:12345",
+            message_type=MessageType.VOICE,
+            force_nonstream=force_nonstream,
+        )
+
+    result = asyncio.new_event_loop().run_until_complete(_run())
+    return result, consumer_factory, consumer
+
+
+def test_force_nonstream_voice_turn_skips_streaming_tts_consumer(monkeypatch, tmp_path):
+    """Native realtime turns must not enter the gateway streaming-TTS lane."""
+    result, consumer_factory, _ = _run_voice_turn_with_streaming_tts_boundary(
+        monkeypatch,
+        tmp_path,
+        force_nonstream=True,
+    )
+
+    assert result["final_response"] == "Hello from the agent."
+    consumer_factory.assert_not_called()
+
+
+def test_ordinary_voice_turn_starts_streaming_tts_consumer(monkeypatch, tmp_path):
+    """Ordinary voice turns remain eligible for gateway streaming TTS."""
+    result, consumer_factory, consumer = _run_voice_turn_with_streaming_tts_boundary(
+        monkeypatch,
+        tmp_path,
+        force_nonstream=False,
+    )
+
+    assert result["final_response"] == "Hello from the agent."
+    consumer_factory.assert_called_once()
+    consumer.start.assert_called_once_with()
+
+
