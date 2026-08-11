@@ -438,6 +438,10 @@ def _claim_for(runner: object, event: object) -> _CanonicalClaim | None:
     return claim
 
 
+def _is_native_realtime_event(runner: object, event: object) -> bool:
+    return _claim_for(runner, event) is not None
+
+
 def _rewrite_realtime_voice_event(runner: object, event: object, text: str) -> object:
     """Preserve only the exact host claim across a legitimate dataclass rewrite."""
 

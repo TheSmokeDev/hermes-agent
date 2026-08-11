@@ -6109,10 +6109,18 @@ class BasePlatformAdapter(ABC):
                 # True globally and no ``/voice off`` has been issued.
                 # Skip when streaming TTS already delivered audio for this turn
                 # (#60671) — the gateway streaming-TTS consumer sets the flag.
+                from gateway.realtime_voice_messaging_host import (
+                    _is_native_realtime_event,
+                )
+
+                _native_realtime_event = _is_native_realtime_event(
+                    getattr(self, "gateway_runner", None), event
+                )
                 _tts_path = None
                 _tts_requested_path = None
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
+                        and not _native_realtime_event
                         and text_content
                         and not media_files
                         and not self._streaming_tts_turn_completed(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -103,10 +104,10 @@ class _InstalledProvider(RealtimeVoiceProvider):
 
 
 @pytest.mark.asyncio
-async def test_installed_contextual_plugin_dispatch_delivers_one_canonical_response(
+async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
     monkeypatch, tmp_path
 ):
-    """Public plugin registration and adapter dispatch reach canonical delivery."""
+    """The exact host-owned turn reaches canonical delivery without generic TTS."""
     import gateway.run as gateway_run
     import hermes_state
     import run_agent
@@ -176,7 +177,26 @@ async def test_installed_contextual_plugin_dispatch_delivers_one_canonical_respo
     adapter.set_message_handler(runner._handle_message)
     adapter.set_session_store(store)
     runner.adapters[Platform.DISCORD] = adapter
+    adapter._should_auto_tts_for_chat = lambda _chat_id: True
     canonical_sends: list[tuple[str, str]] = []
+    generic_tts_calls: list[str] = []
+    generic_audio_calls: list[str] = []
+
+    def generic_tts_tripwire(*, text, output_path=None):
+        generic_tts_calls.append(text)
+        assert output_path is not None
+        from pathlib import Path
+
+        Path(output_path).write_bytes(b"generic whole-file audio")
+        return json.dumps({"success": True, "file_path": output_path})
+
+    async def generic_audio_tripwire(*, audio_path, **_kwargs):
+        generic_audio_calls.append(audio_path)
+        raise AssertionError("native realtime turn reached generic audio output")
+
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", generic_tts_tripwire)
+    monkeypatch.setattr(adapter, "play_tts", generic_audio_tripwire)
 
     async def send_canonical_response(*, chat_id, content, **_kwargs):
         canonical_sends.append((chat_id, content))
@@ -187,7 +207,10 @@ async def test_installed_contextual_plugin_dispatch_delivers_one_canonical_respo
     captured_events: list[MessageEvent] = []
 
     def capture_pre_dispatch(_hook_name, **kwargs):
-        captured_events.append(kwargs["event"])
+        event = kwargs["event"]
+        if getattr(event, _CLAIM_ATTR, None) is not None:
+            event.message_type = MessageType.VOICE
+        captured_events.append(event)
         return []
 
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", capture_pre_dispatch)
@@ -374,6 +397,8 @@ async def test_installed_contextual_plugin_dispatch_delivers_one_canonical_respo
 
         assert run_calls == ["installed voice turn"]
         assert canonical_sends == [(source.chat_id, "canonical installed response")]
+        assert generic_tts_calls == []
+        assert generic_audio_calls == []
         assert provider.open_calls == 1
         assert session.tool_result_calls == 0
         assert session.close_calls == 1
