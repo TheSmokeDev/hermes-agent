@@ -86,6 +86,28 @@ class TestVoiceMixerCore:
         )
         await lease.close()
 
+    @pytest.mark.parametrize("field", range(3))
+    def test_native_identity_rejects_raw_oversize_before_normalization(self, field):
+        mx = vm.VoiceMixer()
+        values = ["lease", "response", "turn"]
+        values[field] = "x" + (" " * vm.NATIVE_ID_MAX_CHARS)
+
+        with pytest.raises(ValueError, match="exceed"):
+            mx.acquire_native_playback(*values, 1)
+
+    @pytest.mark.parametrize("field", range(3))
+    def test_native_identity_rejects_str_subclass_before_calling_methods(self, field):
+        class ExplosiveStr(str):
+            def strip(self, *args, **kwargs):
+                raise AssertionError("str subclass method must not be called")
+
+        mx = vm.VoiceMixer()
+        values = ["lease", "response", "turn"]
+        values[field] = ExplosiveStr(values[field])
+
+        with pytest.raises(TypeError, match="exact strings"):
+            mx.acquire_native_playback(*values, 1)
+
     @pytest.mark.asyncio
     async def test_capacity_counts_frame_returned_until_next_read_acknowledges_it(self):
         mx = vm.VoiceMixer(native_frame_capacity=1)

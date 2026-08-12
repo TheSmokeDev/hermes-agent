@@ -415,11 +415,11 @@ class VoiceMixer(discord.AudioSource):
         identifiers = (lease_id, response_id, turn_marker)
         if any(type(value) is not str for value in identifiers):
             raise TypeError("native playback identifiers must be exact strings")
+        if any(len(value) > NATIVE_ID_MAX_CHARS for value in identifiers):
+            raise ValueError(f"native playback identifiers exceed {NATIVE_ID_MAX_CHARS} characters")
         identifiers = tuple(value.strip() for value in identifiers)
         if any(not value for value in identifiers):
             raise ValueError("native playback identifiers must be nonblank")
-        if any(len(value) > NATIVE_ID_MAX_CHARS for value in identifiers):
-            raise ValueError(f"native playback identifiers exceed {NATIVE_ID_MAX_CHARS} characters")
         if type(generation) is not int or generation <= 0:
             raise TypeError("generation must be a positive exact int")
         lease_id, response_id, turn_marker = identifiers
