@@ -659,6 +659,39 @@ class _ImmediateFailingCancellationSession(_Session):
         self.closed_count += 1
 
 
+class _FailingCancellationCloseJoinsOperationSession(_Session):
+    def __init__(self) -> None:
+        super().__init__({RealtimeCapability.RESPONSE_CANCELLATION})
+        self.events_entered = asyncio.Event()
+        self.release_events = asyncio.Event()
+        self.close_entered = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def _cancel_response(self, response_id: str) -> None:
+        self.cancelled_responses.append(response_id)
+        raise RuntimeError("native cancellation write failed")
+
+    def _events(self):
+        async def stream():
+            self.events_entered.set()
+            await self.release_events.wait()
+            if False:
+                yield RealtimeVoiceEvent()
+
+        return stream()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.close_entered.set()
+        self.release_events.set()
+        operation = self._response_cancellation_tasks.get("response")
+        if operation is not None:
+            await asyncio.shield(operation)
+        self.cleanup_completed.set()
+        if self.closed_count == 1:
+            raise RuntimeError("close after cancellation failure failed")
+
+
 class _ControlledResponseSession(_Session):
     def __init__(self, outcome: BaseException | None = None) -> None:
         super().__init__({RealtimeCapability.EXPLICIT_RESPONSE})
@@ -688,6 +721,26 @@ class _ControlledResponseSession(_Session):
     async def _close(self) -> None:
         self.closed_count += 1
         self.release_events.set()
+
+
+class _FailingResponseCloseJoinsOperationSession(_ControlledResponseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_entered = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        raise RuntimeError("native response write failed")
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.close_entered.set()
+        self.release_events.set()
+        operation = next(iter(self._response_send_tasks.values()), None)
+        if operation is not None:
+            await asyncio.shield(operation)
+        self.cleanup_completed.set()
 
 
 class _ControlledCancellationSession(_Session):
@@ -970,6 +1023,27 @@ async def test_start_response_failure_is_terminal_and_host_visible() -> None:
     with pytest.raises(RuntimeError, match="closed"):
         await session.start_response(_response_request(assistant_message_id=2))
     assert session.response_requests == [request]
+
+
+@pytest.mark.asyncio
+async def test_response_failure_does_not_deadlock_close_joining_operation() -> None:
+    session = _FailingResponseCloseJoinsOperationSession()
+    sending = asyncio.create_task(session.start_response(_response_request()))
+    await session.close_entered.wait()
+
+    try:
+        done, _ = await asyncio.wait({sending}, timeout=0.1)
+        assert done == {sending}
+        with pytest.raises(RuntimeError, match="native response write failed"):
+            sending.result()
+        await asyncio.wait_for(session.cleanup_completed.wait(), timeout=0.1)
+        assert session.closed_count == 1
+        assert session._response_send_tasks == {}
+        assert session._in_flight_response_sends == set()
+    finally:
+        if session._close_task is not None and not session._close_task.done():
+            session._close_task.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1724,6 +1798,43 @@ async def test_cancelled_cancellation_waiter_late_failure_is_terminal_once() -> 
     assert session._terminal_failure is failure
     assert session._response_cancellation_tasks == {}
     assert session._in_flight_response_cancellations == set()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_failure_does_not_deadlock_close_joining_operation() -> None:
+    session = _FailingCancellationCloseJoinsOperationSession()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    receiving = asyncio.create_task(anext(session.events()))
+    await session.events_entered.wait()
+    cancelling = asyncio.create_task(session.cancel_response("response"))
+    await session.close_entered.wait()
+
+    try:
+        done, _ = await asyncio.wait({cancelling}, timeout=0.1)
+        assert done == {cancelling}
+        with pytest.raises(RuntimeError, match="native cancellation write failed"):
+            cancelling.result()
+        await asyncio.wait_for(session.cleanup_completed.wait(), timeout=0.1)
+        await session.close()
+        failure = await receiving
+        assert isinstance(failure, SessionFailure)
+        assert failure.code == "cancellation_failed"
+        assert [event async for event in session.events()] == []
+        assert session.cleanup_completed.is_set()
+        assert session.closed_count == 2
+        assert session._closed
+        assert session._response_cancellation_tasks == {}
+        assert session._in_flight_response_cancellations == set()
+        assert session._detached_close_tasks == set()
+        assert orphaned == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+        if session._close_task is not None and not session._close_task.done():
+            session._close_task.cancel()
+        await asyncio.gather(cancelling, receiving, return_exceptions=True)
 
 
 @pytest.mark.asyncio

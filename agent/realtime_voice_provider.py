@@ -654,6 +654,7 @@ class RealtimeVoiceSession(abc.ABC):
         self._closed = False
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+        self._detached_close_tasks: set[asyncio.Task[None]] = set()
         self._pending_continuation_batch_ids: OrderedDict[str, None] = OrderedDict()
         self._continuation_responses: dict[str, str] = {}
         self._completed_continuation_responses: OrderedDict[str, str] = OrderedDict()
@@ -746,7 +747,15 @@ class RealtimeVoiceSession(abc.ABC):
         if task.done():
             self._cleanup_response_send_task(identity, task)
         await asyncio.wait({task})
-        task.result()
+        try:
+            task.result()
+        except BaseException:
+            if self._terminal_failure is not None:
+                try:
+                    await self.close()
+                except BaseException:
+                    pass
+            raise
 
     def _cleanup_response_send_task(
         self,
@@ -786,12 +795,7 @@ class RealtimeVoiceSession(abc.ABC):
                         code="explicit_response_failed",
                         message="explicit response provider send failed",
                     )
-                try:
-                    await self.close()
-                except BaseException:
-                    # Preserve the provider-send failure. The retained close lifecycle
-                    # remains retryable according to close().
-                    pass
+                self._close_after_operation_failure()
             raise
         else:
             self._accepted_response_send_tombstones[identity] = None
@@ -840,7 +844,15 @@ class RealtimeVoiceSession(abc.ABC):
         if task.done():
             self._cleanup_response_cancellation_task(response_id, task)
         await asyncio.wait({task})
-        task.result()
+        try:
+            task.result()
+        except BaseException:
+            if self._terminal_failure is not None:
+                try:
+                    await self.close()
+                except BaseException:
+                    pass
+            raise
 
     def _cleanup_response_cancellation_task(
         self, response_id: str, task: asyncio.Future[None]
@@ -852,6 +864,20 @@ class RealtimeVoiceSession(abc.ABC):
         self, response_id: str, task: asyncio.Future[None]
     ) -> None:
         self._cleanup_response_cancellation_task(response_id, task)
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    def _close_after_operation_failure(self) -> None:
+        task = asyncio.create_task(self.close())
+        self._detached_close_tasks.add(task)
+        task.add_done_callback(self._observe_detached_close)
+        if task.done():
+            self._observe_detached_close(task)
+
+    def _observe_detached_close(self, task: asyncio.Task[None]) -> None:
+        self._detached_close_tasks.discard(task)
         try:
             task.result()
         except BaseException:
@@ -871,10 +897,7 @@ class RealtimeVoiceSession(abc.ABC):
                         code="cancellation_failed",
                         message="response cancellation provider send failed",
                     )
-                try:
-                    await self.close()
-                except BaseException:
-                    pass
+                self._close_after_operation_failure()
             raise
         else:
             self._accepted_response_cancellation_tombstones[response_id] = None
