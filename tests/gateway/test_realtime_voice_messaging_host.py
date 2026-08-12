@@ -161,15 +161,15 @@ async def test_reserve_native_output_uses_exact_persisted_text_and_live_adapter_
     receipt = RealtimeVoiceFinalizationReceipt("durable-1", marker, 10, 11)
     host._finalizations.add(receipt)
 
-    reservation = await host.reserve_native_output(
+    request = await host.reserve_native_output(
         _binding(build_session_key(source)), receipt
     )
+    reservation = request.reservation
 
-    assert reservation.canonical_text == "canonical answer"
-    assert reservation.content_digest == hashlib.sha256(
-        b"canonical answer"
-    ).hexdigest()
-    assert reservation.output_audio_format is host._output_audio_format
+    assert request.canonical_text == "canonical answer"
+    assert not hasattr(reservation, "canonical_text")
+    assert request.content_digest == hashlib.sha256(b"canonical answer").hexdigest()
+    assert request.output_audio_format is host._output_audio_format
     assert reservation.guild_id == 111
     assert reservation.connection_generation == 4
     assert reservation.mixer_generation == 7
@@ -259,6 +259,89 @@ async def test_reservation_rejects_coercive_durable_row_ids():
 
     with pytest.raises(PermissionError, match="rows"):
         await host.reserve_native_output(_binding(build_session_key(source)), receipt)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_acquisition_waiter_cannot_orphan_late_lease():
+    from gateway.realtime_voice_messaging_host import (
+        GatewayRealtimeVoiceMessagingHost,
+        RealtimeVoiceFinalizationReceipt,
+    )
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    marker = "marker"
+    runner._session_db = SimpleNamespace(_db=MagicMock(get_messages=MagicMock(return_value=[
+        {"id": 1, "role": "user", "content": "voice", "display_metadata": {"realtime_voice_turn_marker": marker}},
+        {"id": 2, "role": "assistant", "content": "answer", "tool_calls": []},
+    ])))
+    adapter = runner.adapters[Platform.DISCORD]
+    adapter._voice_clients[111] = SimpleNamespace(is_connected=lambda: True)
+    adapter._voice_connection_generations[111] = 4
+    adapter._voice_mixer_generations[111] = 7
+    host = GatewayRealtimeVoiceMessagingHost(captured[0], runner, output_audio_format=_native_output_format())
+    receipt = RealtimeVoiceFinalizationReceipt("durable-1", marker, 1, 2)
+    host._finalizations.add(receipt)
+    request = await host.reserve_native_output(_binding(build_session_key(source)), receipt)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    lease = SimpleNamespace(close=AsyncMock())
+
+    async def acquire(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return lease
+
+    adapter.acquire_native_playback_lease = acquire
+    waiter = asyncio.create_task(host.acquire_native_playback(
+        request, lease_id="lease", response_id="response", transport_generation=1,
+    ))
+    await entered.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    closer = asyncio.create_task(host.close_attachment(None))
+    release.set()
+    await closer
+    lease.close.assert_awaited_once()
+    with pytest.raises(PermissionError, match="forged or stale|already acquired"):
+        await host.acquire_native_playback(
+            request, lease_id="lease-2", response_id="response-2", transport_generation=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_hostile_finalization_receipt_is_rejected_without_hashing():
+    from gateway.realtime_voice_messaging_host import GatewayRealtimeVoiceMessagingHost
+
+    class Hostile:
+        def __hash__(self):
+            raise AssertionError("hostile hash executed")
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    runner._session_db = SimpleNamespace(_db=MagicMock())
+    host = GatewayRealtimeVoiceMessagingHost(captured[0], runner, output_audio_format=_native_output_format())
+    for hostile in ([], Hostile()):
+        with pytest.raises(PermissionError, match="not minted"):
+            await host.reserve_native_output(_binding(build_session_key(source)), hostile)
+
+
+@pytest.mark.asyncio
+async def test_closed_host_cannot_publish_new_permit():
+    from gateway.realtime_voice_messaging_host import _create_messaging_host
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(get_messages=MagicMock(return_value=[]))
+    )
+    host = _create_messaging_host(captured[0], runner)
+    binding = _binding(build_session_key(source))
+    await host.close_attachment(binding)
+
+    assert await host.authorize(binding, _utterance()) is None
+    assert not host._permits
 
 
 def test_magic_mock_event_without_installed_claim_is_ordinary():
