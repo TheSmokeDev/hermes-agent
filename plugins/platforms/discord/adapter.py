@@ -1058,6 +1058,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        self._voice_mixer_owners: Dict[int, tuple] = {}
         self._voice_connection_generations: Dict[int, int] = {}
         self._voice_mixer_generations: Dict[int, int] = {}
         self._native_playback_leases: Dict[int, tuple] = {}
@@ -4093,7 +4094,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if vc.is_playing():
             vc.stop()
         vc.play(mixer, after=_after)
-        self._voice_mixers[guild_id] = mixer
+        self._register_voice_mixer(guild_id, vc, mixer, mixer_generation)
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
 
     def _ensure_native_playback_state(self) -> None:
@@ -4102,8 +4103,24 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_connection_generations = {}
         if not hasattr(self, "_voice_mixer_generations"):
             self._voice_mixer_generations = {}
+        if not hasattr(self, "_voice_mixer_owners"):
+            self._voice_mixer_owners = {}
         if not hasattr(self, "_native_playback_leases"):
             self._native_playback_leases = {}
+
+    def _register_voice_mixer(self, guild_id, vc, mixer, mixer_generation) -> None:
+        self._ensure_native_playback_state()
+        self._voice_mixers[guild_id] = mixer
+        self._voice_mixer_owners[guild_id] = (vc, mixer, mixer_generation)
+
+    def _voice_mixer_owner_is(self, guild_id, vc, mixer, mixer_generation) -> bool:
+        owner = self._voice_mixer_owners.get(guild_id)
+        return (
+            owner is not None
+            and owner[0] is vc
+            and owner[1] is mixer
+            and owner[2] == mixer_generation
+        )
 
     def _native_mixer_failed(self, guild_id, vc, mixer, connection_generation,
                              mixer_generation, error) -> None:
@@ -4113,6 +4130,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if (
             self._voice_clients.get(guild_id) is not vc
             or self._voice_mixers.get(guild_id) is not mixer
+            or not self._voice_mixer_owner_is(
+                guild_id, vc, mixer, mixer_generation,
+            )
             or self._voice_connection_generations.get(guild_id) != connection_generation
             or self._voice_mixer_generations.get(guild_id) != mixer_generation
         ):
@@ -4120,6 +4140,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if error:
             logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
         self._voice_mixers.pop(guild_id, None)
+        self._voice_mixer_owners.pop(guild_id, None)
         self._voice_mixer_generations[guild_id] = mixer_generation + 1
         if current is not None and current[1] is mixer:
             self._native_playback_leases.pop(guild_id, None)
@@ -4129,9 +4150,12 @@ class DiscordAdapter(BasePlatformAdapter):
         """Synchronously fence and wake the exact mixer/lease owned by a guild."""
         self._ensure_native_playback_state()
         mixer = self._voice_mixers.pop(guild_id, None)
+        owner = self._voice_mixer_owners.pop(guild_id, None)
         self._native_playback_leases.pop(guild_id, None)
         if mixer is not None:
             mixer.cleanup()
+        if owner is not None and owner[1] is not mixer:
+            owner[1].cleanup()
         if guild_id in self._voice_mixer_generations or mixer is not None:
             self._voice_mixer_generations[guild_id] = (
                 self._voice_mixer_generations.get(guild_id, 0) + 1
@@ -4172,10 +4196,48 @@ class DiscordAdapter(BasePlatformAdapter):
             if owned is not None and owned[0] is not vc:
                 self._invalidate_native_playback(guild_id, connection_lost=True)
                 raise RuntimeError("stale Discord voice client replacement")
+            if owned is not None and self._voice_mixers.get(guild_id) is not owned[1]:
+                self._native_playback_leases.pop(guild_id, None)
+                old_owner = self._voice_mixer_owners.get(guild_id)
+                if old_owner is not None and old_owner[0] is owned[0] and old_owner[1] is owned[1]:
+                    self._voice_mixer_owners.pop(guild_id, None)
+                owned[1].cleanup()
+                self._voice_mixer_generations[guild_id] = (
+                    self._voice_mixer_generations.get(guild_id, 0) + 1
+                )
+                replacement = self._voice_mixers.get(guild_id)
+                if replacement is not None:
+                    self._register_voice_mixer(
+                        guild_id, vc, replacement,
+                        self._voice_mixer_generations[guild_id],
+                    )
+                raise RuntimeError("stale Discord voice mixer replacement")
             current_connection_generation = self._voice_connection_generations.setdefault(guild_id, 1)
             if connection_generation != current_connection_generation:
                 raise RuntimeError("stale Discord voice connection generation")
             mixer = self._voice_mixers.get(guild_id)
+            owner = self._voice_mixer_owners.get(guild_id)
+            if mixer is not None and owner is None:
+                raise RuntimeError("Discord voice playback bus ownership is unknown")
+            if owner is not None and (
+                owner[0] is not vc
+                or owner[1] is not mixer
+                or owner[2] != self._voice_mixer_generations.get(guild_id, 1)
+            ):
+                if self._voice_mixers.get(guild_id) is owner[1]:
+                    self._voice_mixers.pop(guild_id, None)
+                if self._voice_mixer_owners.get(guild_id) is owner:
+                    self._voice_mixer_owners.pop(guild_id, None)
+                self._native_playback_leases.pop(guild_id, None)
+                owner[1].cleanup()
+                self._voice_mixer_generations[guild_id] = (
+                    self._voice_mixer_generations.get(guild_id, 0) + 1
+                )
+                if owner[0] is not vc:
+                    self._voice_connection_generations[guild_id] = (
+                        self._voice_connection_generations.get(guild_id, 0) + 1
+                    )
+                raise RuntimeError("stale Discord voice mixer ownership")
             if mixer is None:
                 if vc.is_playing():
                     raise RuntimeError("Discord voice playback bus is busy")
@@ -4196,7 +4258,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
 
                 vc.play(mixer, after=_after)
-                self._voice_mixers[guild_id] = mixer
+                self._register_voice_mixer(
+                    guild_id, vc, mixer, current_mixer_generation,
+                )
             else:
                 current_mixer_generation = self._voice_mixer_generations.setdefault(guild_id, 1)
                 if mixer_generation != current_mixer_generation:
@@ -4222,6 +4286,9 @@ class DiscordAdapter(BasePlatformAdapter):
             current_lease is not lease
             or self._voice_clients.get(guild_id) is not vc
             or self._voice_mixers.get(guild_id) is not mixer
+            or not self._voice_mixer_owner_is(
+                guild_id, vc, mixer, mixer_generation,
+            )
             or self._voice_connection_generations.get(guild_id) != connection_generation
             or self._voice_mixer_generations.get(guild_id) != mixer_generation
             or lease.generation != mixer_generation
