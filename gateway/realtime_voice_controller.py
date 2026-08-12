@@ -1131,7 +1131,10 @@ class GatewayRealtimeVoiceController:
             if self._closed:
                 return
             close_task = self._close_task
-            if close_task is None or (close_task.done() and close_task.exception() is not None):
+            if close_task is None or (
+                close_task.done()
+                and (close_task.cancelled() or close_task.exception() is not None)
+            ):
                 self._closing = True
                 close_task = asyncio.create_task(self._finish_close(reason))
                 self._close_task = close_task

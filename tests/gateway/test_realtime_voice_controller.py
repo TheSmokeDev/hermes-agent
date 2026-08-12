@@ -831,6 +831,33 @@ async def test_provider_close_failure_is_retryable_and_closed_is_truthful(bindin
 
 
 @pytest.mark.asyncio
+async def test_cancelled_provider_close_is_retryable_and_closed_is_truthful(binding):
+    session = _Session()
+    session.close_error = asyncio.CancelledError()
+    assert register_provider(_Provider(session))
+    controller = GatewayRealtimeVoiceController(_Host())
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+
+    with pytest.raises(asyncio.CancelledError):
+        await controller.close(reason="first")
+
+    assert session.close_calls == 1
+    assert controller._closed is False
+    assert not any(
+        event.lifecycle is ControllerLifecycle.CLOSED
+        for event in controller.lifecycle_events
+    )
+
+    await controller.close(reason="retry")
+    assert session.close_calls == 2
+    assert controller._closed is True
+    assert sum(
+        event.lifecycle is ControllerLifecycle.CLOSED
+        for event in controller.lifecycle_events
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_all_terminal_admission_statuses_are_visibly_projected(
     binding: RealtimeSessionBinding,
 ) -> None:
