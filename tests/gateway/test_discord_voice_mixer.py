@@ -536,7 +536,7 @@ class TestNativePlaybackAdapterLease:
         assert not replacement_vc.play_calls and replacement_vc.stop_calls == 0
 
     @pytest.mark.asyncio
-    async def test_mixer_replacement_fences_old_lease_before_replacement_acquisition(self):
+    async def test_unknown_mixer_replacement_remains_unowned_after_old_lease_is_fenced(self):
         adapter = _make_adapter({"enabled": False})
         vc = _FakeVoiceClient()
         adapter._voice_clients[111] = vc
@@ -567,15 +567,21 @@ class TestNativePlaybackAdapterLease:
         assert adapter._voice_mixers[111] is replacement
         assert adapter._voice_mixer_generations[111] == 2
         assert 111 not in adapter._native_playback_leases
+        assert 111 not in adapter._voice_mixer_owners
 
-        new_lease = await adapter.acquire_native_playback_lease(
-            111, "replacement", "response", "turn", 1, 2,
-            input_format="pcm_s16le", sample_rate=24000, channels=1,
-        )
+        for lease_id in ("replacement", "repeated"):
+            with pytest.raises(RuntimeError, match="ownership is unknown"):
+                await adapter.acquire_native_playback_lease(
+                    111, lease_id, "response", "turn", 1, 2,
+                    input_format="pcm_s16le", sample_rate=24000, channels=1,
+                )
+        with pytest.raises(ValueError):
+            adapter.validate_native_playback_receipt(111, old_lease, object())
         await old_lease.close()
         assert adapter._voice_mixers[111] is replacement
+        assert 111 not in adapter._voice_mixer_owners
         assert not replacement._closed
-        await new_lease.close()
+        assert len(vc.play_calls) == 1 and vc.stop_calls == 0
 
     @pytest.mark.asyncio
     async def test_prelease_client_replacement_fences_exact_owned_mixer(self):

@@ -4205,12 +4205,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._voice_mixer_generations[guild_id] = (
                     self._voice_mixer_generations.get(guild_id, 0) + 1
                 )
-                replacement = self._voice_mixers.get(guild_id)
-                if replacement is not None:
-                    self._register_voice_mixer(
-                        guild_id, vc, replacement,
-                        self._voice_mixer_generations[guild_id],
-                    )
                 raise RuntimeError("stale Discord voice mixer replacement")
             current_connection_generation = self._voice_connection_generations.setdefault(guild_id, 1)
             if connection_generation != current_connection_generation:
