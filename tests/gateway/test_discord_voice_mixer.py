@@ -327,6 +327,215 @@ def _make_adapter(fx_cfg=None):
     return adapter
 
 
+class _FakeVoiceClient:
+    def __init__(self, *, playing=False):
+        self._playing = playing
+        self.play_calls = []
+        self.stop_calls = 0
+
+    def is_connected(self):
+        return True
+
+    def is_playing(self):
+        return self._playing
+
+    def play(self, source, *, after=None):
+        self.play_calls.append((source, after))
+        self._playing = True
+
+    def stop(self):
+        self.stop_calls += 1
+        self._playing = False
+
+    async def disconnect(self):
+        self._playing = False
+
+
+class TestNativePlaybackAdapterLease:
+    @pytest.mark.asyncio
+    async def test_object_new_fixture_acquires_exact_current_generation(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = vc
+
+        lease = await adapter.acquire_native_playback_lease(
+            111, "lease", "response", "turn", 1, 1,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+
+        assert adapter._voice_connection_generations[111] == 1
+        assert adapter._voice_mixer_generations[111] == 1
+        assert adapter._voice_mixers[111] is lease._mixer
+        assert len(vc.play_calls) == 1
+        assert vc.stop_calls == 0
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_and_wrong_shape_fail_before_play_or_mixer_mutation(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = vc
+        adapter._voice_connection_generations = {111: 2}
+        adapter._voice_mixer_generations = {111: 3}
+        calls = [
+            (True, 2, 3, "pcm_s16le", 24000, 1),
+            (111, 1, 3, "pcm_s16le", 24000, 1),
+            (111, 2, 2, "pcm_s16le", 24000, 1),
+            (111, 2, 3, "PCM_S16LE", 24000, 1),
+            (111, 2, 3, "pcm_s16le", 48000, 1),
+            (111, 2, 3, "pcm_s16le", 24000, True),
+        ]
+        for guild_id, connection_gen, mixer_gen, fmt, rate, channels in calls:
+            with pytest.raises((TypeError, ValueError, RuntimeError)):
+                await adapter.acquire_native_playback_lease(
+                    guild_id, "lease", "response", "turn", connection_gen, mixer_gen,
+                    input_format=fmt, sample_rate=rate, channels=channels,
+                )
+        assert not adapter._voice_mixers
+        assert not vc.play_calls and vc.stop_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_busy_legacy_source_is_not_stopped_or_replaced(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = _FakeVoiceClient(playing=True)
+        adapter._voice_clients[111] = vc
+        with pytest.raises(RuntimeError, match="busy"):
+            await adapter.acquire_native_playback_lease(
+                111, "lease", "response", "turn", 1, 1,
+                input_format="pcm_s16le", sample_rate=24000, channels=1,
+            )
+        assert not vc.play_calls and vc.stop_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_existing_mixer_receipt_validation_does_not_touch_vc(self):
+        adapter = _make_adapter()
+        vc = _FakeVoiceClient(playing=True)
+        mixer = vm.VoiceMixer()
+        adapter._voice_clients[111] = vc
+        adapter._voice_mixers[111] = mixer
+        adapter._voice_connection_generations = {111: 4}
+        adapter._voice_mixer_generations = {111: 7}
+        lease = await adapter.acquire_native_playback_lease(
+            111, "lease", "response", "turn", 4, 7,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+        receipt = await lease.interrupt_and_wait(1)
+        assert adapter.validate_native_playback_receipt(111, lease, receipt) is receipt
+        forged = vm.NativePlaybackReceipt(
+            receipt.lease_id, receipt.response_id, receipt.turn_marker,
+            receipt.generation, receipt.accepted_provider_bytes,
+            receipt.lease_frames, receipt.interrupted,
+        )
+        with pytest.raises(ValueError):
+            adapter.validate_native_playback_receipt(111, lease, forged)
+        assert not vc.play_calls and vc.stop_calls == 0
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_leave_invalidates_lease_and_wakes_blocked_write(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = vc
+        lease = await adapter.acquire_native_playback_lease(
+            111, "lease", "response", "turn", 1, 1,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+        writer = asyncio.create_task(lease.write_pcm(struct.pack("<4320h", *range(4320))))
+        while not lease._space_waiters:
+            await asyncio.sleep(0)
+        await adapter.leave_voice_channel(111)
+        with pytest.raises(RuntimeError):
+            await writer
+        assert lease._terminal and lease._interrupted
+        assert 111 not in adapter._native_playback_leases
+        assert adapter._voice_connection_generations[111] == 2
+        assert adapter._voice_mixer_generations[111] == 2
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_player_callback_cannot_cleanup_replacement(self):
+        adapter = _make_adapter({"enabled": False})
+        first_vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = first_vc
+        first = await adapter.acquire_native_playback_lease(
+            111, "first", "response", "turn", 1, 1,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+        stale_after = first_vc.play_calls[0][1]
+        await adapter.leave_voice_channel(111)
+        replacement_vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = replacement_vc
+        second = await adapter.acquire_native_playback_lease(
+            111, "second", "response", "turn", 2, 2,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+        stale_after(RuntimeError("late"))
+        barrier = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(barrier.set_result, None)
+        await barrier
+        assert adapter._voice_mixers[111] is second._mixer
+        assert not second._mixer._closed
+        await second.close()
+
+    @pytest.mark.asyncio
+    async def test_current_player_error_invalidates_and_wakes_finish(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = vc
+        lease = await adapter.acquire_native_playback_lease(
+            111, "lease", "response", "turn", 1, 1,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+        await lease.write_pcm(struct.pack("<h", 7))
+        finishing = asyncio.create_task(lease.finish_and_wait(1))
+        vc.play_calls[0][1](RuntimeError("player failed"))
+        receipt = await asyncio.wait_for(finishing, 1)
+        assert receipt.interrupted is True
+        assert 111 not in adapter._voice_mixers
+        assert 111 not in adapter._native_playback_leases
+        assert adapter._voice_mixer_generations[111] == 2
+
+    @pytest.mark.asyncio
+    async def test_concurrent_acquisition_has_exactly_one_winner(self):
+        adapter = _make_adapter({"enabled": False})
+        vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = vc
+
+        async def acquire(identity):
+            return await adapter.acquire_native_playback_lease(
+                111, identity, "response", "turn", 1, 1,
+                input_format="pcm_s16le", sample_rate=24000, channels=1,
+            )
+
+        results = await asyncio.gather(acquire("a"), acquire("b"), return_exceptions=True)
+        winners = [result for result in results if not isinstance(result, Exception)]
+        losers = [result for result in results if isinstance(result, RuntimeError)]
+        assert len(winners) == len(losers) == 1
+        assert len(vc.play_calls) == 1 and vc.stop_calls == 0
+        await winners[0].close()
+
+    @pytest.mark.asyncio
+    async def test_client_replacement_fences_old_mixer_before_acquisition(self):
+        adapter = _make_adapter({"enabled": False})
+        first_vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = first_vc
+        lease = await adapter.acquire_native_playback_lease(
+            111, "first", "response", "turn", 1, 1,
+            input_format="pcm_s16le", sample_rate=24000, channels=1,
+        )
+        replacement_vc = _FakeVoiceClient()
+        adapter._voice_clients[111] = replacement_vc
+        with pytest.raises(RuntimeError, match="stale"):
+            await adapter.acquire_native_playback_lease(
+                111, "second", "response", "turn", 1, 1,
+                input_format="pcm_s16le", sample_rate=24000, channels=1,
+            )
+        assert lease._terminal and lease._interrupted
+        assert adapter._voice_connection_generations[111] == 2
+        assert adapter._voice_mixer_generations[111] == 2
+        assert not replacement_vc.play_calls and replacement_vc.stop_calls == 0
+
+
 class TestVoiceMixerActive:
 
 
