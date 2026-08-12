@@ -537,18 +537,84 @@ async def test_cancelled_acquisition_waiter_cannot_orphan_late_lease():
     with pytest.raises(asyncio.CancelledError):
         await waiter
     closer = asyncio.create_task(host.close_attachment(None))
-    close_returned = asyncio.Event()
-    closer.add_done_callback(lambda _task: close_returned.set())
-    await close_returned.wait()
+    await asyncio.sleep(0)
+    assert not closer.done()
     assert not release.is_set()
     release.set()
     await closer
     await lease_closed.wait()
     lease.close.assert_awaited_once()
+    assert host._acquisitions == {}
     with pytest.raises(PermissionError, match="forged or stale|already acquired"):
         await host.acquire_native_playback(
             request, lease_id="lease-2", response_id="response-2", transport_generation=1,
         )
+
+
+@pytest.mark.asyncio
+async def test_close_waiters_share_shielded_exact_lease_cleanup_owner():
+    from gateway.realtime_voice_messaging_host import _ACCEPTED_TASKS
+
+    host, request, adapter = await _issued_native_output_request()
+    close_entered = asyncio.Event()
+    close_release = asyncio.Event()
+
+    async def close_lease():
+        close_entered.set()
+        await close_release.wait()
+
+    lease = SimpleNamespace(close=AsyncMock(side_effect=close_lease))
+    adapter.acquire_native_playback_lease = AsyncMock(return_value=lease)
+    await host.acquire_native_playback(
+        request, lease_id="lease", response_id="response", transport_generation=1,
+    )
+
+    first = asyncio.create_task(host.close_attachment(None))
+    await close_entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second = asyncio.create_task(host.close_attachment(None))
+    await asyncio.sleep(0)
+    assert not second.done()
+
+    close_release.set()
+    await second
+
+    lease.close.assert_awaited_once()
+    assert host._acquisitions == {}
+    assert not any(not task.done() for task in _ACCEPTED_TASKS)
+
+
+@pytest.mark.asyncio
+async def test_close_attempts_every_lease_then_replays_first_failure_with_empty_ledger():
+    from gateway.realtime_voice_messaging_host import _AcquisitionRecord
+
+    host, request, adapter = await _issued_native_output_request()
+    first_failure = RuntimeError("first close failed")
+    first_lease = SimpleNamespace(close=AsyncMock(side_effect=first_failure))
+    second_lease = SimpleNamespace(close=AsyncMock())
+    adapter.acquire_native_playback_lease = AsyncMock(return_value=first_lease)
+    await host.acquire_native_playback(
+        request, lease_id="lease", response_id="response", transport_generation=1,
+    )
+    first_record = host._acquisitions[request.reservation]
+    second_reservation = object()
+    second_record = _AcquisitionRecord(
+        request.reservation, first_record.issuance, 1, adapter, lease=second_lease
+    )
+    host._acquisitions[second_reservation] = second_record
+
+    with pytest.raises(RuntimeError, match="first close failed") as first:
+        await host.close_attachment(None)
+    with pytest.raises(RuntimeError, match="first close failed") as retry:
+        await host.close_attachment(None)
+
+    assert first.value is first_failure
+    assert retry.value is first_failure
+    first_lease.close.assert_awaited_once()
+    second_lease.close.assert_awaited_once()
+    assert host._acquisitions == {}
 
 
 @pytest.mark.asyncio

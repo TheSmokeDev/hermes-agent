@@ -1168,13 +1168,18 @@ class GatewayRealtimeVoiceController:
                 if cleanup_detail is None:
                     cleanup_detail = "controller cleanup failed"
         close_attachment = getattr(self._host, "close_attachment", None)
+        host_cleanup_failure: BaseException | None = None
         if callable(close_attachment):
             try:
                 await close_attachment(self._binding)
-            except BaseException:
-                if cleanup_detail is None:
-                    cleanup_detail = "controller cleanup failed"
-        final_detail = cleanup_detail or reason
+            except BaseException as exc:
+                host_cleanup_failure = exc
+                cleanup_detail = "native cleanup failed"
+        final_detail = (
+            "closed after cleanup failure"
+            if host_cleanup_failure is not None
+            else cleanup_detail or reason
+        )
         if cleanup_detail is not None and not (
             self._lifecycle_events
             and self._lifecycle_events[-1].lifecycle is ControllerLifecycle.FAILED
@@ -1184,6 +1189,8 @@ class GatewayRealtimeVoiceController:
         self._emit(ControllerLifecycle.CLOSING, detail=final_detail)
         self._closed = True
         self._emit(ControllerLifecycle.CLOSED, detail=final_detail)
+        if host_cleanup_failure is not None:
+            raise host_cleanup_failure
 
 
 __all__ = [

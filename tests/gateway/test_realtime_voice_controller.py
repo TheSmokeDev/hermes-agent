@@ -1678,6 +1678,35 @@ async def test_session_closed_terminalizes_active_native_ledger_before_closed(bi
 
 
 @pytest.mark.asyncio
+async def test_host_cleanup_failure_is_sanitized_and_closed_means_lifecycle_ended(binding):
+    class FailingCloseHost(_NativeHost):
+        async def close_attachment(self, binding) -> None:
+            await super().close_attachment(binding)
+            raise RuntimeError("secret native close detail")
+
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = FailingCloseHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+
+    with pytest.raises(RuntimeError, match="secret native close detail"):
+        await controller.close(reason="test")
+
+    terminal = controller.lifecycle_events[-3:]
+    assert [event.lifecycle for event in terminal] == [
+        ControllerLifecycle.FAILED,
+        ControllerLifecycle.CLOSING,
+        ControllerLifecycle.CLOSED,
+    ]
+    assert terminal[0].detail == "native cleanup failed"
+    assert {event.detail for event in terminal[1:]} == {"closed after cleanup failure"}
+    assert all("secret" not in event.detail for event in controller.lifecycle_events)
+    assert controller._closed is True
+    assert session.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_terminal_response_tombstones_are_bounded_and_reject_late_duplicate(
     binding,
 ):
@@ -1894,12 +1923,23 @@ async def test_timed_out_real_host_acquire_closes_late_lease_without_orphan():
     )
     await entered.wait()
 
+    state = controller._native_response
+    assert state is not None and state.acquire_task is not None
+    state.acquire_task.cancel()
     with pytest.raises(RuntimeError, match="native response cleanup failed"):
-        await controller.interrupt()
+        interrupting = asyncio.create_task(controller.interrupt())
+        while not host._closed:
+            await _next_loop_turn()
+        assert not interrupting.done()
+        assert not any(
+            event.lifecycle is ControllerLifecycle.CLOSED
+            for event in controller.lifecycle_events
+        )
+        release.set()
+        await interrupting
     await starting
     assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
     assert host._closed is True
-    release.set()
     await lease_closed.wait()
     for _ in range(20):
         if not host._acquisitions:

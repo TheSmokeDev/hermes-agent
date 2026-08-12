@@ -227,6 +227,7 @@ class GatewayRealtimeVoiceMessagingHost:
         self._acquisitions: dict[NativeRealtimeOutputReservation, _AcquisitionRecord] = {}
         self._closed = False
         self._lock = asyncio.Lock()
+        self._attachment_close_task: asyncio.Task[None] | None = None
 
     def _runner(self) -> object:
         runner = self._runner_ref()
@@ -376,19 +377,56 @@ class GatewayRealtimeVoiceMessagingHost:
 
     async def close_attachment(self, binding: RealtimeSessionBinding | None) -> None:
         async with self._lock:
-            self._closed = True
-            self._permits.clear()
-            records = tuple(self._acquisitions.values())
-            self._reservations.clear()
-            self._requests.clear()
-        for record in records:
-            task = record.task
-            if task is not None:
-                _retain_accepted_task(task)
-            lease = record.lease
-            if lease is not None:
-                close_task = asyncio.create_task(self._close_acquisition_lease(record))
+            close_task = self._attachment_close_task
+            if close_task is None:
+                self._closed = True
+                self._permits.clear()
+                self._reservations.clear()
+                self._requests.clear()
+                records = tuple(self._acquisitions.items())
+                close_task = asyncio.create_task(
+                    self._finish_attachment_close(records)
+                )
+                self._attachment_close_task = close_task
                 _retain_accepted_task(close_task)
+        await asyncio.shield(close_task)
+
+    async def _finish_attachment_close(
+        self,
+        records: tuple[tuple[object, _AcquisitionRecord], ...],
+    ) -> None:
+        first_failure: BaseException | None = None
+        for reservation, record in records:
+            try:
+                task = record.task
+                if task is not None and not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except RealtimeVoiceIngressError:
+                        pass
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+                elif task is not None:
+                    try:
+                        task.result()
+                    except RealtimeVoiceIngressError:
+                        pass
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+                if record.lease is not None and not record.close_started:
+                    try:
+                        await self._close_acquisition_lease(record)
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+            finally:
+                async with self._lock:
+                    if self._acquisitions.get(reservation) is record:
+                        self._acquisitions.pop(reservation, None)
+        if first_failure is not None:
+            raise first_failure
 
     async def _close_acquisition_lease(self, record: _AcquisitionRecord) -> None:
         if record.close_started or record.lease is None:
