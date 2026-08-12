@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+import gateway.realtime_voice_controller as controller_module
 
 from agent.realtime_voice_admission import (
     AdmissionStatus,
@@ -43,15 +48,33 @@ from gateway.realtime_voice_controller import (
 
 
 _STOP = object()
+_REQUIRED_NATIVE_CAPABILITIES = frozenset({
+    RealtimeCapability.EXPLICIT_RESPONSE,
+    RealtimeCapability.RESPONSE_CANCELLATION,
+})
 
 
 class _Session(RealtimeVoiceSession):
     def __init__(
-        self, capabilities: frozenset[RealtimeCapability] = frozenset()
+        self,
+        capabilities: frozenset[RealtimeCapability] = frozenset(),
+        *,
+        include_native_capabilities: bool = True,
     ) -> None:
-        super().__init__(capabilities)
+        effective_capabilities = (
+            capabilities | _REQUIRED_NATIVE_CAPABILITIES
+            if include_native_capabilities
+            else capabilities
+        )
+        super().__init__(effective_capabilities)
         self.response_requests: list[RealtimeResponseRequest] = []
+        self.response_started = asyncio.Event()
         self.cancelled_responses: list[str] = []
+        self.cancel_entered = asyncio.Event()
+        self.cancel_release = asyncio.Event()
+        self.cancel_release.set()
+        self.block_cancel = False
+        self.cancel_error: BaseException | None = None
         self.incoming: asyncio.Queue[RealtimeVoiceEvent | object] = asyncio.Queue()
         self.audio: list[tuple[bytes, str | None]] = []
         self.close_calls = 0
@@ -70,9 +93,15 @@ class _Session(RealtimeVoiceSession):
 
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
         self.response_requests.append(request)
+        self.response_started.set()
 
     async def _cancel_response(self, response_id: str) -> None:
         self.cancelled_responses.append(response_id)
+        self.cancel_entered.set()
+        if self.block_cancel:
+            await self.cancel_release.wait()
+        if self.cancel_error is not None:
+            raise self.cancel_error
 
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         self.audio_started.set()
@@ -114,12 +143,15 @@ class _Session(RealtimeVoiceSession):
 class _Provider(RealtimeVoiceProvider):
     def __init__(self, session: _Session) -> None:
         self.session = session
+        self.capabilities = session.capabilities
+        self.open_calls = 0
 
     @property
     def name(self) -> str:
         return "fake"
 
     async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
+        self.open_calls += 1
         return self.session
 
 
@@ -130,6 +162,7 @@ class _ControlledProvider(_Provider):
         self.open_release = asyncio.Event()
 
     async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
+        self.open_calls += 1
         self.open_started.set()
         await self.open_release.wait()
         return self.session
@@ -141,6 +174,7 @@ class _CancellationSuppressingProvider(_ControlledProvider):
         self.suppressed_cancellation = False
 
     async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
+        self.open_calls += 1
         self.open_started.set()
         try:
             await self.open_release.wait()
@@ -160,6 +194,13 @@ class _Host:
         self.interrupt_error: BaseException | None = None
         self.block_interrupt = False
         self._finalizations: set[object] = set()
+        self._native_finalization = object()
+        self._native_requests: set[object] = set()
+        self.native_leases: list[object] = []
+        self.native_retired: list[tuple[object, object, object]] = []
+        self.native_order: list[str] = []
+        self.attachment_close_calls = 0
+        self.native_closed = False
 
     async def authorize(
         self, binding: RealtimeSessionBinding, utterance: RealtimeUtterance
@@ -177,7 +218,7 @@ class _Host:
         permit: object,
     ) -> str:
         self.submitted.append(utterance)
-        return "queued"
+        return self._native_finalization
 
     async def interrupt_and_wait(
         self, binding: RealtimeSessionBinding, timeout: float
@@ -195,6 +236,60 @@ class _Host:
 
     def validate_finalization(self, receipt: object) -> bool:
         return receipt in self._finalizations
+
+    async def reserve_native_output(self, binding, finalization):
+        assert finalization is self._native_finalization
+        text = "generic canonical answer"
+        import hashlib
+
+        request = _NativeRequest(
+            _NativeReservation(
+                binding.durable_session_id,
+                len(self.submitted) + 1,
+                f"host-turn-{len(self.submitted)}",
+                hashlib.sha256(text.encode()).hexdigest(),
+                RealtimeOutputAudioFormat(
+                    "audio/pcm", 24000, 1, "pcm_s16le", 2, "little"
+                ),
+            ),
+            text,
+        )
+        self._native_requests.add(request)
+        return request
+
+    def validate_native_output_request(self, request):
+        if self.native_closed or request not in self._native_requests:
+            raise ValueError("forged request")
+        return request
+
+    async def acquire_native_playback(
+        self, request, *, lease_id, response_id, transport_generation
+    ):
+        self.validate_native_output_request(request)
+        lease = _PlaybackLease(
+            lease_id,
+            response_id,
+            request.reservation.turn_marker,
+            transport_generation,
+            self.native_order,
+        )
+        self.native_leases.append(lease)
+        return lease
+
+    def validate_native_playback_receipt(self, request, lease, receipt):
+        self.validate_native_output_request(request)
+        return receipt
+
+    async def retire_native_output(self, request, lease, receipt):
+        self.validate_native_output_request(request)
+        self.native_retired.append((request, lease, receipt))
+        self._native_requests.remove(request)
+        return receipt
+
+    async def close_attachment(self, binding) -> None:
+        self.attachment_close_calls += 1
+        self.native_closed = True
+        self._native_requests.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -228,10 +323,12 @@ async def _eventually(predicate) -> None:
 async def test_only_final_operator_transcript_is_admitted_once_and_tools_are_inert(
     binding: RealtimeSessionBinding,
 ) -> None:
-    session = _Session(frozenset({
-        RealtimeCapability.EXPLICIT_RESPONSE,
-        RealtimeCapability.RESPONSE_CANCELLATION,
-    }))
+    session = _Session(
+        frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+        })
+    )
     assert register_provider(_Provider(session))
     host = _NativeHost()
     controller = GatewayRealtimeVoiceController(host)
@@ -270,8 +367,10 @@ async def test_only_final_operator_transcript_is_admitted_once_and_tools_are_ine
     await _eventually(lambda: len(host.submitted) == 1)
     await _eventually(lambda: len(session.response_requests) == 1)
     await _eventually(
-        lambda: ControllerLifecycle.THINKING
-        in [item.lifecycle for item in controller.lifecycle_events]
+        lambda: (
+            ControllerLifecycle.THINKING
+            in [item.lifecycle for item in controller.lifecycle_events]
+        )
     )
 
     assert [utterance.text for utterance in host.authorized] == ["hello"]
@@ -279,7 +378,9 @@ async def test_only_final_operator_transcript_is_admitted_once_and_tools_are_ine
     statuses = [event.lifecycle for event in controller.lifecycle_events]
     assert ControllerLifecycle.QUEUED in statuses
     assert ControllerLifecycle.THINKING in statuses
-    assert session.response_requests[0].canonical_text == "  persisted canonical answer  "
+    assert (
+        session.response_requests[0].canonical_text == "  persisted canonical answer  "
+    )
     assert controller.lifecycle_events[0].lifecycle is ControllerLifecycle.CONNECTING
     assert [event.sequence for event in controller.lifecycle_events] == list(
         range(1, len(controller.lifecycle_events) + 1)
@@ -297,7 +398,9 @@ async def test_completed_projection_rejects_caller_manufactured_receipt(
     host = _Host()
     controller = GatewayRealtimeVoiceController(host)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
-    await controller.project_host(HostProjection(binding, HostProjectionStatus.THINKING))
+    await controller.project_host(
+        HostProjection(binding, HostProjectionStatus.THINKING)
+    )
 
     with pytest.raises(RuntimeError, match="persistence receipt"):
         await controller.project_host(
@@ -322,7 +425,9 @@ async def test_audio_queue_copies_chunks_and_reports_overflow_without_stopping_e
     await controller.open("fake", RealtimeVoiceSetup(), binding)
 
     source = bytearray(b"first")
-    assert controller.feed_audio(source, mime_type="audio/pcm") is AudioFeedResult.ACCEPTED
+    assert (
+        controller.feed_audio(source, mime_type="audio/pcm") is AudioFeedResult.ACCEPTED
+    )
     source[:] = b"xxxxx"
     await session.audio_started.wait()
     assert controller.feed_audio(b"second") is AudioFeedResult.ACCEPTED
@@ -377,8 +482,7 @@ async def test_interrupt_holds_admission_until_release_and_failure_closes_attach
     with pytest.raises(TimeoutError, match="release timed out"):
         await interrupt
     await _eventually(
-        lambda: controller.lifecycle_events[-1].lifecycle
-        is ControllerLifecycle.CLOSED
+        lambda: controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
     )
     assert host.authorized == []
     assert host.submitted == []
@@ -404,14 +508,21 @@ async def test_resume_retains_session_and_replay_ledger_and_fences_stale_generat
     )
     await session.incoming.put(original)
     await _eventually(lambda: len(host.submitted) == 1)
+    await _eventually(lambda: len(session.response_requests) == 1)
+    await session.incoming.put(ResponseStarted("response-1", "host-turn-1"))
+    await _eventually(lambda: len(host.native_leases) == 1)
+    await session.incoming.put(ResponseCompleted("response-1", "host-turn-1"))
+    await _eventually(lambda: len(host.native_retired) == 1)
     session.block_audio = True
     assert controller.feed_audio(b"active-stale") is AudioFeedResult.ACCEPTED
     await session.audio_started.wait()
     assert controller.feed_audio(b"queued-stale") is AudioFeedResult.ACCEPTED
     await session.incoming.put(SessionFailure(code="network", message="lost"))
     await _eventually(
-        lambda: controller.lifecycle_events[-1].lifecycle
-        is ControllerLifecycle.RECONNECTING
+        lambda: (
+            controller.lifecycle_events[-1].lifecycle
+            is ControllerLifecycle.RECONNECTING
+        )
     )
 
     assert session.audio == []
@@ -477,7 +588,8 @@ async def test_close_wins_resume_race_without_resurrecting_workers(
     assert all(
         event.lifecycle is not ControllerLifecycle.CONNECTING
         for event in controller.lifecycle_events
-        if event.sequence > next(
+        if event.sequence
+        > next(
             item.sequence
             for item in controller.lifecycle_events
             if item.lifecycle is ControllerLifecycle.CLOSED
@@ -507,11 +619,14 @@ async def test_concurrent_resume_has_single_owner_and_no_orphan_pumps(
     assert session.resume_calls == ["resume-token"]
     assert controller._transport_generation == 2
     assert sum(result is None for result in results) == 1
-    assert sum(
-        isinstance(result, RuntimeError)
-        and str(result) == "session is not reconnecting"
-        for result in results
-    ) == 1
+    assert (
+        sum(
+            isinstance(result, RuntimeError)
+            and str(result) == "session is not reconnecting"
+            for result in results
+        )
+        == 1
+    )
     assert controller._event_task is not None and not controller._event_task.done()
     assert controller._audio_task is not None and not controller._audio_task.done()
 
@@ -613,8 +728,7 @@ async def test_provider_close_is_projected_and_terminal_old_ledger_closes_once(
     native_close = SessionClosed(reason="native")
     await session.incoming.put(native_close)
     await _eventually(
-        lambda: controller.lifecycle_events[-1].lifecycle
-        is ControllerLifecycle.CLOSED
+        lambda: controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
     )
 
     assert any(
@@ -638,10 +752,13 @@ async def test_provider_close_is_projected_and_terminal_old_ledger_closes_once(
     assert result.status is AdmissionStatus.CLOSED
     await controller.close(reason="again")
     assert session.close_calls == 1
-    assert sum(
-        event.lifecycle is ControllerLifecycle.CLOSED
-        for event in controller.lifecycle_events
-    ) == 1
+    assert (
+        sum(
+            event.lifecycle is ControllerLifecycle.CLOSED
+            for event in controller.lifecycle_events
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -662,62 +779,111 @@ async def test_cancelled_close_waiter_does_not_orphan_cleanup_or_terminal_event(
     session.close_release.set()
 
     await _eventually(
-        lambda: controller.lifecycle_events[-1].lifecycle
-        is ControllerLifecycle.CLOSED
+        lambda: controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
     )
     await controller.close(reason="again")
     assert session.close_calls == 1
-    assert sum(
-        event.lifecycle is ControllerLifecycle.CLOSED
-        for event in controller.lifecycle_events
-    ) == 1
+    assert (
+        sum(
+            event.lifecycle is ControllerLifecycle.CLOSED
+            for event in controller.lifecycle_events
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
-async def test_all_terminal_admission_statuses_are_visibly_projected(binding: RealtimeSessionBinding) -> None:
+async def test_all_terminal_admission_statuses_are_visibly_projected(
+    binding: RealtimeSessionBinding,
+) -> None:
     session = _Session()
     assert register_provider(_Provider(session))
     controller = GatewayRealtimeVoiceController(_Host(), replay_capacity=1)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
-    participant = InputTranscript(item_id="participant", turn_id="participant-turn", text="no", final=True,
-        role=TranscriptRole.PARTICIPANT, provenance=TranscriptProvenance.PARTICIPANT_INPUT_AUDIO)
+    participant = InputTranscript(
+        item_id="participant",
+        turn_id="participant-turn",
+        text="no",
+        final=True,
+        role=TranscriptRole.PARTICIPANT,
+        provenance=TranscriptProvenance.PARTICIPANT_INPUT_AUDIO,
+    )
     await session.incoming.put(participant)
     await session.incoming.put(participant)
-    await session.incoming.put(InputTranscript(item_id="capacity", turn_id="capacity-turn", text="later", final=True,
-        role=TranscriptRole.OPERATOR, provenance=TranscriptProvenance.OPERATOR_INPUT))
-    await _eventually(lambda: sum(e.admission_status is not None for e in controller.lifecycle_events) == 3)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="capacity",
+            turn_id="capacity-turn",
+            text="later",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await _eventually(
+        lambda: (
+            sum(e.admission_status is not None for e in controller.lifecycle_events)
+            == 3
+        )
+    )
     assert controller._admission is not None
     await controller._admission.close()
-    await controller._handle_event(InputTranscript(
-        item_id="closed", turn_id="closed-turn", text="closed", final=True,
-        role=TranscriptRole.OPERATOR, provenance=TranscriptProvenance.OPERATOR_INPUT,
-    ), 1)
-    assert [e.admission_status for e in controller.lifecycle_events if e.admission_status] == [
-        AdmissionStatus.REJECTED, AdmissionStatus.DUPLICATE,
-        AdmissionStatus.CAPACITY_EXHAUSTED, AdmissionStatus.CLOSED]
+    await controller._handle_event(
+        InputTranscript(
+            item_id="closed",
+            turn_id="closed-turn",
+            text="closed",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    assert [
+        e.admission_status for e in controller.lifecycle_events if e.admission_status
+    ] == [
+        AdmissionStatus.REJECTED,
+        AdmissionStatus.DUPLICATE,
+        AdmissionStatus.CAPACITY_EXHAUSTED,
+        AdmissionStatus.CLOSED,
+    ]
     await controller.close(reason="test")
 
 
 @pytest.mark.asyncio
-async def test_audio_send_failure_is_visible_and_terminal(binding: RealtimeSessionBinding) -> None:
+async def test_audio_send_failure_is_visible_and_terminal(
+    binding: RealtimeSessionBinding,
+) -> None:
     session = _Session()
     session.audio_error = OSError("speaker transport failed")
     assert register_provider(_Provider(session))
     controller = GatewayRealtimeVoiceController(_Host())
     await controller.open("fake", RealtimeVoiceSetup(), binding)
     assert controller.feed_audio(b"boom") is AudioFeedResult.ACCEPTED
-    await _eventually(lambda: controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED)
-    assert any(e.lifecycle is ControllerLifecycle.FAILED and "speaker transport failed" in e.detail for e in controller.lifecycle_events)
+    await _eventually(
+        lambda: controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+    )
+    assert any(
+        e.lifecycle is ControllerLifecycle.FAILED and e.detail == "audio send failed"
+        for e in controller.lifecycle_events
+    )
+    assert all(
+        "speaker transport failed" not in e.detail for e in controller.lifecycle_events
+    )
     assert session.close_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_cancelled_open_closes_late_provider_session_before_propagating(binding: RealtimeSessionBinding) -> None:
+async def test_cancelled_open_closes_late_provider_session_before_propagating(
+    binding: RealtimeSessionBinding,
+) -> None:
     session = _Session()
     provider = _CancellationSuppressingProvider(session)
     assert register_provider(provider)
     controller = GatewayRealtimeVoiceController(_Host())
-    opening = asyncio.create_task(controller.open("fake", RealtimeVoiceSetup(), binding))
+    opening = asyncio.create_task(
+        controller.open("fake", RealtimeVoiceSetup(), binding)
+    )
     await provider.open_started.wait()
     opening.cancel()
     provider.open_release.set()
@@ -729,12 +895,16 @@ async def test_cancelled_open_closes_late_provider_session_before_propagating(bi
 
 
 @pytest.mark.asyncio
-async def test_external_close_during_open_cannot_orphan_late_session(binding: RealtimeSessionBinding) -> None:
+async def test_external_close_during_open_cannot_orphan_late_session(
+    binding: RealtimeSessionBinding,
+) -> None:
     session = _Session()
     provider = _ControlledProvider(session)
     assert register_provider(provider)
     controller = GatewayRealtimeVoiceController(_Host())
-    opening = asyncio.create_task(controller.open("fake", RealtimeVoiceSetup(), binding))
+    opening = asyncio.create_task(
+        controller.open("fake", RealtimeVoiceSetup(), binding)
+    )
     await provider.open_started.wait()
     closing = asyncio.create_task(controller.close(reason="external"))
     await asyncio.sleep(0)
@@ -772,31 +942,88 @@ class _PlaybackReceipt:
 
 
 class _PlaybackLease:
-    def __init__(self, lease_id: str, response_id: str, turn_marker: str, generation: int) -> None:
+    def __init__(
+        self,
+        lease_id: str,
+        response_id: str,
+        turn_marker: str,
+        generation: int,
+        order: list[str],
+    ) -> None:
         self.lease_id = lease_id
         self.response_id = response_id
         self.turn_marker = turn_marker
         self.generation = generation
+        self.order = order
         self.writes: list[bytes] = []
+        self.close_calls = 0
+        self.write_entered = asyncio.Event()
+        self.write_release = asyncio.Event()
+        self.write_release.set()
+        self.block_write = False
+        self.write_error: BaseException | None = None
+        self.finish_calls = 0
+        self.finish_cancelled = asyncio.Event()
+        self.interrupt_calls = 0
+        self.interrupt_entered = asyncio.Event()
+        self.interrupt_release = asyncio.Event()
+        self.interrupt_release.set()
+        self.block_lease_interrupt = False
+        self.interrupt_error: BaseException | None = None
         self.finish_entered = asyncio.Event()
         self.finish_release = asyncio.Event()
         self.finish_release.set()
 
     async def write_pcm(self, data: bytes) -> None:
+        self.write_entered.set()
+        if self.block_write:
+            await self.write_release.wait()
+        if self.write_error is not None:
+            raise self.write_error
         if len(data) % 2:
             raise ValueError("unaligned PCM")
         self.writes.append(data)
 
     async def finish_and_wait(self, timeout: float) -> _PlaybackReceipt:
+        self.order.append("lease_finish")
+        self.finish_calls += 1
         self.finish_entered.set()
-        await self.finish_release.wait()
-        return _PlaybackReceipt(self.lease_id, self.response_id, self.turn_marker, self.generation, sum(map(len, self.writes)), len(self.writes), False)
+        try:
+            await self.finish_release.wait()
+        except asyncio.CancelledError:
+            self.finish_cancelled.set()
+            raise
+        return _PlaybackReceipt(
+            self.lease_id,
+            self.response_id,
+            self.turn_marker,
+            self.generation,
+            sum(map(len, self.writes)),
+            len(self.writes),
+            False,
+        )
 
     async def interrupt_and_wait(self, timeout: float) -> _PlaybackReceipt:
-        return _PlaybackReceipt(self.lease_id, self.response_id, self.turn_marker, self.generation, sum(map(len, self.writes)), len(self.writes), True)
+        self.order.append("lease_interrupt")
+        self.interrupt_calls += 1
+        self.interrupt_entered.set()
+        if self.block_lease_interrupt:
+            await self.interrupt_release.wait()
+        if self.interrupt_error is not None:
+            raise self.interrupt_error
+        return _PlaybackReceipt(
+            self.lease_id,
+            self.response_id,
+            self.turn_marker,
+            self.generation,
+            sum(map(len, self.writes)),
+            len(self.writes),
+            True,
+        )
 
     async def close(self) -> None:
-        return None
+        self.order.append("lease_close")
+        self.close_calls += 1
 
 
 class _NativeHost(_Host):
@@ -807,6 +1034,16 @@ class _NativeHost(_Host):
         self.leases: list[_PlaybackLease] = []
         self.retired: list[tuple[_NativeRequest, _PlaybackLease, _PlaybackReceipt]] = []
         self.finalization = object()
+        self.acquire_entered = asyncio.Event()
+        self.acquire_release = asyncio.Event()
+        self.acquire_release.set()
+        self.block_acquire = False
+        self.acquire_error: BaseException | None = None
+        self.close_calls = 0
+        self.closed = False
+        self.validation_calls = 0
+        self.retire_calls = 0
+        self.turn_markers: list[str] = []
 
     async def submit(self, binding, utterance, permit):
         self.submitted.append(utterance)
@@ -817,24 +1054,49 @@ class _NativeHost(_Host):
         self.order.append("reserve")
         text = "  persisted canonical answer  "
         import hashlib
-        reservation = _NativeReservation(binding.durable_session_id, 42, "host-turn", hashlib.sha256(text.encode()).hexdigest(), RealtimeOutputAudioFormat("audio/pcm", 24000, 1, "pcm_s16le", 2, "little"))
+
+        marker = self.turn_markers.pop(0) if self.turn_markers else "host-turn"
+        reservation = _NativeReservation(
+            binding.durable_session_id,
+            42,
+            marker,
+            hashlib.sha256(text.encode()).hexdigest(),
+            RealtimeOutputAudioFormat("audio/pcm", 24000, 1, "pcm_s16le", 2, "little"),
+        )
         request = _NativeRequest(reservation, text)
         self.requests.add(request)
         return request
 
     def validate_native_output_request(self, request):
-        if request not in self.requests:
+        if self.closed or request not in self.requests:
             raise ValueError("forged request")
         return request
 
-    async def acquire_native_playback(self, request, *, lease_id, response_id, transport_generation):
+    async def acquire_native_playback(
+        self, request, *, lease_id, response_id, transport_generation
+    ):
         self.validate_native_output_request(request)
         self.order.append("acquire")
-        lease = _PlaybackLease(lease_id, response_id, request.reservation.turn_marker, transport_generation)
+        self.acquire_entered.set()
+        if self.block_acquire:
+            await self.acquire_release.wait()
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        lease = _PlaybackLease(
+            lease_id,
+            response_id,
+            request.reservation.turn_marker,
+            transport_generation,
+            self.order,
+        )
         self.leases.append(lease)
         return lease
 
     def validate_native_playback_receipt(self, request, lease, receipt):
+        self.validation_calls += 1
+        return self._assert_native_playback_receipt(request, lease, receipt)
+
+    def _assert_native_playback_receipt(self, request, lease, receipt):
         self.validate_native_output_request(request)
         assert receipt.lease_id == lease.lease_id
         assert receipt.response_id == lease.response_id
@@ -844,21 +1106,44 @@ class _NativeHost(_Host):
         return receipt
 
     async def retire_native_output(self, request, lease, receipt):
-        self.validate_native_playback_receipt(request, lease, receipt)
+        self.retire_calls += 1
+        self._assert_native_playback_receipt(request, lease, receipt)
         self.order.append("retire")
         self.retired.append((request, lease, receipt))
+        self.requests.remove(request)
         return receipt
+
+    async def close_attachment(self, binding) -> None:
+        self.order.append("host_close")
+        self.close_calls += 1
+        self.closed = True
+        self.requests.clear()
 
 
 @pytest.mark.asyncio
-async def test_native_response_uses_exact_canonical_text_streams_pcm_and_completes_after_drain(binding):
-    capabilities = frozenset({RealtimeCapability.EXPLICIT_RESPONSE, RealtimeCapability.RESPONSE_CANCELLATION, RealtimeCapability.OUTPUT_TRANSCRIPTION})
+async def test_native_response_uses_exact_canonical_text_streams_pcm_and_completes_after_drain(
+    binding,
+):
+    capabilities = frozenset({
+        RealtimeCapability.EXPLICIT_RESPONSE,
+        RealtimeCapability.RESPONSE_CANCELLATION,
+        RealtimeCapability.OUTPUT_TRANSCRIPTION,
+    })
     session = _Session(capabilities)
     assert register_provider(_Provider(session))
     host = _NativeHost()
     controller = GatewayRealtimeVoiceController(host)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
-    await session.incoming.put(InputTranscript(item_id="input", turn_id="input-turn", text="question", final=True, role=TranscriptRole.OPERATOR, provenance=TranscriptProvenance.OPERATOR_INPUT))
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
     await _eventually(lambda: len(session.response_requests) == 1)
     request = session.response_requests[0]
     assert request.canonical_text == "  persisted canonical answer  "
@@ -866,12 +1151,16 @@ async def test_native_response_uses_exact_canonical_text_streams_pcm_and_complet
     assert host.order == ["reserve"]
     await session.incoming.put(ResponseStarted("response", "host-turn"))
     await _eventually(lambda: len(host.leases) == 1)
-    await session.incoming.put(OutputTranscript("item", "host-turn", "response", "provider substitute", True))
-    await session.incoming.put(OutputAudio(b"\x01\x00\x02\x00", "item", "host-turn", "response"))
+    await session.incoming.put(
+        OutputTranscript("item", "host-turn", "response", "provider substitute", True)
+    )
+    await session.incoming.put(
+        OutputAudio(b"\x01\x00\x02\x00", "item", "host-turn", "response")
+    )
     await session.incoming.put(ResponseCompleted("response", "host-turn"))
     await _eventually(lambda: len(host.retired) == 1)
     assert host.leases[0].writes == [b"\x01\x00\x02\x00"]
-    assert host.order == ["reserve", "acquire", "retire"]
+    assert host.order == ["reserve", "acquire", "lease_finish", "retire"]
     assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.COMPLETED
     assert controller.lifecycle_events[-1].detail == "native playback drained"
     await controller.close(reason="test")
@@ -879,12 +1168,26 @@ async def test_native_response_uses_exact_canonical_text_streams_pcm_and_complet
 
 @pytest.mark.asyncio
 async def test_provider_completion_waits_for_local_drain_before_retirement(binding):
-    session = _Session(frozenset({RealtimeCapability.EXPLICIT_RESPONSE, RealtimeCapability.RESPONSE_CANCELLATION}))
+    session = _Session(
+        frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+        })
+    )
     assert register_provider(_Provider(session))
     host = _NativeHost()
     controller = GatewayRealtimeVoiceController(host)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
-    await session.incoming.put(InputTranscript(item_id="input", turn_id="input-turn", text="question", final=True, role=TranscriptRole.OPERATOR, provenance=TranscriptProvenance.OPERATOR_INPUT))
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
     await _eventually(lambda: len(session.response_requests) == 1)
     await session.incoming.put(ResponseStarted("response", "host-turn"))
     await _eventually(lambda: len(host.leases) == 1)
@@ -893,20 +1196,39 @@ async def test_provider_completion_waits_for_local_drain_before_retirement(bindi
     await session.incoming.put(ResponseCompleted("response", "host-turn"))
     await lease.finish_entered.wait()
     assert host.retired == []
-    assert ControllerLifecycle.COMPLETED not in {item.lifecycle for item in controller.lifecycle_events}
+    assert ControllerLifecycle.COMPLETED not in {
+        item.lifecycle for item in controller.lifecycle_events
+    }
     lease.finish_release.set()
     await _eventually(lambda: len(host.retired) == 1)
     await controller.close(reason="test")
 
 
 @pytest.mark.asyncio
-async def test_interrupt_cancels_only_bound_response_and_retires_interrupted_lease(binding):
-    session = _Session(frozenset({RealtimeCapability.EXPLICIT_RESPONSE, RealtimeCapability.RESPONSE_CANCELLATION, RealtimeCapability.EXPLICIT_INTERRUPTION}))
+async def test_interrupt_cancels_only_bound_response_and_retires_interrupted_lease(
+    binding,
+):
+    session = _Session(
+        frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+            RealtimeCapability.EXPLICIT_INTERRUPTION,
+        })
+    )
     assert register_provider(_Provider(session))
     host = _NativeHost()
     controller = GatewayRealtimeVoiceController(host)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
-    await session.incoming.put(InputTranscript(item_id="input", turn_id="input-turn", text="question", final=True, role=TranscriptRole.OPERATOR, provenance=TranscriptProvenance.OPERATOR_INPUT))
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
     await _eventually(lambda: len(session.response_requests) == 1)
     await session.incoming.put(ResponseStarted("response", "host-turn"))
     await _eventually(lambda: len(host.leases) == 1)
@@ -920,13 +1242,669 @@ async def test_interrupt_cancels_only_bound_response_and_retires_interrupted_lea
 
 @pytest.mark.asyncio
 async def test_native_owner_rejects_external_speaking_projection(binding):
-    session = _Session(frozenset({RealtimeCapability.EXPLICIT_RESPONSE, RealtimeCapability.RESPONSE_CANCELLATION}))
+    session = _Session(
+        frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+        })
+    )
     assert register_provider(_Provider(session))
     host = _NativeHost()
     controller = GatewayRealtimeVoiceController(host)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
-    await session.incoming.put(InputTranscript(item_id="input", turn_id="input-turn", text="question", final=True, role=TranscriptRole.OPERATOR, provenance=TranscriptProvenance.OPERATOR_INPUT))
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
     await _eventually(lambda: len(session.response_requests) == 1)
     with pytest.raises(RuntimeError, match="native response owns lifecycle"):
-        await controller.project_host(HostProjection(binding, HostProjectionStatus.SPEAKING))
+        await controller.project_host(
+            HostProjection(binding, HostProjectionStatus.SPEAKING)
+        )
     await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_close_terminalizes_native_lease_before_host_authority_closes(binding):
+    session = _Session(
+        frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+        })
+    )
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await host.acquire_entered.wait()
+
+    await controller.close(reason="operator close")
+
+    assert host.order == [
+        "reserve",
+        "acquire",
+        "lease_interrupt",
+        "retire",
+        "host_close",
+    ]
+    assert host.close_calls == 1
+    assert len(host.retired) == 1
+    assert host.retired[0][2].interrupted is True
+    assert host.requests == set()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_native_host_api_is_rejected_before_provider_open(binding):
+    session = _Session()
+    provider = _Provider(session)
+    assert register_provider(provider)
+    controller = GatewayRealtimeVoiceController(object())
+
+    try:
+        with pytest.raises(RuntimeError, match="native host API"):
+            await controller.open("fake", RealtimeVoiceSetup(), binding)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert provider.open_calls == 0
+    assert controller._admission is None
+    assert controller._event_task is None
+    assert controller._audio_task is None
+
+
+@pytest.mark.asyncio
+async def test_open_unions_mandatory_native_capabilities_without_mutating_caller(
+    binding, monkeypatch
+):
+    session = _Session(frozenset({RealtimeCapability.OUTPUT_TRANSCRIPTION}))
+    captured: list[frozenset[RealtimeCapability]] = []
+
+    async def open_session(provider_name, setup, *, required_capabilities):
+        captured.append(required_capabilities)
+        return session
+
+    monkeypatch.setattr(controller_module, "open_realtime_voice_session", open_session)
+    caller_required = frozenset({RealtimeCapability.OUTPUT_TRANSCRIPTION})
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open(
+        "fake",
+        RealtimeVoiceSetup(),
+        binding,
+        required_capabilities=caller_required,
+    )
+
+    assert caller_required == frozenset({RealtimeCapability.OUTPUT_TRANSCRIPTION})
+    assert captured == [caller_required | _REQUIRED_NATIVE_CAPABILITIES]
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_incompatible_returned_session_closes_session_and_host_before_pumps(
+    binding, monkeypatch
+):
+    session = _Session(
+        frozenset({RealtimeCapability.EXPLICIT_RESPONSE}),
+        include_native_capabilities=False,
+    )
+
+    async def open_session(provider_name, setup, *, required_capabilities):
+        return session
+
+    monkeypatch.setattr(controller_module, "open_realtime_voice_session", open_session)
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+
+    try:
+        with pytest.raises(RuntimeError, match="native realtime session incompatible"):
+            await controller.open("fake", RealtimeVoiceSetup(), binding)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert session.close_calls == 1
+    assert host.close_calls == 1
+    assert controller._admission is None
+    assert controller._event_task is None
+    assert controller._audio_task is None
+    terminal = controller.lifecycle_events[-3:]
+    assert [event.lifecycle for event in terminal] == [
+        ControllerLifecycle.FAILED,
+        ControllerLifecycle.CLOSING,
+        ControllerLifecycle.CLOSED,
+    ]
+    assert [event.detail for event in terminal] == [
+        "native realtime session incompatible",
+        "native realtime session incompatible",
+        "native realtime session incompatible",
+    ]
+
+
+async def _open_pending_native_response(binding):
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    return controller, session, host
+
+
+@pytest.mark.asyncio
+async def test_response_start_turn_must_match_authenticated_reservation_before_acquire(
+    binding,
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+
+    try:
+        with pytest.raises(RuntimeError, match="native response identity"):
+            await controller._handle_event(
+                ResponseStarted("response", "forged-turn"), 1
+            )
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert host.leases == []
+
+
+@pytest.mark.asyncio
+async def test_native_event_subclass_is_rejected_without_reading_hostile_fields(
+    binding,
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+    armed = False
+
+    class HostileResponseStarted(ResponseStarted):
+        def __getattribute__(self, name):
+            if armed and name in {
+                "response_id",
+                "turn_id",
+                "continuation_of_batch_id",
+            }:
+                raise AssertionError("hostile event field read")
+            return super().__getattribute__(name)
+
+    event = HostileResponseStarted("response", "host-turn")
+    armed = True
+    try:
+        with pytest.raises(RuntimeError, match="exact native event type"):
+            await controller._handle_event(event, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert host.leases == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("response_id", " response"),
+        ("response_id", "r" * 257),
+        ("continuation_of_batch_id", "batch"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutated_response_start_is_revalidated_before_acquire(
+    binding, field_name, invalid_value
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+    event = ResponseStarted("response", "host-turn")
+    object.__setattr__(event, field_name, invalid_value)
+
+    try:
+        with pytest.raises(RuntimeError, match="invalid native response event"):
+            await controller._handle_event(event, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert host.leases == []
+
+
+class _HostileString(str):
+    def strip(self, *args, **kwargs):
+        raise AssertionError("hostile string method called")
+
+    def encode(self, *args, **kwargs):
+        raise AssertionError("hostile string method called")
+
+
+@pytest.mark.asyncio
+async def test_mutated_response_id_subclass_is_rejected_before_hostile_methods(binding):
+    controller, _session, host = await _open_pending_native_response(binding)
+    event = ResponseStarted("response", "host-turn")
+    object.__setattr__(event, "response_id", _HostileString("response"))
+
+    try:
+        with pytest.raises(RuntimeError, match="invalid native response event"):
+            await controller._handle_event(event, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert host.leases == []
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        OutputAudio(b"pcm", "item", "host-turn", "response"),
+        OutputTranscript("item", "host-turn", "response", "text", True),
+        ResponseCompleted("response", "host-turn"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutated_native_event_fields_are_revalidated_before_lease_methods(
+    binding, event
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    if type(event) is OutputAudio:
+        object.__setattr__(event, "data", bytearray(b"pcm"))
+    elif type(event) is OutputTranscript:
+        object.__setattr__(event, "final", 1)
+    else:
+        object.__setattr__(event, "continuation_of_batch_id", "batch")
+
+    try:
+        with pytest.raises(RuntimeError, match="invalid native response event"):
+            await controller._handle_event(event, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert lease.writes == []
+    assert "lease_finish" not in host.order
+
+
+@pytest.mark.asyncio
+async def test_interrupt_waits_for_blocked_acquire_then_terminalizes_exact_lease(
+    binding,
+):
+    controller, session, host = await _open_pending_native_response(binding)
+    host.block_acquire = True
+    host.acquire_release.clear()
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await host.acquire_entered.wait()
+
+    interrupting = asyncio.create_task(controller.interrupt())
+    await session.cancel_entered.wait()
+    assert not interrupting.done()
+    host.acquire_release.set()
+    await interrupting
+
+    assert session.cancelled_responses == ["response"]
+    assert len(host.leases) == 1
+    assert host.leases[0].interrupt_calls == 1
+    assert host.validation_calls == 1
+    assert host.retire_calls == 1
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.LISTENING
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_interrupt_preempts_blocked_finish_and_retires_only_interrupt_receipt(
+    binding,
+):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    lease.finish_release.clear()
+    completing = asyncio.create_task(
+        controller._handle_event(ResponseCompleted("response", "host-turn"), 1)
+    )
+    await lease.finish_entered.wait()
+
+    interrupting = asyncio.create_task(controller.interrupt())
+    interrupt_done, _pending = await asyncio.wait({interrupting}, timeout=0.5)
+    completion_done, _pending = await asyncio.wait({completing}, timeout=0.5)
+    if not interrupt_done or not completion_done:
+        lease.finish_release.set()
+        await completing
+        await interrupting
+    assert interrupt_done == {interrupting}
+    assert completion_done == {completing}
+    await interrupting
+    await completing
+
+    assert lease.finish_calls == 1
+    assert lease.finish_cancelled.is_set()
+    assert lease.interrupt_calls == 1
+    assert host.validation_calls == 1
+    assert host.retire_calls == 1
+    assert host.retired[0][2].interrupted is True
+    assert not lease.finish_release.is_set()
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.LISTENING
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_interrupt_and_close_share_one_blocked_cancel_and_one_terminal_owner(
+    binding,
+):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    session.block_cancel = True
+    session.cancel_release.clear()
+
+    interrupting = asyncio.create_task(controller.interrupt())
+    await session.cancel_entered.wait()
+    closing = asyncio.create_task(controller.close(reason="concurrent close"))
+    assert not closing.done()
+    session.cancel_release.set()
+    await asyncio.gather(interrupting, closing)
+
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 1
+    assert host.validation_calls == 1
+    assert host.retire_calls == 1
+    assert host.close_calls == 1
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_native_cleanup_failure_forces_lease_and_host_close_with_safe_details(
+    binding,
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    lease.interrupt_error = RuntimeError("secret raw provider failure")
+
+    await controller.close(reason="operator close")
+
+    assert lease.interrupt_calls == 1
+    assert lease.close_calls == 1
+    assert host.close_calls == 1
+    assert host.requests == set()
+    terminal = [
+        event
+        for event in controller.lifecycle_events
+        if event.lifecycle
+        in {
+            ControllerLifecycle.FAILED,
+            ControllerLifecycle.CLOSING,
+            ControllerLifecycle.CLOSED,
+        }
+    ][-3:]
+    assert [event.lifecycle for event in terminal] == [
+        ControllerLifecycle.FAILED,
+        ControllerLifecycle.CLOSING,
+        ControllerLifecycle.CLOSED,
+    ]
+    assert {event.detail for event in terminal} == {"native response cleanup failed"}
+    assert all("secret" not in event.detail for event in controller.lifecycle_events)
+
+
+@pytest.mark.asyncio
+async def test_session_closed_terminalizes_active_native_ledger_before_closed(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+
+    await session.incoming.put(SessionClosed(reason="provider closed"))
+    await session.close_started.wait()
+    await controller.close(reason="join observed close")
+
+    assert host.retire_calls == 1
+    assert host.requests == set()
+    assert host.order.index("retire") < host.order.index("host_close")
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_terminal_response_tombstones_are_bounded_and_reject_late_duplicate(
+    binding,
+):
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    host.turn_markers = [f"host-turn-{index}" for index in range(3)]
+    controller = GatewayRealtimeVoiceController(host, replay_capacity=2)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+
+    for index in range(3):
+        transcript = InputTranscript(
+            item_id=f"input-{index}",
+            turn_id=f"input-turn-{index}",
+            text=f"question-{index}",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+        await controller._start_native_response(host.finalization, transcript, 1, index)
+        assert len(session.response_requests) == index + 1
+        await controller._handle_event(
+            ResponseStarted(f"response-{index}", f"host-turn-{index}"), 1
+        )
+        await controller._handle_event(
+            ResponseCompleted(f"response-{index}", f"host-turn-{index}"), 1
+        )
+
+    assert len(controller._native_tombstone_ids) == 2
+    assert list(controller._native_tombstone_order) == [
+        ("response-1", "host-turn-1"),
+        ("response-2", "host-turn-2"),
+    ]
+    with pytest.raises(RuntimeError, match="late duplicate native response event"):
+        await controller._handle_event(
+            ResponseCompleted("response-2", "host-turn-2"), 1
+        )
+    await controller.close(reason="test")
+
+
+class _RealLeaseHost(_NativeHost):
+    def __init__(self, mixer) -> None:
+        super().__init__()
+        self.mixer = mixer
+
+    async def acquire_native_playback(
+        self, request, *, lease_id, response_id, transport_generation
+    ):
+        self.validate_native_output_request(request)
+        self.order.append("acquire")
+        lease = self.mixer.acquire_native_playback(
+            lease_id,
+            response_id,
+            request.reservation.turn_marker,
+            transport_generation,
+        )
+        self.leases.append(lease)
+        self.acquire_entered.set()
+        return lease
+
+    def validate_native_playback_receipt(self, request, lease, receipt):
+        self.validation_calls += 1
+        self.validate_native_output_request(request)
+        validated = self.mixer.validate_native_receipt(receipt, lease)
+        assert validated is receipt
+        return receipt
+
+    async def retire_native_output(self, request, lease, receipt):
+        self.retire_calls += 1
+        self.validate_native_output_request(request)
+        self.order.append("retire")
+        self.retired.append((request, lease, receipt))
+        self.requests.remove(request)
+        return receipt
+
+    async def close_attachment(self, binding) -> None:
+        for lease in self.leases:
+            await lease.close()
+        await super().close_attachment(binding)
+
+
+async def _next_loop_turn() -> None:
+    barrier = asyncio.get_running_loop().create_future()
+    asyncio.get_running_loop().call_soon(barrier.set_result, None)
+    await barrier
+
+
+@pytest.mark.asyncio
+async def test_real_native_pcm_capacity_blocked_write_interrupts_and_stays_listening(
+    binding,
+):
+    from plugins.platforms.discord.voice_mixer import VoiceMixer
+
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _RealLeaseHost(VoiceMixer(native_frame_capacity=1))
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    payload = struct.pack("<960h", *range(960))
+    writing = asyncio.create_task(
+        controller._handle_event(
+            OutputAudio(payload, "item", "host-turn", "response"), 1
+        )
+    )
+    for _ in range(20):
+        if lease._space_waiters:
+            break
+        await _next_loop_turn()
+    assert lease._space_waiters
+
+    await controller.interrupt()
+    await writing
+
+    assert host.retire_calls == 1
+    assert host.retired[0][2].interrupted is True
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.LISTENING
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_timed_out_real_host_acquire_closes_late_lease_without_orphan():
+    from gateway.realtime_voice_messaging_host import (
+        GatewayRealtimeVoiceMessagingHost,
+        RealtimeVoiceFinalizationReceipt,
+    )
+    from tests.gateway.test_realtime_voice_messaging_host import (
+        _binding as messaging_binding,
+        _host_fixture,
+        _native_output_format,
+        build_session_key,
+    )
+    from gateway.config import Platform
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    marker = "host-turn"
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(
+            get_messages=MagicMock(
+                return_value=[
+                    {
+                        "id": 1,
+                        "role": "user",
+                        "content": "voice",
+                        "display_metadata": {"realtime_voice_turn_marker": marker},
+                    },
+                    {
+                        "id": 2,
+                        "role": "assistant",
+                        "content": "answer",
+                        "tool_calls": [],
+                    },
+                ]
+            )
+        )
+    )
+    adapter = runner.adapters[Platform.DISCORD]
+    adapter._voice_clients[111] = SimpleNamespace(is_connected=lambda: True)
+    adapter._voice_connection_generations[111] = 4
+    adapter._voice_mixer_generations[111] = 7
+    host = GatewayRealtimeVoiceMessagingHost(
+        captured[0], runner, output_audio_format=_native_output_format()
+    )
+    receipt = RealtimeVoiceFinalizationReceipt("durable-1", marker, 1, 2)
+    host._finalizations.add(receipt)
+    binding = messaging_binding(build_session_key(source))
+    session = _Session()
+    assert register_provider(_Provider(session))
+    controller = GatewayRealtimeVoiceController(host, interrupt_timeout=0.01)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await controller._start_native_response(
+        receipt,
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+        0,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    lease_closed = asyncio.Event()
+    lease = SimpleNamespace(close=AsyncMock(side_effect=lease_closed.set))
+
+    async def acquire(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return lease
+
+    adapter.acquire_native_playback_lease = acquire
+    starting = asyncio.create_task(
+        controller._handle_event(ResponseStarted("response", marker), 1)
+    )
+    await entered.wait()
+
+    with pytest.raises(RuntimeError, match="native response cleanup failed"):
+        await controller.interrupt()
+    await starting
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+    assert host._closed is True
+    release.set()
+    await lease_closed.wait()
+    for _ in range(20):
+        if not host._acquisitions:
+            break
+        await _next_loop_turn()
+
+    lease.close.assert_awaited_once()
+    assert host._acquisitions == {}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
@@ -29,6 +30,8 @@ from agent.realtime_voice_provider import (
     SessionClosed,
     SessionFailure,
     SessionReady,
+    TranscriptProvenance,
+    TranscriptRole,
 )
 
 
@@ -83,7 +86,9 @@ class AudioFeedResult(StrEnum):
 
 
 class RealtimeControllerHost(Protocol):
-    async def authorize(self, binding: RealtimeSessionBinding, utterance: Any) -> Any: ...
+    async def authorize(
+        self, binding: RealtimeSessionBinding, utterance: Any
+    ) -> Any: ...
 
     async def revoke(self, permit: Any) -> None: ...
 
@@ -104,7 +109,11 @@ class RealtimeControllerHost(Protocol):
     def validate_native_output_request(self, request: object) -> object: ...
 
     async def acquire_native_playback(
-        self, request: object, *, lease_id: str, response_id: str,
+        self,
+        request: object,
+        *,
+        lease_id: str,
+        response_id: str,
         transport_generation: int,
     ) -> object: ...
 
@@ -116,6 +125,79 @@ class RealtimeControllerHost(Protocol):
         self, request: object, lease: object, receipt: object
     ) -> object: ...
 
+    async def close_attachment(
+        self, binding: RealtimeSessionBinding | None
+    ) -> None: ...
+
+
+_REQUIRED_NATIVE_CAPABILITIES = frozenset({
+    RealtimeCapability.EXPLICIT_RESPONSE,
+    RealtimeCapability.RESPONSE_CANCELLATION,
+})
+_REQUIRED_NATIVE_HOST_METHODS = (
+    "reserve_native_output",
+    "validate_native_output_request",
+    "acquire_native_playback",
+    "validate_native_playback_receipt",
+    "retire_native_output",
+    "close_attachment",
+)
+_NATIVE_EVENT_TYPES = (
+    ResponseStarted,
+    OutputAudio,
+    OutputTranscript,
+    ResponseCompleted,
+)
+_MAX_NATIVE_IDENTIFIER_BYTES = 256
+
+
+def _validate_native_identifier(value: object) -> str:
+    if type(value) is not str or not value or len(value) > _MAX_NATIVE_IDENTIFIER_BYTES:
+        raise RuntimeError("invalid native response event")
+    if value.strip() != value:
+        raise RuntimeError("invalid native response event")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError("invalid native response event") from exc
+    if len(encoded) > _MAX_NATIVE_IDENTIFIER_BYTES:
+        raise RuntimeError("invalid native response event")
+    return value
+
+
+def _validate_native_event(event: RealtimeVoiceEvent) -> None:
+    event_type = type(event)
+    if event_type not in _NATIVE_EVENT_TYPES:
+        if isinstance(event, _NATIVE_EVENT_TYPES):
+            raise RuntimeError("exact native event type required")
+        raise RuntimeError("invalid native response event")
+    if event_type is ResponseStarted:
+        _validate_native_identifier(event.response_id)
+        _validate_native_identifier(event.turn_id)
+        if event.continuation_of_batch_id is not None:
+            raise RuntimeError("invalid native response event")
+        return
+    if event_type is ResponseCompleted:
+        _validate_native_identifier(event.response_id)
+        _validate_native_identifier(event.turn_id)
+        if event.continuation_of_batch_id is not None:
+            raise RuntimeError("invalid native response event")
+        return
+    _validate_native_identifier(event.item_id)
+    _validate_native_identifier(event.turn_id)
+    _validate_native_identifier(event.response_id)
+    if event_type is OutputAudio:
+        if type(event.data) is not bytes:
+            raise RuntimeError("invalid native response event")
+        return
+    if (
+        type(event.text) is not str
+        or type(event.final) is not bool
+        or event.role is not TranscriptRole.ASSISTANT
+        or event.provenance is not TranscriptProvenance.ASSISTANT_OUTPUT_AUDIO
+    ):
+        raise RuntimeError("invalid native response event")
+
 
 @dataclass(slots=True)
 class _NativeResponseState:
@@ -126,9 +208,17 @@ class _NativeResponseState:
     response_id: str | None = None
     turn_id: str | None = None
     lease: object | None = None
+    acquire_task: asyncio.Task[object] | None = None
+    operation_task: asyncio.Task[object] | None = None
+    terminal_task: asyncio.Task[bool] | None = None
+    terminal_intent: str | None = None
     provider_completed: bool = False
     speaking: bool = False
     interrupted: bool = False
+    cancel_sent: bool = False
+    lease_terminal_started: bool = False
+    receipt_validated: bool = False
+    retired: bool = False
 
 
 class GatewayRealtimeVoiceController:
@@ -192,7 +282,9 @@ class GatewayRealtimeVoiceController:
         self._close_task: asyncio.Task[None] | None = None
         self._native_response: _NativeResponseState | None = None
         self._native_lock = asyncio.Lock()
-        self._terminal_native_ids: tuple[str, str] | None = None
+        self._native_terminal_task: asyncio.Task[bool] | None = None
+        self._native_tombstone_order: deque[tuple[str, str]] = deque()
+        self._native_tombstone_ids: set[tuple[str, str]] = set()
 
     @property
     def lifecycle_events(self) -> tuple[ControllerEvent, ...]:
@@ -235,11 +327,23 @@ class GatewayRealtimeVoiceController:
     ) -> None:
         if self._binding is not None:
             raise RuntimeError("controller already owns an attachment")
+        if not all(
+            callable(getattr(self._host, method_name, None))
+            for method_name in _REQUIRED_NATIVE_HOST_METHODS
+        ):
+            raise RuntimeError("native host API is incomplete")
         self._binding = binding
         self._emit(ControllerLifecycle.CONNECTING)
-        self._open_task = asyncio.create_task(open_realtime_voice_session(
-            provider_name, setup, required_capabilities=required_capabilities,
-        ))
+        native_required_capabilities = (
+            frozenset(required_capabilities) | _REQUIRED_NATIVE_CAPABILITIES
+        )
+        self._open_task = asyncio.create_task(
+            open_realtime_voice_session(
+                provider_name,
+                setup,
+                required_capabilities=native_required_capabilities,
+            )
+        )
         try:
             session = await asyncio.shield(self._open_task)
         except asyncio.CancelledError:
@@ -262,6 +366,19 @@ class GatewayRealtimeVoiceController:
         if self._closing or self._closed:
             await self.close(reason="closed during open")
             return
+        session_capabilities = session.capabilities
+        if (
+            type(session_capabilities) is not frozenset
+            or any(
+                type(capability) is not RealtimeCapability
+                for capability in session_capabilities
+            )
+            or not _REQUIRED_NATIVE_CAPABILITIES.issubset(session_capabilities)
+        ):
+            detail = "native realtime session incompatible"
+            self._emit(ControllerLifecycle.FAILED, detail=detail)
+            await self.close(reason=detail)
+            raise RuntimeError(detail)
         self._admission = FinalTranscriptAdmission(
             binding,
             self._host,
@@ -298,12 +415,12 @@ class GatewayRealtimeVoiceController:
                     if self._native_response is not None
                     else "provider event stream failed"
                 )
-                self._emit(ControllerLifecycle.FAILED, detail=detail, generation=generation)
+                self._emit(
+                    ControllerLifecycle.FAILED, detail=detail, generation=generation
+                )
                 await self.close(reason="event stream failure")
 
-    async def _handle_event(
-        self, event: RealtimeVoiceEvent, generation: int
-    ) -> None:
+    async def _handle_event(self, event: RealtimeVoiceEvent, generation: int) -> None:
         if self._closing or generation != self._transport_generation:
             return
         if isinstance(event, SessionReady):
@@ -389,11 +506,11 @@ class GatewayRealtimeVoiceController:
                         admission_status=result.status,
                     )
             return
-        if isinstance(
-            event, (ResponseStarted, OutputAudio, OutputTranscript, ResponseCompleted)
-        ):
+        if type(event) in _NATIVE_EVENT_TYPES:
             await self._handle_native_event(event, generation)
             return
+        if isinstance(event, _NATIVE_EVENT_TYPES):
+            raise RuntimeError("exact native event type required")
         # Provider tools and all other events are projection-only in this slice.
         self._emit(
             self._lifecycle_events[-1].lifecycle,
@@ -402,24 +519,17 @@ class GatewayRealtimeVoiceController:
         )
 
     async def _start_native_response(
-        self, receipt: object | None, event: InputTranscript,
-        generation: int, interrupt_generation: int,
+        self,
+        receipt: object | None,
+        event: InputTranscript,
+        generation: int,
+        interrupt_generation: int,
     ) -> None:
         session, binding = self._session, self._binding
-        if not callable(getattr(self._host, "reserve_native_output", None)):
-            self._emit(
-                ControllerLifecycle.QUEUED, provider_event=event,
-                generation=generation, admission_status=AdmissionStatus.SUBMITTED,
-            )
-            return
         if receipt is None or session is None or binding is None:
             await self._native_failure("native output reservation failed")
             return
-        required = {
-            RealtimeCapability.EXPLICIT_RESPONSE,
-            RealtimeCapability.RESPONSE_CANCELLATION,
-        }
-        if not required.issubset(session.capabilities) or self._native_response is not None:
+        if not _REQUIRED_NATIVE_CAPABILITIES.issubset(session.capabilities):
             await self._native_failure("native response unavailable")
             return
         try:
@@ -439,13 +549,39 @@ class GatewayRealtimeVoiceController:
             state = _NativeResponseState(
                 request, generation, interrupt_generation, uuid.uuid4().hex
             )
-            self._native_response = state
-            await session.start_response(provider_request)
-            if self._native_response is not state or state.interrupted:
+            async with self._native_lock:
+                if self._native_response is not None or self._closing:
+                    raise RuntimeError("native response unavailable")
+                self._native_response = state
+                operation = self._create_native_task(
+                    session.start_response(provider_request)
+                )
+                state.operation_task = operation
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                async with self._native_lock:
+                    expected = state.interrupted or state.terminal_task is not None
+                if not expected:
+                    raise
+                return
+            finally:
+                async with self._native_lock:
+                    if state.operation_task is operation and operation.done():
+                        state.operation_task = None
+            async with self._native_lock:
+                active = (
+                    self._native_response is state
+                    and not state.interrupted
+                    and state.terminal_task is None
+                )
+            if not active:
                 return
             self._emit(
-                ControllerLifecycle.QUEUED, detail="native response queued",
-                provider_event=event, generation=generation,
+                ControllerLifecycle.QUEUED,
+                detail="native response queued",
+                provider_event=event,
+                generation=generation,
                 admission_status=AdmissionStatus.SUBMITTED,
             )
             self._emit(ControllerLifecycle.THINKING, detail="native response pending")
@@ -455,79 +591,356 @@ class GatewayRealtimeVoiceController:
     async def _handle_native_event(
         self, event: RealtimeVoiceEvent, generation: int
     ) -> None:
-        state = self._native_response
-        if (
-            state is None or state.interrupted or generation != state.generation
-            or generation != self._transport_generation
-        ):
-            raise RuntimeError("unsolicited or stale native response event")
+        _validate_native_event(event)
         async with self._native_lock:
             state = self._native_response
+            event_identity = (event.response_id, event.turn_id)
+            if state is None and event_identity in self._native_tombstone_ids:
+                raise RuntimeError("late duplicate native response event")
             if (
-                state is None or state.interrupted or generation != state.generation
+                state is None
+                or state.interrupted
+                or generation != state.generation
                 or generation != self._transport_generation
             ):
                 raise RuntimeError("unsolicited or stale native response event")
-            if isinstance(event, ResponseStarted):
-                if state.response_id is not None or event.continuation_of_batch_id is not None:
+            if type(event) is ResponseStarted:
+                if state.response_id is not None:
                     raise RuntimeError("duplicate native response start")
+                authenticated = self._host.validate_native_output_request(state.request)
+                if authenticated is not state.request:
+                    raise RuntimeError("native response identity mismatch")
+                turn_marker = _validate_native_identifier(
+                    authenticated.reservation.turn_marker
+                )
+                if event.turn_id != turn_marker:
+                    raise RuntimeError("native response identity mismatch")
                 state.response_id, state.turn_id = event.response_id, event.turn_id
-                try:
-                    state.lease = await self._host.acquire_native_playback(
-                        state.request, lease_id=state.lease_id,
+                acquire_task = self._create_native_task(
+                    self._host.acquire_native_playback(
+                        state.request,
+                        lease_id=state.lease_id,
                         response_id=event.response_id,
                         transport_generation=generation,
                     )
-                except BaseException:
-                    await self._native_failure("native playback acquisition failed")
-                return
-            if state.response_id is None or state.lease is None:
-                raise RuntimeError("native response event before start")
-            if event.response_id != state.response_id or event.turn_id != state.turn_id:
-                raise RuntimeError("native response identity mismatch")
-            if state.provider_completed:
-                raise RuntimeError("native response event after completion")
-            if isinstance(event, OutputTranscript):
-                self._emit(self._lifecycle_events[-1].lifecycle, provider_event=event)
-                return
-            if isinstance(event, OutputAudio):
-                await state.lease.write_pcm(event.data)
-                if event.data and not state.speaking:
-                    state.speaking = True
-                    self._emit(ControllerLifecycle.SPEAKING, detail="native audio streaming")
-                return
-            state.provider_completed = True
-            try:
-                receipt = await state.lease.finish_and_wait(self._interrupt_timeout)
-                if self._native_response is not state or state.interrupted:
-                    return
-                validated = self._host.validate_native_playback_receipt(
-                    state.request, state.lease, receipt
                 )
-                if (
-                    self._native_response is not state
-                    or state.interrupted
-                    or validated is not receipt
-                    or getattr(receipt, "interrupted", None) is not False
-                ):
-                    raise RuntimeError("invalid native drain receipt")
-                await self._host.retire_native_output(state.request, state.lease, receipt)
+                state.acquire_task = acquire_task
+                state.operation_task = acquire_task
+                operation = None
+                terminal_task = None
+            else:
+                acquire_task = None
+                lease = state.lease
+                if state.response_id is None or lease is None:
+                    raise RuntimeError("native response event before start")
+                if event_identity != (state.response_id, state.turn_id):
+                    raise RuntimeError("native response identity mismatch")
+                if state.provider_completed:
+                    raise RuntimeError("native response event after completion")
+                if type(event) is OutputTranscript:
+                    self._emit(
+                        self._lifecycle_events[-1].lifecycle,
+                        provider_event=event,
+                    )
+                    return
+                if type(event) is OutputAudio:
+                    operation = self._create_native_task(lease.write_pcm(event.data))
+                    state.operation_task = operation
+                    terminal_task = None
+                else:
+                    state.provider_completed = True
+                    terminal_task = self._claim_native_terminal_locked(state, "drain")
+                    operation = None
+
+        if acquire_task is not None:
+            try:
+                acquired = await asyncio.shield(acquire_task)
+            except asyncio.CancelledError:
+                async with self._native_lock:
+                    expected = state.interrupted or state.terminal_task is not None
+                if expected:
+                    return
+                raise
             except BaseException:
-                await self._native_failure("native playback drain failed")
+                async with self._native_lock:
+                    expected = state.interrupted or state.terminal_task is not None
+                if expected:
+                    return
+                await self._native_failure("native playback acquisition failed")
                 return
+            finally:
+                async with self._native_lock:
+                    if state.operation_task is acquire_task and acquire_task.done():
+                        state.operation_task = None
+            async with self._native_lock:
+                if self._native_response is state:
+                    state.lease = acquired
+            return
+
+        if operation is not None:
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                async with self._native_lock:
+                    expected = state.interrupted or state.terminal_task is not None
+                if expected:
+                    return
+                raise
+            except BaseException:
+                async with self._native_lock:
+                    expected = state.interrupted or state.terminal_task is not None
+                if expected:
+                    return
+                await self._native_failure("native playback write failed")
+                return
+            finally:
+                async with self._native_lock:
+                    if state.operation_task is operation and operation.done():
+                        state.operation_task = None
+            async with self._native_lock:
+                active = self._native_response is state and not state.interrupted
+                emit_speaking = active and bool(event.data) and not state.speaking
+                if emit_speaking:
+                    state.speaking = True
+            if emit_speaking:
+                self._emit(
+                    ControllerLifecycle.SPEAKING,
+                    detail="native audio streaming",
+                )
+            return
+
+        assert terminal_task is not None
+        cleanup_failed = await asyncio.shield(terminal_task)
+        if cleanup_failed:
+            await self._request_close("native response cleanup failed")
+
+    def _claim_native_terminal_locked(
+        self, state: _NativeResponseState, intent: str
+    ) -> asyncio.Task[bool]:
+        if state.terminal_intent is None or (
+            state.terminal_intent == "drain" and intent != "drain"
+        ):
+            state.terminal_intent = intent
+        if intent != "drain":
+            state.interrupted = True
+            operation = state.operation_task
+            if (
+                operation is not None
+                and operation is not state.acquire_task
+                and not operation.done()
+            ):
+                operation.cancel()
+        if state.terminal_task is None:
+            task = asyncio.create_task(self._terminalize_native(state))
+            state.terminal_task = task
+            self._native_terminal_task = task
+            task.add_done_callback(self._observe_native_terminal)
+        return state.terminal_task
+
+    async def _claim_native_terminal(self, intent: str) -> asyncio.Task[bool] | None:
+        async with self._native_lock:
+            state = self._native_response
+            if state is None:
+                return None
+            return self._claim_native_terminal_locked(state, intent)
+
+    @staticmethod
+    def _observe_native_terminal(task: asyncio.Task[bool]) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _observe_native_operation(task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    def _create_native_task(self, awaitable: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(awaitable)
+        task.add_done_callback(self._observe_native_operation)
+        return task
+
+    async def _await_native_task(self, task: asyncio.Task[Any]) -> Any:
+        done, _pending = await asyncio.wait({task}, timeout=self._interrupt_timeout)
+        if not done:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise TimeoutError("native operation timed out")
+        return task.result()
+
+    async def _terminalize_native(self, state: _NativeResponseState) -> bool:
+        cleanup_failed = False
+        receipt: object | None = None
+        terminal_method: str | None = None
+        lease = state.lease
+        session = self._session
+
+        try:
+            authenticated = self._host.validate_native_output_request(state.request)
+            if authenticated is not state.request:
+                raise RuntimeError("native request identity changed")
+        except BaseException:
+            cleanup_failed = True
+
+        async with self._native_lock:
+            intent = state.terminal_intent or "failure"
+            response_id = state.response_id
+            send_cancel = (
+                intent != "drain" and response_id is not None and not state.cancel_sent
+            )
+            if send_cancel:
+                state.cancel_sent = True
+        if send_cancel and session is not None:
+            cancel_task = self._create_native_task(session.cancel_response(response_id))
+            try:
+                await self._await_native_task(cancel_task)
+            except BaseException:
+                cleanup_failed = True
+
+        acquire_task = state.acquire_task
+        if lease is None and acquire_task is not None:
+            try:
+                lease = await self._await_native_task(acquire_task)
+            except BaseException:
+                cleanup_failed = True
+            else:
+                async with self._native_lock:
+                    if self._native_response is state:
+                        state.lease = lease
+
+        async with self._native_lock:
+            intent = state.terminal_intent or "failure"
+            response_id = state.response_id
+            send_cancel = (
+                intent != "drain" and response_id is not None and not state.cancel_sent
+            )
+            if send_cancel:
+                state.cancel_sent = True
+        if send_cancel and session is not None:
+            cancel_task = self._create_native_task(session.cancel_response(response_id))
+            try:
+                await self._await_native_task(cancel_task)
+            except BaseException:
+                cleanup_failed = True
+
+        if lease is not None:
+            async with self._native_lock:
+                intent = state.terminal_intent or "failure"
+            if intent == "drain":
+                terminal_method = "finish"
+                finish_task = self._create_native_task(
+                    lease.finish_and_wait(self._interrupt_timeout)
+                )
+                async with self._native_lock:
+                    state.operation_task = finish_task
+                    state.lease_terminal_started = True
+                try:
+                    receipt = await self._await_native_task(finish_task)
+                except asyncio.CancelledError:
+                    async with self._native_lock:
+                        switched = state.terminal_intent != "drain"
+                    if not switched:
+                        cleanup_failed = True
+                except BaseException:
+                    cleanup_failed = True
+                finally:
+                    async with self._native_lock:
+                        if state.operation_task is finish_task:
+                            state.operation_task = None
+
+            async with self._native_lock:
+                intent = state.terminal_intent or "failure"
+            if receipt is None and intent != "drain":
+                terminal_method = "interrupt"
+                interrupt_task = self._create_native_task(
+                    lease.interrupt_and_wait(self._interrupt_timeout)
+                )
+                async with self._native_lock:
+                    state.operation_task = interrupt_task
+                    state.lease_terminal_started = True
+                try:
+                    receipt = await self._await_native_task(interrupt_task)
+                except BaseException:
+                    cleanup_failed = True
+                finally:
+                    async with self._native_lock:
+                        if state.operation_task is interrupt_task:
+                            state.operation_task = None
+
+        if receipt is not None and lease is not None:
+            try:
+                validated = self._host.validate_native_playback_receipt(
+                    state.request, lease, receipt
+                )
+                expected_interrupted = terminal_method == "interrupt"
+                if (
+                    validated is not receipt
+                    or type(getattr(receipt, "interrupted", None)) is not bool
+                    or receipt.interrupted is not expected_interrupted
+                ):
+                    raise RuntimeError("invalid native playback receipt")
+                state.receipt_validated = True
+                retired = await self._host.retire_native_output(
+                    state.request, lease, receipt
+                )
+                if retired is not receipt:
+                    raise RuntimeError("native retirement identity changed")
+                state.retired = True
+            except BaseException:
+                cleanup_failed = True
+        elif lease is not None:
+            cleanup_failed = True
+
+        if cleanup_failed and lease is not None:
+            try:
+                close_task = self._create_native_task(lease.close())
+                await self._await_native_task(close_task)
+            except BaseException:
+                pass
+
+        async with self._native_lock:
+            if state.response_id is not None and state.turn_id is not None:
+                identity = (state.response_id, state.turn_id)
+                if identity not in self._native_tombstone_ids:
+                    if len(self._native_tombstone_order) >= self._replay_capacity:
+                        expired = self._native_tombstone_order.popleft()
+                        self._native_tombstone_ids.remove(expired)
+                    self._native_tombstone_order.append(identity)
+                    self._native_tombstone_ids.add(identity)
             if self._native_response is state:
-                self._terminal_native_ids = (state.response_id, state.turn_id)
                 self._native_response = None
-                self._emit(ControllerLifecycle.COMPLETED, detail="native playback drained")
+
+        if cleanup_failed:
+            self._emit(
+                ControllerLifecycle.FAILED,
+                detail="native response cleanup failed",
+            )
+        elif not self._closing:
+            if terminal_method == "finish":
+                self._emit(
+                    ControllerLifecycle.COMPLETED,
+                    detail="native playback drained",
+                )
+            else:
+                self._emit(
+                    ControllerLifecycle.LISTENING,
+                    detail="native response interrupted",
+                )
+        return cleanup_failed
 
     async def _native_failure(self, detail: str) -> None:
         if not self._closing:
             self._emit(ControllerLifecycle.FAILED, detail=detail)
-        current = asyncio.current_task()
-        if current is self._event_task:
-            asyncio.create_task(self.close(reason=detail))
-            return
-        await self.close(reason=detail)
+        terminal_task = await self._claim_native_terminal("failure")
+        cleanup_failed = (
+            await asyncio.shield(terminal_task) if terminal_task is not None else False
+        )
+        await self._request_close(
+            "native response cleanup failed" if cleanup_failed else detail
+        )
 
     async def _pump_audio(self) -> None:
         try:
@@ -541,9 +954,9 @@ class GatewayRealtimeVoiceController:
                     self._audio_queue.task_done()
         except asyncio.CancelledError:
             raise
-        except BaseException as exc:
+        except BaseException:
             if not self._closing:
-                self._emit(ControllerLifecycle.FAILED, detail=f"audio send failed: {exc}")
+                self._emit(ControllerLifecycle.FAILED, detail="audio send failed")
                 await self.close(reason="audio send failed")
 
     async def _stop_audio_for_reconnect(self) -> None:
@@ -564,7 +977,10 @@ class GatewayRealtimeVoiceController:
         self, data: bytes | bytearray | memoryview, *, mime_type: str | None = None
     ) -> AudioFeedResult:
         if self._reconnecting:
-            self._emit(ControllerLifecycle.RECONNECTING, detail="audio rejected while reconnecting")
+            self._emit(
+                ControllerLifecycle.RECONNECTING,
+                detail="audio rejected while reconnecting",
+            )
             return AudioFeedResult.RECONNECTING
         if self._closing or self._closed or self._session is None:
             return AudioFeedResult.CLOSED
@@ -590,45 +1006,30 @@ class GatewayRealtimeVoiceController:
                 binding = self._binding
                 if session is None or binding is None or self._closing:
                     return
-                state = self._native_response
-                if state is not None:
-                    state.interrupted = True
-                    if state.response_id is not None:
-                        await session.cancel_response(state.response_id)
-                    if state.lease is not None:
-                        receipt = await state.lease.interrupt_and_wait(
-                            self._interrupt_timeout
-                        )
-                        validated = self._host.validate_native_playback_receipt(
-                            state.request, state.lease, receipt
-                        )
-                        if (
-                            validated is not receipt
-                            or getattr(receipt, "interrupted", None) is not True
-                        ):
-                            raise RuntimeError("invalid native interruption receipt")
-                        await self._host.retire_native_output(
-                            state.request, state.lease, receipt
-                        )
-                    self._native_response = None
-                    self._emit(
-                        ControllerLifecycle.LISTENING,
-                        detail="native response interrupted",
+                terminal_task = await self._claim_native_terminal("interrupt")
+                if terminal_task is not None:
+                    cleanup_failed = await asyncio.shield(terminal_task)
+                    if cleanup_failed:
+                        failure = RuntimeError("native response cleanup failed")
+                else:
+                    if RealtimeCapability.EXPLICIT_INTERRUPTION in session.capabilities:
+                        await session.interrupt()
+                    await self._host.interrupt_and_wait(
+                        binding, self._interrupt_timeout
                     )
-                    return
-                if RealtimeCapability.EXPLICIT_INTERRUPTION in session.capabilities:
-                    await session.interrupt()
-                await self._host.interrupt_and_wait(binding, self._interrupt_timeout)
             except BaseException as exc:
                 # Fence admission before releasing the barrier. Scheduling close()
                 # first would leave one event-loop turn where a final transcript
                 # could authorize against an attachment already known to be unsafe.
-                if not self._closing:
-                    self._closing = True
-                    self._emit(ControllerLifecycle.CLOSING, detail="interrupt failed")
+                self._closing = True
                 failure = exc
         if failure is not None:
-            await self.close(reason="interrupt failed")
+            reason = (
+                "native response cleanup failed"
+                if str(failure) == "native response cleanup failed"
+                else "interrupt failed"
+            )
+            await self._request_close(reason)
             raise failure
 
     async def resume(self, *, timeout: float = 10.0) -> None:
@@ -678,7 +1079,9 @@ class GatewayRealtimeVoiceController:
             projection.finalization is None
             or not self._host.validate_finalization(projection.finalization)
         ):
-            raise RuntimeError("completed projection requires canonical persistence receipt")
+            raise RuntimeError(
+                "completed projection requires canonical persistence receipt"
+            )
         current = self._lifecycle_events[-1].lifecycle
         rank = {
             ControllerLifecycle.THINKING: 0,
@@ -689,29 +1092,42 @@ class GatewayRealtimeVoiceController:
         }
         projected = ControllerLifecycle(projection.status.value)
         if (
-            (current in rank and (rank[projected] < rank[current] or rank[current] == 3))
-            or (current not in rank and projected is not ControllerLifecycle.THINKING)
-        ):
-            raise RuntimeError("host projection is not a monotonic canonical transition")
+            current in rank and (rank[projected] < rank[current] or rank[current] == 3)
+        ) or (current not in rank and projected is not ControllerLifecycle.THINKING):
+            raise RuntimeError(
+                "host projection is not a monotonic canonical transition"
+            )
         self._emit(projected, detail=projection.detail)
 
     async def close(self, *, reason: str = "") -> None:
+        await self._request_close(reason)
+
+    async def _request_close(self, reason: str) -> None:
         async with self._close_lock:
             if self._closed:
                 return
             close_task = self._close_task
-            if close_task is None or close_task.done():
+            if close_task is None:
+                self._closing = True
                 close_task = asyncio.create_task(self._finish_close(reason))
                 self._close_task = close_task
+                close_task.add_done_callback(self._observe_close_task)
+        if asyncio.current_task() in {self._event_task, self._audio_task}:
+            return
         await asyncio.shield(close_task)
+
+    @staticmethod
+    def _observe_close_task(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
 
     async def _finish_close(self, reason: str) -> None:
         """Own cleanup independently of any one caller waiting for close."""
         if self._closed:
             return
-        if not self._closing:
-            self._closing = True
-            self._emit(ControllerLifecycle.CLOSING, detail=reason)
+        cleanup_detail: str | None = None
         open_task = self._open_task
         if open_task is not None and open_task is not asyncio.current_task():
             try:
@@ -720,41 +1136,21 @@ class GatewayRealtimeVoiceController:
                 late_session = None
             if late_session is not None and self._session is None:
                 self._session = late_session
+        terminal_task = await self._claim_native_terminal("close")
+        if terminal_task is not None:
+            try:
+                if await asyncio.shield(terminal_task):
+                    cleanup_detail = "native response cleanup failed"
+            except BaseException:
+                cleanup_detail = "native response cleanup failed"
         admission = self._admission
         if admission is not None:
-            await admission.close()
-        close_attachment = getattr(self._host, "close_attachment", None)
-        if close_attachment is not None:
-            await close_attachment(self._binding)
+            try:
+                await admission.close()
+            except BaseException:
+                if cleanup_detail is None:
+                    cleanup_detail = "controller cleanup failed"
         current = asyncio.current_task()
-        state = self._native_response
-        if state is not None:
-            state.interrupted = True
-            first_error: BaseException | None = None
-            if state.response_id is not None and self._session is not None:
-                try:
-                    await self._session.cancel_response(state.response_id)
-                except BaseException as exc:
-                    first_error = exc
-            if state.lease is not None:
-                try:
-                    receipt = await state.lease.interrupt_and_wait(
-                        self._interrupt_timeout
-                    )
-                    validated = self._host.validate_native_playback_receipt(
-                        state.request, state.lease, receipt
-                    )
-                    if validated is not receipt or getattr(
-                        receipt, "interrupted", None
-                    ) is not True:
-                        raise RuntimeError("invalid native interruption receipt")
-                    await self._host.retire_native_output(
-                        state.request, state.lease, receipt
-                    )
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
-            self._native_response = None
         tasks = [
             task
             for task in (self._event_task, self._audio_task)
@@ -766,9 +1162,28 @@ class GatewayRealtimeVoiceController:
             await asyncio.gather(*tasks, return_exceptions=True)
         session = self._session
         if session is not None:
-            await session.close()
+            try:
+                await session.close()
+            except BaseException:
+                if cleanup_detail is None:
+                    cleanup_detail = "controller cleanup failed"
+        close_attachment = getattr(self._host, "close_attachment", None)
+        if callable(close_attachment):
+            try:
+                await close_attachment(self._binding)
+            except BaseException:
+                if cleanup_detail is None:
+                    cleanup_detail = "controller cleanup failed"
+        final_detail = cleanup_detail or reason
+        if cleanup_detail is not None and not (
+            self._lifecycle_events
+            and self._lifecycle_events[-1].lifecycle is ControllerLifecycle.FAILED
+            and self._lifecycle_events[-1].detail == cleanup_detail
+        ):
+            self._emit(ControllerLifecycle.FAILED, detail=cleanup_detail)
+        self._emit(ControllerLifecycle.CLOSING, detail=final_detail)
         self._closed = True
-        self._emit(ControllerLifecycle.CLOSED, detail=reason)
+        self._emit(ControllerLifecycle.CLOSED, detail=final_detail)
 
 
 __all__ = [
@@ -776,7 +1191,6 @@ __all__ = [
     "ControllerEvent",
     "ControllerLifecycle",
     "GatewayRealtimeVoiceController",
-
     "HostProjection",
     "HostProjectionStatus",
     "RealtimeControllerHost",
