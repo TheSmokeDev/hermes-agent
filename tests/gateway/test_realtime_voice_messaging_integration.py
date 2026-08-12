@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from collections.abc import AsyncIterator
@@ -13,6 +14,7 @@ from agent.realtime_voice_admission import RealtimeSessionBinding, RealtimeUtter
 from agent.realtime_voice_provider import (
     InputTranscript,
     OutputAudio,
+    OutputTranscript,
     RealtimeCapability,
     RealtimeOutputAudioFormat,
     RealtimeResponseRequest,
@@ -81,6 +83,7 @@ class _InstalledSession(RealtimeVoiceSession):
         self.close_calls = 0
         self.tool_result_calls = 0
         self.response_requests: list[RealtimeResponseRequest] = []
+        self.response_requested = asyncio.Event()
 
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         pass
@@ -93,12 +96,7 @@ class _InstalledSession(RealtimeVoiceSession):
 
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
         self.response_requests.append(request)
-        response_id = "provider-native-response"
-        await self.incoming.put(ResponseStarted(response_id, request.turn_marker))
-        await self.incoming.put(OutputAudio(
-            b"\x00\x00", "provider-output-item", request.turn_marker, response_id
-        ))
-        await self.incoming.put(ResponseCompleted(response_id, request.turn_marker))
+        self.response_requested.set()
 
     async def _cancel_response(self, response_id: str) -> None:
         raise AssertionError("completed native response must not be cancelled")
@@ -139,7 +137,10 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
     import hermes_state
     import run_agent
     from agent.realtime_voice_registry import _reset_for_tests, register_provider
-    from gateway.realtime_voice_controller import GatewayRealtimeVoiceController
+    from gateway.realtime_voice_controller import (
+        ControllerLifecycle,
+        GatewayRealtimeVoiceController,
+    )
     from gateway.config import PlatformConfig
     from gateway.platforms.base import SendResult
     from gateway.realtime_voice_messaging_host import (
@@ -208,6 +209,7 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
     canonical_sends: list[tuple[str, str]] = []
     generic_tts_calls: list[str] = []
     generic_audio_calls: list[str] = []
+    generic_voice_calls: list[str] = []
 
     def generic_tts_tripwire(*, text, output_path=None):
         generic_tts_calls.append(text)
@@ -221,34 +223,69 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
         generic_audio_calls.append(audio_path)
         raise AssertionError("native realtime turn reached generic audio output")
 
+    async def generic_voice_tripwire(*, audio_path, **_kwargs):
+        generic_voice_calls.append(audio_path)
+        raise AssertionError("native realtime turn reached voice attachment fallback")
+
     monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
     monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", generic_tts_tripwire)
     monkeypatch.setattr(adapter, "play_tts", generic_audio_tripwire)
+    monkeypatch.setattr(adapter, "send_voice", generic_voice_tripwire)
 
     class _NativeLease:
         def __init__(self) -> None:
             self.pcm: list[bytes] = []
+            self.finish_entered = asyncio.Event()
+            self.release_finish = asyncio.Event()
+            self.close_calls = 0
 
         async def write_pcm(self, data: bytes) -> None:
             self.pcm.append(data)
 
         async def finish_and_wait(self, _timeout: float):
-            return object()
+            self.finish_entered.set()
+            await self.release_finish.wait()
+            return drain_receipt
 
         async def interrupt_and_wait(self, _timeout: float):
             raise AssertionError("completed native playback must drain")
 
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    class _DrainReceipt:
+        interrupted = False
+
+    drain_receipt = _DrainReceipt()
     native_lease = _NativeLease()
+    receipt_validated = asyncio.Event()
     guild_id = int(source.scope_id)
     adapter._voice_clients[guild_id] = type(
         "ConnectedVoice", (), {"is_connected": lambda self: True}
     )()
     adapter._voice_connection_generations[guild_id] = 1
     adapter._voice_mixer_generations[guild_id] = 1
+    lease_acquired = asyncio.Event()
+
+    async def acquire_native_lease(*_args, **_kwargs):
+        lease_acquired.set()
+        return native_lease
+
     monkeypatch.setattr(
         adapter,
         "acquire_native_playback_lease",
-        AsyncMock(return_value=native_lease),
+        AsyncMock(side_effect=acquire_native_lease),
+    )
+
+    def validate_native_receipt(candidate_guild, candidate_lease, candidate_receipt):
+        assert candidate_guild == guild_id
+        assert candidate_lease is native_lease
+        assert candidate_receipt is drain_receipt
+        receipt_validated.set()
+        return candidate_receipt
+
+    monkeypatch.setattr(
+        adapter, "validate_native_playback_receipt", validate_native_receipt
     )
 
     async def send_canonical_response(*, chat_id, content, **_kwargs):
@@ -421,12 +458,113 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
         assert len(accepted) == 1
         results = await asyncio.wait_for(asyncio.gather(*accepted), timeout=5)
         assert len(results) == 1
-        for _ in range(500):
-            if session.response_requests and attachment._controller._native_response is None:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("native response did not complete and drain")
+        await asyncio.wait_for(session.response_requested.wait(), timeout=5)
+        assert len(session.response_requests) == 1
+        request = session.response_requests[0]
+        assert request == RealtimeResponseRequest(
+            durable_session_id=entry.session_id,
+            assistant_message_id=request.assistant_message_id,
+            turn_marker=request.turn_marker,
+            canonical_text="canonical installed response",
+            content_digest=hashlib.sha256(
+                b"canonical installed response"
+            ).hexdigest(),
+            output_audio_format=RealtimeOutputAudioFormat(
+                mime_type="audio/pcm",
+                sample_rate_hz=24000,
+                channels=1,
+                sample_encoding="pcm_s16le",
+                sample_width_bytes=2,
+                endianness="little",
+            ),
+            allow_tools=False,
+        )
+        response_id = "provider-native-response"
+        item_id = "provider-output-item"
+        controller = attachment._controller
+        native_state = controller._native_response
+        assert native_state is not None
+
+        class _StartedSubclass(ResponseStarted):
+            pass
+
+        invalid_before_start = (
+            ResponseStarted(response_id, "wrong-turn-marker"),
+            OutputAudio(b"\x00\x00", item_id, request.turn_marker, response_id),
+            _StartedSubclass(response_id, request.turn_marker),
+        )
+        for invalid in invalid_before_start:
+            with pytest.raises(RuntimeError):
+                await controller._handle_native_event(invalid, 1)
+            assert native_state.response_id is None
+            adapter.acquire_native_playback_lease.assert_not_awaited()
+
+        await controller._handle_native_event(
+            ResponseStarted(response_id, request.turn_marker), 1
+        )
+        assert lease_acquired.is_set()
+        adapter.acquire_native_playback_lease.assert_awaited_once_with(
+            guild_id,
+            native_state.lease_id,
+            response_id,
+            request.turn_marker,
+            1,
+            1,
+            input_format="pcm_s16le",
+            sample_rate=24000,
+            channels=1,
+        )
+        with pytest.raises(RuntimeError, match="duplicate native response start"):
+            await controller._handle_native_event(
+                ResponseStarted(response_id, request.turn_marker), 1
+            )
+        with pytest.raises(RuntimeError, match="native response identity mismatch"):
+            await controller._handle_native_event(
+                OutputAudio(b"\x00\x00", item_id, "wrong-turn", response_id), 1
+            )
+        mutated = OutputAudio(
+            b"\x00\x00", item_id, request.turn_marker, response_id
+        )
+        object.__setattr__(mutated, "response_id", "mutated-response")
+        with pytest.raises(RuntimeError, match="native response identity mismatch"):
+            await controller._handle_native_event(mutated, 1)
+        assert native_lease.pcm == []
+        await session.incoming.put(
+            OutputAudio(b"\x00\x00", item_id, request.turn_marker, response_id)
+        )
+        await session.incoming.put(
+            OutputTranscript(
+                item_id,
+                request.turn_marker,
+                response_id,
+                "provider projection must not replace canonical text",
+                True,
+                TranscriptRole.ASSISTANT,
+                TranscriptProvenance.ASSISTANT_OUTPUT_AUDIO,
+            )
+        )
+        await session.incoming.put(
+            OutputAudio(b"\x01\x00", item_id, request.turn_marker, response_id)
+        )
+        await session.incoming.put(ResponseCompleted(response_id, request.turn_marker))
+        await asyncio.wait_for(native_lease.finish_entered.wait(), timeout=5)
+        assert controller._native_response is not None
+        assert not receipt_validated.is_set()
+        assert not any(
+            event.lifecycle is ControllerLifecycle.COMPLETED
+            for event in controller.lifecycle_events
+        )
+        native_lease.release_finish.set()
+        await asyncio.wait_for(receipt_validated.wait(), timeout=5)
+        terminal_task = controller._native_terminal_task
+        assert terminal_task is not None
+        await asyncio.wait_for(asyncio.shield(terminal_task), timeout=5)
+        assert controller._native_response is None
+        with pytest.raises(RuntimeError, match="late duplicate native response event"):
+            await controller._handle_native_event(
+                OutputAudio(b"\x02\x00", item_id, request.turn_marker, response_id), 1
+            )
+        assert native_lease.pcm == [b"\x00\x00", b"\x01\x00"]
         await asyncio.wait_for(attachment.close(), timeout=5)
 
         rows = db.get_messages(entry.session_id, include_inactive=True)
@@ -456,13 +594,16 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
         assert reread_user["display_metadata"][_MARKER_KEY] == marker
 
         assert run_calls == ["installed voice turn"]
-        assert [request.canonical_text for request in session.response_requests] == [
+        assert request.assistant_message_id == assistant_row["id"]
+        assert request.turn_marker == marker
+        assert [sent.canonical_text for sent in session.response_requests] == [
             "canonical installed response"
         ]
-        assert native_lease.pcm == [b"\x00\x00"]
+        assert native_lease.pcm == [b"\x00\x00", b"\x01\x00"]
         assert canonical_sends == [(source.chat_id, "canonical installed response")]
         assert generic_tts_calls == []
         assert generic_audio_calls == []
+        assert generic_voice_calls == []
         assert provider.open_calls == 1
         assert session.tool_result_calls == 0
         assert session.close_calls == 1
@@ -471,7 +612,19 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
         assert not runner._is_session_running(route)
         assert runner._turn_lease_tokens == {}
         assert not _ACCEPTED_TASKS
-        controller = attachment._controller
+        completed = [
+            event
+            for event in controller.lifecycle_events
+            if event.lifecycle is ControllerLifecycle.COMPLETED
+        ]
+        assert len(completed) == 1
+        assert completed[0].detail == "native playback drained"
+        assert receipt_validated.is_set()
+        assert native_lease.close_calls == 0
+        host = claim.host
+        assert host._reservations == set()
+        assert host._acquisitions == {}
+        assert len(host._requests) == 0
         assert controller._event_task.done()
         assert controller._audio_task.done()
         assert controller._closed is True
