@@ -12,11 +12,17 @@ import pytest
 from agent.realtime_voice_admission import RealtimeSessionBinding, RealtimeUtterance
 from agent.realtime_voice_provider import (
     InputTranscript,
+    OutputAudio,
+    RealtimeCapability,
+    RealtimeOutputAudioFormat,
+    RealtimeResponseRequest,
     RealtimeToolResult,
     RealtimeVoiceEvent,
     RealtimeVoiceProvider,
     RealtimeVoiceSession,
     RealtimeVoiceSetup,
+    ResponseCompleted,
+    ResponseStarted,
     SessionReady,
     ToolCall,
     TranscriptProvenance,
@@ -67,10 +73,14 @@ async def _capture_factory(runner, source: SessionSource, route: str):
 
 class _InstalledSession(RealtimeVoiceSession):
     def __init__(self) -> None:
-        super().__init__(frozenset())
+        super().__init__(frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+        }))
         self.incoming: asyncio.Queue[RealtimeVoiceEvent] = asyncio.Queue()
         self.close_calls = 0
         self.tool_result_calls = 0
+        self.response_requests: list[RealtimeResponseRequest] = []
 
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         pass
@@ -81,6 +91,18 @@ class _InstalledSession(RealtimeVoiceSession):
         self.tool_result_calls += 1
         raise AssertionError("provider tools must remain inert")
 
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        response_id = "provider-native-response"
+        await self.incoming.put(ResponseStarted(response_id, request.turn_marker))
+        await self.incoming.put(OutputAudio(
+            b"\x00\x00", "provider-output-item", request.turn_marker, response_id
+        ))
+        await self.incoming.put(ResponseCompleted(response_id, request.turn_marker))
+
+    async def _cancel_response(self, response_id: str) -> None:
+        raise AssertionError("completed native response must not be cancelled")
+
     async def _events(self) -> AsyncIterator[RealtimeVoiceEvent]:
         while True:
             yield await self.incoming.get()
@@ -90,6 +112,11 @@ class _InstalledSession(RealtimeVoiceSession):
 
 
 class _InstalledProvider(RealtimeVoiceProvider):
+    capabilities = frozenset({
+        RealtimeCapability.EXPLICIT_RESPONSE,
+        RealtimeCapability.RESPONSE_CANCELLATION,
+    })
+
     def __init__(self, session: _InstalledSession) -> None:
         self.session = session
         self.open_calls = 0
@@ -197,6 +224,32 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
     monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
     monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", generic_tts_tripwire)
     monkeypatch.setattr(adapter, "play_tts", generic_audio_tripwire)
+
+    class _NativeLease:
+        def __init__(self) -> None:
+            self.pcm: list[bytes] = []
+
+        async def write_pcm(self, data: bytes) -> None:
+            self.pcm.append(data)
+
+        async def finish_and_wait(self, _timeout: float):
+            return object()
+
+        async def interrupt_and_wait(self, _timeout: float):
+            raise AssertionError("completed native playback must drain")
+
+    native_lease = _NativeLease()
+    guild_id = int(source.scope_id)
+    adapter._voice_clients[guild_id] = type(
+        "ConnectedVoice", (), {"is_connected": lambda self: True}
+    )()
+    adapter._voice_connection_generations[guild_id] = 1
+    adapter._voice_mixer_generations[guild_id] = 1
+    monkeypatch.setattr(
+        adapter,
+        "acquire_native_playback_lease",
+        AsyncMock(return_value=native_lease),
+    )
 
     async def send_canonical_response(*, chat_id, content, **_kwargs):
         canonical_sends.append((chat_id, content))
@@ -333,7 +386,11 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
     factory = captured_factories[0]
     attachment = await factory.open(
         provider.name,
-        RealtimeVoiceSetup(),
+        RealtimeVoiceSetup(output_audio=RealtimeOutputAudioFormat(
+            mime_type="audio/pcm", sample_rate_hz=24000, channels=1,
+            sample_encoding="pcm_s16le", sample_width_bytes=2,
+            endianness="little",
+        )),
         provider_session_id="provider-installed-session",
     )
     tool = ToolCall(
@@ -359,15 +416,18 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
         await session.incoming.put(final)
         await asyncio.wait_for(handler_started.wait(), timeout=5)
 
-        # Closing revokes only unconsumed attachment authority. The exact turn
-        # already accepted by the canonical handler remains host-owned.
-        await asyncio.wait_for(attachment.close(), timeout=5)
-        assert runner._is_session_running(route)
         release_handler.set()
         accepted = tuple(_ACCEPTED_TASKS)
         assert len(accepted) == 1
         results = await asyncio.wait_for(asyncio.gather(*accepted), timeout=5)
         assert len(results) == 1
+        for _ in range(500):
+            if session.response_requests and attachment._controller._native_response is None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("native response did not complete and drain")
+        await asyncio.wait_for(attachment.close(), timeout=5)
 
         rows = db.get_messages(entry.session_id, include_inactive=True)
         user_rows = [row for row in rows if row["role"] == "user"]
@@ -389,13 +449,17 @@ async def test_native_realtime_voice_turn_bypasses_generic_whole_file_auto_tts(
         assert receipt.turn_marker == marker
         assert receipt.user_message_id == user_row["id"]
         assert receipt.assistant_message_id == assistant_row["id"]
-        assert claim.host.validate_finalization(receipt)
+        assert not claim.host.validate_finalization(receipt)
         reread = db.get_messages(entry.session_id, include_inactive=True)
         reread_user = next(row for row in reread if row["id"] == user_row["id"])
         assert reread_user["display_kind"] == "realtime_voice_turn"
         assert reread_user["display_metadata"][_MARKER_KEY] == marker
 
         assert run_calls == ["installed voice turn"]
+        assert [request.canonical_text for request in session.response_requests] == [
+            "canonical installed response"
+        ]
+        assert native_lease.pcm == [b"\x00\x00"]
         assert canonical_sends == [(source.chat_id, "canonical installed response")]
         assert generic_tts_calls == []
         assert generic_audio_calls == []

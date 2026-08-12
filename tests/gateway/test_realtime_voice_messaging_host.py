@@ -928,7 +928,10 @@ async def test_accepted_canonical_work_survives_submit_waiter_cancellation():
 
 class _Session(RealtimeVoiceSession):
     def __init__(self):
-        super().__init__(frozenset())
+        super().__init__(frozenset({
+            RealtimeCapability.EXPLICIT_RESPONSE,
+            RealtimeCapability.RESPONSE_CANCELLATION,
+        }))
         self.closed = 0
         self.stop = asyncio.Event()
 
@@ -937,6 +940,12 @@ class _Session(RealtimeVoiceSession):
 
     async def _submit_tool_results(self, batch_id, results) -> None:
         raise AssertionError("provider tools are inert")
+
+    async def _start_response(self, request) -> None:
+        return None
+
+    async def _cancel_response(self, response_id: str) -> None:
+        return None
 
     async def _events(self) -> AsyncIterator[RealtimeVoiceEvent]:
         await self.stop.wait()
@@ -949,6 +958,11 @@ class _Session(RealtimeVoiceSession):
 
 
 class _Provider(RealtimeVoiceProvider):
+    capabilities = frozenset({
+        RealtimeCapability.EXPLICIT_RESPONSE,
+        RealtimeCapability.RESPONSE_CANCELLATION,
+    })
+
     def __init__(self, session: _Session):
         self.session = session
         self.opened = 0
@@ -1006,7 +1020,7 @@ async def test_factory_open_is_consumed_once_even_after_attachment_closes():
     try:
         attachment = await captured[0].open(
             provider.name,
-            RealtimeVoiceSetup(),
+            RealtimeVoiceSetup(output_audio=_native_output_format()),
             provider_session_id="provider-attachment-1",
         )
         await attachment.close()
@@ -1014,7 +1028,7 @@ async def test_factory_open_is_consumed_once_even_after_attachment_closes():
         with pytest.raises(PermissionError, match="already consumed"):
             await captured[0].open(
                 provider.name,
-                RealtimeVoiceSetup(),
+                RealtimeVoiceSetup(output_audio=_native_output_format()),
                 provider_session_id="provider-attachment-2",
             )
         assert provider.opened == 1
