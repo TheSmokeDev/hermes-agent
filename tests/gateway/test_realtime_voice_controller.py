@@ -138,6 +138,10 @@ class _Session(RealtimeVoiceSession):
         self.close_started.set()
         if self.block_close:
             await self.close_release.wait()
+        if getattr(self, "close_error", None) is not None:
+            error = self.close_error
+            self.close_error = None
+            raise error
 
 
 class _Provider(RealtimeVoiceProvider):
@@ -511,6 +515,9 @@ async def test_resume_retains_session_and_replay_ledger_and_fences_stale_generat
     await _eventually(lambda: len(session.response_requests) == 1)
     await session.incoming.put(ResponseStarted("response-1", "host-turn-1"))
     await _eventually(lambda: len(host.native_leases) == 1)
+    await session.incoming.put(
+        OutputAudio(b"\x01\x00", "output-1", "host-turn-1", "response-1")
+    )
     await session.incoming.put(ResponseCompleted("response-1", "host-turn-1"))
     await _eventually(lambda: len(host.native_retired) == 1)
     session.block_audio = True
@@ -790,6 +797,37 @@ async def test_cancelled_close_waiter_does_not_orphan_cleanup_or_terminal_event(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_provider_close_failure_is_retryable_and_closed_is_truthful(binding):
+    session = _Session()
+    session.close_error = RuntimeError("secret provider close failure")
+    assert register_provider(_Provider(session))
+    controller = GatewayRealtimeVoiceController(_Host())
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+
+    with pytest.raises(RuntimeError, match="secret provider close failure"):
+        await controller.close(reason="first")
+
+    assert session.close_calls == 1
+    assert controller._closed is False
+    assert controller._closing is True
+    assert not any(
+        event.lifecycle is ControllerLifecycle.CLOSED
+        for event in controller.lifecycle_events
+    )
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.FAILED
+    assert controller.lifecycle_events[-1].detail == "provider cleanup failed"
+
+    await controller.close(reason="retry")
+    assert session.close_calls == 2
+    assert controller._closed is True
+    assert sum(
+        event.lifecycle is ControllerLifecycle.CLOSED
+        for event in controller.lifecycle_events
+    ) == 1
+    assert all("secret" not in event.detail for event in controller.lifecycle_events)
 
 
 @pytest.mark.asyncio
@@ -1192,6 +1230,9 @@ async def test_provider_completion_waits_for_local_drain_before_retirement(bindi
     await session.incoming.put(ResponseStarted("response", "host-turn"))
     await _eventually(lambda: len(host.leases) == 1)
     lease = host.leases[0]
+    await session.incoming.put(
+        OutputAudio(b"\x01\x00", "item", "host-turn", "response")
+    )
     lease.finish_release.clear()
     await session.incoming.put(ResponseCompleted("response", "host-turn"))
     await lease.finish_entered.wait()
@@ -1542,6 +1583,95 @@ async def test_mutated_native_event_fields_are_revalidated_before_lease_methods(
     assert "lease_finish" not in host.order
 
 
+@pytest.mark.parametrize(
+    "first_event",
+    [
+        OutputAudio(b"\x01\x00", "item-a", "host-turn", "response"),
+        OutputTranscript("item-a", "host-turn", "response", "final", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_output_item_binding_rejects_later_audio_or_transcript_item(
+    binding, first_event
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    await controller._handle_event(first_event, 1)
+    writes_before = list(lease.writes)
+
+    wrong_event = (
+        OutputTranscript("item-b", "host-turn", "response", "final", True)
+        if type(first_event) is OutputAudio
+        else OutputAudio(b"\x02\x00", "item-b", "host-turn", "response")
+    )
+    try:
+        with pytest.raises(RuntimeError, match="native response item mismatch"):
+            await controller._handle_event(wrong_event, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert lease.writes == writes_before
+
+
+@pytest.mark.parametrize(
+    ("events", "error"),
+    [
+        ([ResponseCompleted("response", "host-turn")], "native response missing audio"),
+        ([OutputAudio(b"", "item", "host-turn", "response")], "invalid native response event"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_completion_requires_successful_nonempty_audio_write(
+    binding, events, error
+):
+    controller, _session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+
+    try:
+        with pytest.raises(RuntimeError, match=error):
+            for event in events:
+                await controller._handle_event(event, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert lease.writes == []
+    assert lease.finish_calls == 0
+    assert host.retire_calls == 1  # close interrupts; completion did not retire
+    assert ControllerLifecycle.COMPLETED not in {
+        event.lifecycle for event in controller.lifecycle_events
+    }
+
+
+@pytest.mark.asyncio
+async def test_output_transcripts_are_bounded_and_not_retained_in_lifecycle(binding):
+    controller, _session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    baseline = len(controller.lifecycle_events)
+    for index in range(20):
+        await controller._handle_event(
+            OutputTranscript(
+                "item", "host-turn", "response", f"provider-{index}", True
+            ),
+            1,
+        )
+    projected = controller.lifecycle_events[baseline:]
+    assert len(projected) == 20
+    assert all(event.provider_event is None for event in projected)
+    assert max(map(len, (event.detail for event in projected))) <= 32
+
+    hostile = OutputTranscript("item", "host-turn", "response", "ok", True)
+    object.__setattr__(hostile, "text", _HostileString("x" * 5_000_000))
+    try:
+        with pytest.raises(RuntimeError, match="invalid native response event"):
+            await controller._handle_event(hostile, 1)
+    finally:
+        await controller.close(reason="test cleanup")
+
+    assert host.leases[0].writes == []
+
+
 @pytest.mark.asyncio
 async def test_interrupt_waits_for_blocked_acquire_then_terminalizes_exact_lease(
     binding,
@@ -1574,6 +1704,9 @@ async def test_interrupt_preempts_blocked_finish_and_retires_only_interrupt_rece
     controller, session, host = await _open_pending_native_response(binding)
     await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
     lease = host.leases[0]
+    await controller._handle_event(
+        OutputAudio(b"\x01\x00", "item", "host-turn", "response"), 1
+    )
     lease.finish_release.clear()
     completing = asyncio.create_task(
         controller._handle_event(ResponseCompleted("response", "host-turn"), 1)
@@ -1730,6 +1863,15 @@ async def test_terminal_response_tombstones_are_bounded_and_reject_late_duplicat
         assert len(session.response_requests) == index + 1
         await controller._handle_event(
             ResponseStarted(f"response-{index}", f"host-turn-{index}"), 1
+        )
+        await controller._handle_event(
+            OutputAudio(
+                b"\x01\x00",
+                f"output-{index}",
+                f"host-turn-{index}",
+                f"response-{index}",
+            ),
+            1,
         )
         await controller._handle_event(
             ResponseCompleted(f"response-{index}", f"host-turn-{index}"), 1

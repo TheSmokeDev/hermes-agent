@@ -149,6 +149,7 @@ _NATIVE_EVENT_TYPES = (
     ResponseCompleted,
 )
 _MAX_NATIVE_IDENTIFIER_BYTES = 256
+_MAX_NATIVE_AUDIO_BYTES = (1 << 63) - 1
 
 
 def _validate_native_identifier(value: object) -> str:
@@ -165,7 +166,9 @@ def _validate_native_identifier(value: object) -> str:
     return value
 
 
-def _validate_native_event(event: RealtimeVoiceEvent) -> None:
+def _validate_native_event(
+    event: RealtimeVoiceEvent, *, max_transcript_chars: int
+) -> None:
     event_type = type(event)
     if event_type not in _NATIVE_EVENT_TYPES:
         if isinstance(event, _NATIVE_EVENT_TYPES):
@@ -187,15 +190,23 @@ def _validate_native_event(event: RealtimeVoiceEvent) -> None:
     _validate_native_identifier(event.turn_id)
     _validate_native_identifier(event.response_id)
     if event_type is OutputAudio:
-        if type(event.data) is not bytes:
+        if type(event.data) is not bytes or not event.data:
             raise RuntimeError("invalid native response event")
         return
     if (
         type(event.text) is not str
+        or len(event.text) > max_transcript_chars
         or type(event.final) is not bool
+        or event.final is not True
         or event.role is not TranscriptRole.ASSISTANT
         or event.provenance is not TranscriptProvenance.ASSISTANT_OUTPUT_AUDIO
     ):
+        raise RuntimeError("invalid native response event")
+    try:
+        encoded_text = event.text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError("invalid native response event") from exc
+    if len(encoded_text) > max_transcript_chars:
         raise RuntimeError("invalid native response event")
 
 
@@ -207,6 +218,8 @@ class _NativeResponseState:
     lease_id: str
     response_id: str | None = None
     turn_id: str | None = None
+    item_id: str | None = None
+    successful_audio_bytes: int = 0
     lease: object | None = None
     acquire_task: asyncio.Task[object] | None = None
     operation_task: asyncio.Task[object] | None = None
@@ -591,7 +604,7 @@ class GatewayRealtimeVoiceController:
     async def _handle_native_event(
         self, event: RealtimeVoiceEvent, generation: int
     ) -> None:
-        _validate_native_event(event)
+        _validate_native_event(event, max_transcript_chars=self._max_transcript_chars)
         async with self._native_lock:
             state = self._native_response
             event_identity = (event.response_id, event.turn_id)
@@ -637,17 +650,26 @@ class GatewayRealtimeVoiceController:
                     raise RuntimeError("native response identity mismatch")
                 if state.provider_completed:
                     raise RuntimeError("native response event after completion")
+                if type(event) in (OutputAudio, OutputTranscript):
+                    if state.item_id is None:
+                        state.item_id = event.item_id
+                    elif event.item_id != state.item_id:
+                        raise RuntimeError("native response item mismatch")
                 if type(event) is OutputTranscript:
                     self._emit(
                         self._lifecycle_events[-1].lifecycle,
-                        provider_event=event,
+                        detail="native output transcript",
                     )
                     return
                 if type(event) is OutputAudio:
+                    if len(event.data) > _MAX_NATIVE_AUDIO_BYTES - state.successful_audio_bytes:
+                        raise RuntimeError("native response audio limit exceeded")
                     operation = self._create_native_task(lease.write_pcm(event.data))
                     state.operation_task = operation
                     terminal_task = None
                 else:
+                    if state.successful_audio_bytes == 0:
+                        raise RuntimeError("native response missing audio")
                     state.provider_completed = True
                     terminal_task = self._claim_native_terminal_locked(state, "drain")
                     operation = None
@@ -699,7 +721,9 @@ class GatewayRealtimeVoiceController:
                         state.operation_task = None
             async with self._native_lock:
                 active = self._native_response is state and not state.interrupted
-                emit_speaking = active and bool(event.data) and not state.speaking
+                if active:
+                    state.successful_audio_bytes += len(event.data)
+                emit_speaking = active and not state.speaking
                 if emit_speaking:
                     state.speaking = True
             if emit_speaking:
@@ -1107,7 +1131,7 @@ class GatewayRealtimeVoiceController:
             if self._closed:
                 return
             close_task = self._close_task
-            if close_task is None:
+            if close_task is None or (close_task.done() and close_task.exception() is not None):
                 self._closing = True
                 close_task = asyncio.create_task(self._finish_close(reason))
                 self._close_task = close_task
@@ -1161,12 +1185,13 @@ class GatewayRealtimeVoiceController:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         session = self._session
+        provider_cleanup_failure: BaseException | None = None
         if session is not None:
             try:
                 await session.close()
-            except BaseException:
-                if cleanup_detail is None:
-                    cleanup_detail = "controller cleanup failed"
+            except BaseException as exc:
+                provider_cleanup_failure = exc
+                cleanup_detail = "provider cleanup failed"
         close_attachment = getattr(self._host, "close_attachment", None)
         host_cleanup_failure: BaseException | None = None
         if callable(close_attachment):
@@ -1186,6 +1211,8 @@ class GatewayRealtimeVoiceController:
             and self._lifecycle_events[-1].detail == cleanup_detail
         ):
             self._emit(ControllerLifecycle.FAILED, detail=cleanup_detail)
+        if provider_cleanup_failure is not None:
+            raise provider_cleanup_failure
         self._emit(ControllerLifecycle.CLOSING, detail=final_detail)
         self._closed = True
         self._emit(ControllerLifecycle.CLOSED, detail=final_detail)
