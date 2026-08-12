@@ -68,6 +68,125 @@ class TestVoiceMixerCore:
         await replacement.close()
 
     @pytest.mark.asyncio
+    async def test_native_identity_is_normalized_bounded_before_mutation(self):
+        mx = vm.VoiceMixer()
+        for field in range(3):
+            values = ["lease", "response", "turn"]
+            values[field] = " "
+            with pytest.raises(ValueError):
+                mx.acquire_native_playback(*values, 1)
+            values[field] = "x" * (vm.NATIVE_ID_MAX_CHARS + 1)
+            with pytest.raises(ValueError):
+                mx.acquire_native_playback(*values, 1)
+        with pytest.raises(TypeError):
+            mx.acquire_native_playback("lease", "response", "turn", True)
+        lease = mx.acquire_native_playback(" lease ", " response ", " turn ", 1)
+        assert (lease.lease_id, lease.response_id, lease.turn_marker) == (
+            "lease", "response", "turn"
+        )
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_capacity_counts_frame_returned_until_next_read_acknowledges_it(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        payload = struct.pack("<960h", *range(960))
+        writer = asyncio.create_task(lease.write_pcm(payload))
+        while not lease._space_waiters:
+            await asyncio.sleep(0)
+        mx.read()
+        for _ in range(3):
+            barrier = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(barrier.set_result, None)
+            await barrier
+        assert not writer.done()
+        assert len(lease._frames) == 0
+        mx.read()
+        await asyncio.wait_for(writer, 1)
+        await lease.interrupt_and_wait(1)
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_interrupted_multiframe_write_reports_only_irrevocably_accepted_bytes(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        payload = struct.pack("<960h", *range(960))
+        writer = asyncio.create_task(lease.write_pcm(payload))
+        while not lease._space_waiters:
+            await asyncio.sleep(0)
+        interrupting = asyncio.create_task(lease.interrupt_and_wait(1))
+        with pytest.raises(RuntimeError):
+            await writer
+        receipt = await interrupting
+        assert receipt.accepted_provider_bytes == 960
+        assert receipt.lease_frames == 1
+        assert not lease._frames and not lease._space_waiters
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_terminal_calls_share_one_exact_winner_receipt(self):
+        mx = vm.VoiceMixer()
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        finish = asyncio.create_task(lease.finish_and_wait(1))
+        interrupt = asyncio.create_task(lease.interrupt_and_wait(1))
+        first, second = await asyncio.gather(finish, interrupt)
+        assert first is second
+        assert first.interrupted is False
+        assert mx.validate_native_receipt(first, lease) is first
+        await lease.close()
+
+    @pytest.mark.asyncio
+    async def test_close_interrupts_terminal_queued_frames_and_concurrent_waiters_share_cleanup(self):
+        mx = vm.VoiceMixer()
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        await lease.write_pcm(struct.pack("<h", 7))
+        finishing = asyncio.create_task(lease.finish_and_wait(1))
+        while not lease._terminal:
+            await asyncio.sleep(0)
+        first = asyncio.create_task(lease.close())
+        second = asyncio.create_task(lease.close())
+        await asyncio.wait_for(asyncio.gather(first, second), 1)
+        receipt = await finishing
+        assert receipt.interrupted is True
+        assert mx._native_lease is None
+        assert not lease._frames and not lease._space_waiters
+
+    @pytest.mark.asyncio
+    async def test_cleanup_synchronously_fences_and_converges_active_lease(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        writer = asyncio.create_task(lease.write_pcm(struct.pack("<960h", *range(960))))
+        while not lease._space_waiters:
+            await asyncio.sleep(0)
+        mx.cleanup()
+        assert mx._closed and mx._native_lease is None
+        assert lease._terminal and lease._interrupted
+        assert not lease._frames and not lease._space_waiters
+        with pytest.raises(RuntimeError):
+            mx.acquire_native_playback("new", "response", "turn", 2)
+        with pytest.raises(RuntimeError):
+            await writer
+        await asyncio.wait_for(lease.close(), 1)
+
+    @pytest.mark.asyncio
+    async def test_write_admission_is_single_and_payload_is_bounded_before_retention(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        payload = struct.pack("<960h", *range(960))
+        first = asyncio.create_task(lease.write_pcm(payload))
+        while not lease._space_waiters:
+            await asyncio.sleep(0)
+        with pytest.raises(RuntimeError):
+            await lease.write_pcm(b"\x00\x00")
+        with pytest.raises(ValueError):
+            await lease.write_pcm(b"\x00" * (lease.max_write_bytes + 1))
+        await lease.interrupt_and_wait(1)
+        with pytest.raises(RuntimeError):
+            await first
+        assert not lease._write_reserved
+        await lease.close()
+
+    @pytest.mark.asyncio
     async def test_native_conversion_and_honest_sender_boundary_drain(self):
         mx = vm.VoiceMixer(native_frame_capacity=1)
         lease = mx.acquire_native_playback("lease", "response", "turn", 1)
@@ -114,13 +233,14 @@ class TestVoiceMixerCore:
         lease = mx.acquire_native_playback("lease", "response", "turn", 1)
         payload = struct.pack("<960h", *range(960))
         writer = asyncio.create_task(lease.write_pcm(payload))
-        await asyncio.sleep(0)
+        while not lease._space_waiters:
+            await asyncio.sleep(0)
         assert not writer.done()
         first = mx.read()
-        await asyncio.sleep(0)
         assert not writer.done()
-        second = mx.read()
+        mx.read()  # acknowledges first; producer may now enqueue the second
         await asyncio.wait_for(writer, 1)
+        second = mx.read()
         assert len(first) == len(second) == 3840
         interrupting = asyncio.create_task(lease.interrupt_and_wait(1))
         await asyncio.sleep(0)
