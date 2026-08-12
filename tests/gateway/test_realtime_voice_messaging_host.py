@@ -4,13 +4,14 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agent.realtime_voice_admission import RealtimeSessionBinding, RealtimeUtterance
 from agent.realtime_voice_provider import (
     RealtimeCapability,
+    RealtimeOutputAudioFormat,
     RealtimeTool,
     RealtimeVoiceEvent,
     RealtimeVoiceProvider,
@@ -30,7 +31,7 @@ def _source() -> SessionSource:
         chat_type="group",
         user_id="123456789",
         thread_id="thread-1",
-        scope_id="guild-1",
+        scope_id="111",
     )
 
 
@@ -108,6 +109,156 @@ def _utterance(text: str = "hello from voice") -> RealtimeUtterance:
         text=text,
         received_at=1.0,
     )
+
+
+def _native_output_format() -> RealtimeOutputAudioFormat:
+    return RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_rate_hz=24000,
+        channels=1,
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reserve_native_output_uses_exact_persisted_text_and_live_adapter_authority():
+    import hashlib
+
+    from gateway.realtime_voice_messaging_host import (
+        GatewayRealtimeVoiceMessagingHost,
+        RealtimeVoiceFinalizationReceipt,
+    )
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    marker = "turn-marker"
+    rows = [
+        {
+            "id": 10,
+            "role": "user",
+            "content": "hello from voice",
+            "display_metadata": {"realtime_voice_turn_marker": marker},
+        },
+        {
+            "id": 11,
+            "role": "assistant",
+            "content": "canonical answer",
+            "tool_calls": [],
+        },
+    ]
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(get_messages=MagicMock(return_value=rows))
+    )
+    adapter = runner.adapters[Platform.DISCORD]
+    adapter._voice_clients[111] = SimpleNamespace(is_connected=lambda: True)
+    adapter._voice_connection_generations[111] = 4
+    adapter._voice_mixer_generations[111] = 7
+    host = GatewayRealtimeVoiceMessagingHost(
+        captured[0], runner, output_audio_format=_native_output_format()
+    )
+    receipt = RealtimeVoiceFinalizationReceipt("durable-1", marker, 10, 11)
+    host._finalizations.add(receipt)
+
+    reservation = await host.reserve_native_output(
+        _binding(build_session_key(source)), receipt
+    )
+
+    assert reservation.canonical_text == "canonical answer"
+    assert reservation.content_digest == hashlib.sha256(
+        b"canonical answer"
+    ).hexdigest()
+    assert reservation.output_audio_format is host._output_audio_format
+    assert reservation.guild_id == 111
+    assert reservation.connection_generation == 4
+    assert reservation.mixer_generation == 7
+    assert reservation.selection_generation == 3
+    lease = object()
+    adapter.acquire_native_playback_lease = AsyncMock(return_value=lease)
+    assert (
+        await host.acquire_native_playback(
+            reservation,
+            lease_id="lease-1",
+            response_id="response-1",
+            transport_generation=3,
+        )
+        is lease
+    )
+    adapter.acquire_native_playback_lease.assert_awaited_once_with(
+        111,
+        "lease-1",
+        "response-1",
+        marker,
+        4,
+        7,
+        input_format="pcm_s16le",
+        sample_rate=24000,
+        channels=1,
+    )
+    with pytest.raises(PermissionError, match="consumed"):
+        await host.reserve_native_output(_binding(build_session_key(source)), receipt)
+
+
+@pytest.mark.asyncio
+async def test_failed_durable_lookup_consumes_finalization_receipt_once():
+    from gateway.realtime_voice_messaging_host import (
+        GatewayRealtimeVoiceMessagingHost,
+        RealtimeVoiceFinalizationReceipt,
+    )
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    db = MagicMock(get_messages=MagicMock(side_effect=RuntimeError("db unavailable")))
+    runner._session_db = SimpleNamespace(_db=db)
+    host = GatewayRealtimeVoiceMessagingHost(
+        captured[0], runner, output_audio_format=_native_output_format()
+    )
+    receipt = RealtimeVoiceFinalizationReceipt("durable-1", "marker", 1, 2)
+    host._finalizations.add(receipt)
+
+    with pytest.raises(RuntimeError, match="db unavailable"):
+        await host.reserve_native_output(_binding(build_session_key(source)), receipt)
+    with pytest.raises(PermissionError, match="consumed"):
+        await host.reserve_native_output(_binding(build_session_key(source)), receipt)
+    db.get_messages.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reservation_rejects_coercive_durable_row_ids():
+    from gateway.realtime_voice_messaging_host import (
+        GatewayRealtimeVoiceMessagingHost,
+        RealtimeVoiceFinalizationReceipt,
+    )
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    marker = "marker"
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(
+            get_messages=MagicMock(
+                return_value=[
+                    {
+                        "id": True,
+                        "role": "user",
+                        "content": "voice",
+                        "display_metadata": {
+                            "realtime_voice_turn_marker": marker
+                        },
+                    },
+                    {"id": 2, "role": "assistant", "content": "answer"},
+                ]
+            )
+        )
+    )
+    host = GatewayRealtimeVoiceMessagingHost(
+        captured[0], runner, output_audio_format=_native_output_format()
+    )
+    receipt = RealtimeVoiceFinalizationReceipt("durable-1", marker, 1, 2)
+    host._finalizations.add(receipt)
+
+    with pytest.raises(PermissionError, match="rows"):
+        await host.reserve_native_output(_binding(build_session_key(source)), receipt)
 
 
 def test_magic_mock_event_without_installed_claim_is_ordinary():
@@ -499,14 +650,16 @@ async def test_factory_composes_one_controller_provider_and_idempotent_teardown(
     provider = _Provider(session)
     assert register_provider(provider)
     try:
+        output_format = _native_output_format()
         attachment = await captured[0].open(
             provider.name,
-            RealtimeVoiceSetup(),
+            RealtimeVoiceSetup(output_audio=output_format),
             provider_session_id="provider-attachment-1",
         )
         assert attachment.binding.routing_key == build_session_key(source)
         assert attachment.binding.durable_session_id == "durable-1"
         assert provider.opened == 1
+        assert attachment._controller._host._output_audio_format is output_format
 
         await attachment.close()
         await attachment.close()
