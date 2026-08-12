@@ -242,6 +242,141 @@ async def test_forged_native_output_request_cannot_validate_or_acquire():
     adapter.acquire_native_playback_lease.assert_not_awaited()
 
 
+async def _issued_native_output_request():
+    from gateway.realtime_voice_messaging_host import (
+        GatewayRealtimeVoiceMessagingHost,
+        RealtimeVoiceFinalizationReceipt,
+    )
+
+    runner, source, _entry, captured, capture = _host_fixture()
+    await capture()
+    marker = "immutable-marker"
+    runner._session_db = SimpleNamespace(
+        _db=MagicMock(
+            get_messages=MagicMock(
+                return_value=[
+                    {
+                        "id": 1,
+                        "role": "user",
+                        "content": "voice",
+                        "display_metadata": {
+                            "realtime_voice_turn_marker": marker
+                        },
+                    },
+                    {
+                        "id": 2,
+                        "role": "assistant",
+                        "content": "canonical answer",
+                        "tool_calls": [],
+                    },
+                ]
+            )
+        )
+    )
+    adapter = runner.adapters[Platform.DISCORD]
+    adapter._voice_clients[111] = SimpleNamespace(is_connected=lambda: True)
+    adapter._voice_connection_generations[111] = 4
+    adapter._voice_mixer_generations[111] = 7
+    adapter.acquire_native_playback_lease = AsyncMock()
+    host = GatewayRealtimeVoiceMessagingHost(
+        captured[0], runner, output_audio_format=_native_output_format()
+    )
+    receipt = RealtimeVoiceFinalizationReceipt("durable-1", marker, 1, 2)
+    host._finalizations.add(receipt)
+    request = await host.reserve_native_output(
+        _binding(build_session_key(source)), receipt
+    )
+    return host, request, adapter
+
+
+@pytest.mark.asyncio
+async def test_mutated_request_and_matching_reservation_digest_reject_before_adapter():
+    import hashlib
+
+    host, request, adapter = await _issued_native_output_request()
+    assert host.validate_native_output_request(request) is request
+    attacker_text = "ATTACKER substituted answer"
+    object.__setattr__(request, "canonical_text", attacker_text)
+    object.__setattr__(
+        request.reservation,
+        "content_digest",
+        hashlib.sha256(attacker_text.encode("utf-8")).hexdigest(),
+    )
+
+    with pytest.raises(PermissionError, match="forged or stale"):
+        host.validate_native_output_request(request)
+    with pytest.raises(PermissionError, match="forged or stale"):
+        await host.acquire_native_playback(
+            request,
+            lease_id="lease",
+            response_id="response",
+            transport_generation=1,
+        )
+    adapter.acquire_native_playback_lease.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hostile_canonical_text_rejects_on_exact_type_without_method_execution():
+    class HostileText:
+        def __len__(self):
+            raise AssertionError("hostile len executed")
+
+        def strip(self):
+            raise AssertionError("hostile strip executed")
+
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("hostile encode executed")
+
+    class HostileStr(str):
+        def strip(self, *_args, **_kwargs):
+            raise AssertionError("hostile strip executed")
+
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("hostile encode executed")
+
+    host, request, adapter = await _issued_native_output_request()
+    for hostile in (HostileText(), HostileStr("canonical answer")):
+        object.__setattr__(request, "canonical_text", hostile)
+        with pytest.raises(PermissionError, match="forged or stale"):
+            host.validate_native_output_request(request)
+    adapter.acquire_native_playback_lease.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("durable_session_id", "durable-attacker"),
+        ("assistant_message_id", 999),
+        ("turn_marker", "attacker-marker"),
+        ("selection_generation", 999),
+        ("guild_id", 999),
+        ("connection_generation", 999),
+        ("mixer_generation", 999),
+        ("output_audio_format", None),
+    ],
+)
+async def test_mutated_reservation_authority_rejects_against_issuance_proof(
+    field, replacement
+):
+    host, request, adapter = await _issued_native_output_request()
+    object.__setattr__(request.reservation, field, replacement)
+
+    with pytest.raises(PermissionError, match="forged or stale"):
+        host.validate_native_output_request(request)
+    adapter.acquire_native_playback_lease.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mutated_output_format_value_rejects_against_issuance_proof():
+    host, request, adapter = await _issued_native_output_request()
+    object.__setattr__(request.reservation.output_audio_format, "sample_rate_hz", 48000)
+
+    with pytest.raises(PermissionError, match="forged or stale"):
+        host.validate_native_output_request(request)
+    adapter.acquire_native_playback_lease.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_retire_native_output_drops_active_authority_but_preserves_replay_tombstone():
     from gateway.realtime_voice_messaging_host import (
