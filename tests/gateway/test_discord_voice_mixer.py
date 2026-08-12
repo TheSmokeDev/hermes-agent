@@ -7,15 +7,19 @@ integration (install on join, play routing, ack) is tested with the standard
 ``object.__new__(DiscordAdapter)`` helper used elsewhere in the voice suite.
 """
 
+import asyncio
 import os
+import struct
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# numpy ships only in the optional "voice" extra (not [all,dev]); the mixer
-# math needs it, so skip this whole module when it isn't installed.
-np = pytest.importorskip("numpy")
+# Only ambient synthesis needs NumPy. Core mixing and native playback do not.
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised in an isolated import test
+    np = None
 
 # voice_mixer lives inside the discord plugin package dir; import by path the
 # same way the adapter does.
@@ -51,6 +55,94 @@ class TestVoiceMixerCore:
         # discord.py sends raw PCM when is_opus() is False.
         assert vm.VoiceMixer().is_opus() is False
 
+    @pytest.mark.asyncio
+    async def test_native_lease_requires_exact_identity_and_is_exclusive(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        with pytest.raises(TypeError):
+            mx.acquire_native_playback(str("lease"), "response", "turn", True)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        with pytest.raises(RuntimeError):
+            mx.acquire_native_playback("other", "response", "turn", 2)
+        await lease.close()
+        replacement = mx.acquire_native_playback("other", "response", "turn", 2)
+        await replacement.close()
+
+    @pytest.mark.asyncio
+    async def test_native_conversion_and_honest_sender_boundary_drain(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        pcm = struct.pack("<hhh", 0, 2, -3)
+        await lease.write_pcm(pcm)
+        finishing = asyncio.create_task(lease.finish_and_wait(1))
+        await asyncio.sleep(0)
+        assert not finishing.done()
+        frame = mx.read()
+        assert struct.unpack("<12h", frame[:24]) == (0, 0, 0, 0, 1, 1, 2, 2, 0, 0, -3, -3)
+        assert not finishing.done()
+        mx.read()  # acknowledges the prior synchronous sender return
+        receipt = await finishing
+        assert receipt.accepted_provider_bytes == len(pcm)
+        assert receipt.lease_frames == 1
+        assert receipt.interrupted is False
+
+    @pytest.mark.asyncio
+    async def test_chunk_permutations_odd_eos_and_exact_geometry(self):
+        pcm = struct.pack("<480h", *range(480))
+        outputs = []
+        for chunks in ([pcm], [pcm[:1], pcm[1:]], [pcm[i:i + 1] for i in range(len(pcm))]):
+            mx = vm.VoiceMixer()
+            lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+            for chunk in chunks:
+                await lease.write_pcm(chunk)
+            finishing = asyncio.create_task(lease.finish_and_wait(1))
+            await asyncio.sleep(0)
+            outputs.append(mx.read())
+            mx.read()
+            await finishing
+        assert outputs[0] == outputs[1] == outputs[2]
+        assert len(outputs[0]) == 3840
+
+        mx = vm.VoiceMixer()
+        lease = mx.acquire_native_playback("odd", "response", "turn", 2)
+        await lease.write_pcm(b"\x00")
+        with pytest.raises(ValueError):
+            await lease.finish_and_wait(1)
+
+    @pytest.mark.asyncio
+    async def test_bounded_write_interrupt_and_receipt_identity(self):
+        mx = vm.VoiceMixer(native_frame_capacity=1)
+        lease = mx.acquire_native_playback("lease", "response", "turn", 1)
+        payload = struct.pack("<960h", *range(960))
+        writer = asyncio.create_task(lease.write_pcm(payload))
+        await asyncio.sleep(0)
+        assert not writer.done()
+        first = mx.read()
+        await asyncio.sleep(0)
+        assert not writer.done()
+        second = mx.read()
+        await asyncio.wait_for(writer, 1)
+        assert len(first) == len(second) == 3840
+        interrupting = asyncio.create_task(lease.interrupt_and_wait(1))
+        await asyncio.sleep(0)
+        assert not interrupting.done()
+        mx.read()
+        receipt = await interrupting
+        assert receipt.interrupted is True
+        assert receipt.accepted_provider_bytes == len(payload)
+        forged = vm.NativePlaybackReceipt(
+            receipt.lease_id, receipt.response_id, receipt.turn_marker,
+            receipt.generation, receipt.accepted_provider_bytes,
+            receipt.lease_frames, receipt.interrupted,
+        )
+        assert mx.validate_native_receipt(receipt, lease) is receipt
+        with pytest.raises(ValueError):
+            mx.validate_native_receipt(forged, lease)
+        with pytest.raises(RuntimeError):
+            await lease.write_pcm(b"\x00\x00")
+        await lease.close()
+        await lease.close()
+
+    @pytest.mark.skipif(np is None, reason="ambient synthesis requires optional NumPy")
     def test_ambient_loops_and_is_quiet(self):
         mx = vm.VoiceMixer(ambient_gain=0.2)
         amb = vm.synth_ambient_pcm(seconds=0.5)
