@@ -2307,17 +2307,23 @@ async def test_provider_start_failure_retires_pending_barge_in_without_fallback(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", ["close", "closed"])
+@pytest.mark.parametrize("terminal", ["close", "failure", "closed"])
 async def test_lifecycle_terminal_immediately_retires_pending_response_start(
     binding, terminal,
 ):
-    session = _Session()
+    session = _Session(
+        frozenset({RealtimeCapability.SESSION_RESUMPTION})
+        if terminal == "failure"
+        else frozenset()
+    )
     session.block_start = True
     session.start_release.clear()
     assert register_provider(_Provider(session))
     host = _NativeHost()
     controller = GatewayRealtimeVoiceController(host)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
+    if terminal == "failure":
+        await controller._handle_event(SessionReady(session_id="resume-token"), 1)
     starting = asyncio.create_task(controller._handle_event(
         InputTranscript(
             "input", "input-turn", "question", True,
@@ -2338,7 +2344,11 @@ async def test_lifecycle_terminal_immediately_retires_pending_response_start(
     if terminal == "close":
         terminalizing = asyncio.create_task(controller.close(reason="operator close"))
     else:
-        event = SessionClosed(reason="provider closed")
+        event = (
+            SessionFailure(code="network", message="lost")
+            if terminal == "failure"
+            else SessionClosed(reason="provider closed")
+        )
         terminalizing = asyncio.create_task(controller._handle_event(event, 1))
     await asyncio.wait_for(terminalizing, timeout=0.2)
     await asyncio.wait_for(starting, timeout=0.2)
@@ -2351,6 +2361,21 @@ async def test_lifecycle_terminal_immediately_retires_pending_response_start(
         if task is not asyncio.current_task()
         and task.get_coro().__qualname__.endswith("start_response")
     ]
+    if terminal == "failure":
+        assert controller._reconnecting is True
+        await asyncio.wait_for(controller.resume(), timeout=0.2)
+        assert controller._transport_generation == 2
+        assert controller._event_task is not None and not controller._event_task.done()
+        assert controller._audio_task is not None and not controller._audio_task.done()
+        await controller._handle_event(
+            InputTranscript(
+                "speech-item", "stale-turn", "stale", True,
+                TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+            ),
+            1,
+        )
+        assert [item.text for item in host.submitted] == ["question"]
+        await controller.close(reason="test")
 
 
 @pytest.mark.asyncio

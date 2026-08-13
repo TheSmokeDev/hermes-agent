@@ -487,6 +487,7 @@ class GatewayRealtimeVoiceController:
                 if resumable:
                     await self.interrupt()
                     self._reconnecting = True
+                    await self._stop_event_for_reconnect()
                     await self._stop_audio_for_reconnect()
                     self._emit(
                         ControllerLifecycle.RECONNECTING,
@@ -1255,6 +1256,13 @@ class GatewayRealtimeVoiceController:
             if not self._closing:
                 self._emit(ControllerLifecycle.FAILED, detail="audio send failed")
                 await self.close(reason="audio send failed")
+
+    async def _stop_event_for_reconnect(self) -> None:
+        task = self._event_task
+        self._event_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def _stop_audio_for_reconnect(self) -> None:
         task = self._audio_task
