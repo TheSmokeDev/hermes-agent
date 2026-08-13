@@ -19,6 +19,7 @@ from agent.realtime_voice_admission import (
 from agent.realtime_voice_provider import (
     InputSpeechStarted,
     InputTranscript,
+    Interruption,
     OutputAudio,
     OutputTranscript,
     RealtimeOutputAudioFormat,
@@ -1388,6 +1389,56 @@ async def test_speech_start_upgrades_blocked_drain_without_blocking_event_pump(b
     }
     await _eventually(lambda: len(host.retired) == 1)
     assert len(host.retired) == 1
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_replacement_final_waits_for_three_exact_barge_in_gates(binding):
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    first = InputTranscript(
+        "input", "input-turn", "question", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    await session.incoming.put(first)
+    await session.response_started.wait()
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await _eventually(lambda: len(host.leases) == 1)
+    lease = host.leases[0]
+    lease.block_lease_interrupt = True
+    lease.interrupt_release.clear()
+
+    replacement = InputTranscript(
+        "speech-item", "replacement-turn", "replacement", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    await session.incoming.put(InputSpeechStarted("speech-item", 123))
+    await session.incoming.put(replacement)
+    await session.cancel_entered.wait()
+    await lease.interrupt_entered.wait()
+    await host.interrupt_entered.wait()
+    assert [item.text for item in host.submitted] == ["question"]
+
+    lease.interrupt_release.set()
+    host.interrupt_release.set()
+    await _eventually(
+        lambda: controller._barge_in_barrier.playback_terminal.is_set()
+        and controller._barge_in_barrier.host_terminal.is_set()
+    )
+    assert len(host.retired) == 1
+    assert [item.text for item in host.submitted] == ["question"]
+    assert controller._barge_in_barrier is not None
+    assert controller._barge_in_barrier.transcript is replacement
+
+    await session.incoming.put(Interruption("response", "host-turn"))
+    await _eventually(lambda: len(host.submitted) == 2)
+    assert [item.text for item in host.submitted] == ["question", "replacement"]
+    assert controller._barge_in_barrier is None
     await controller.close(reason="test")
 
 

@@ -19,6 +19,7 @@ from agent.realtime_voice_orchestrator import open_realtime_voice_session
 from agent.realtime_voice_provider import (
     InputSpeechStarted,
     InputTranscript,
+    Interruption,
     OutputAudio,
     OutputTranscript,
     RealtimeCapability,
@@ -148,6 +149,7 @@ _NATIVE_EVENT_TYPES = (
     OutputAudio,
     OutputTranscript,
     ResponseCompleted,
+    Interruption,
 )
 _MAX_NATIVE_IDENTIFIER_BYTES = 256
 _MAX_NATIVE_AUDIO_BYTES = (1 << 63) - 1
@@ -181,10 +183,13 @@ def _validate_native_event(
         if event.continuation_of_batch_id is not None:
             raise RuntimeError("invalid native response event")
         return
-    if event_type is ResponseCompleted:
+    if event_type in (ResponseCompleted, Interruption):
         _validate_native_identifier(event.response_id)
         _validate_native_identifier(event.turn_id)
-        if event.continuation_of_batch_id is not None:
+        if (
+            event_type is ResponseCompleted
+            and event.continuation_of_batch_id is not None
+        ):
             raise RuntimeError("invalid native response event")
         return
     _validate_native_identifier(event.item_id)
@@ -233,6 +238,7 @@ class _NativeResponseState:
     lease_terminal_started: bool = False
     receipt_validated: bool = False
     retired: bool = False
+    playback_interrupted: bool = False
 
 
 @dataclass(slots=True)
@@ -511,7 +517,25 @@ class GatewayRealtimeVoiceController:
         if type(event) is InputSpeechStarted:
             await self._handle_speech_started(event, generation)
             return
-        if isinstance(event, InputTranscript):
+        if type(event) is InputTranscript:
+            async with self._native_lock:
+                barrier = self._barge_in_barrier
+                if (
+                    barrier is not None
+                    and barrier.transport_generation == generation
+                    and event.item_id == barrier.speech_item_id
+                    and barrier.transcript is None
+                    and event.final is True
+                    and event.role is TranscriptRole.OPERATOR
+                    and event.provenance is TranscriptProvenance.OPERATOR_INPUT
+                    and type(event.text) is str
+                    and bool(event.text.strip())
+                    and len(event.text) <= self._max_transcript_chars
+                    and len(event.text.encode("utf-8")) <= self._max_transcript_chars
+                ):
+                    barrier.transcript = event
+                if barrier is not None:
+                    return
             fence = self._interrupt_generation
             async with self._admission_lock:
                 if (
@@ -595,15 +619,45 @@ class GatewayRealtimeVoiceController:
             asyncio.shield(host_task),
             return_exceptions=True,
         )
-        barrier.provider_terminal.set()
-        barrier.playback_terminal.set()
-        barrier.host_terminal.set()
+        if terminal_result is False and barrier.response.playback_interrupted:
+            barrier.playback_terminal.set()
+        if host_result is None:
+            barrier.host_terminal.set()
         if (
             terminal_result is True
             or isinstance(terminal_result, BaseException)
             or isinstance(host_result, BaseException)
         ):
             await self._request_close("native response cleanup failed")
+            return
+        await barrier.provider_terminal.wait()
+        if not barrier.playback_terminal.is_set() or not barrier.host_terminal.is_set():
+            return
+        async with self._admission_lock:
+            async with self._native_lock:
+                event = barrier.transcript
+                valid = (
+                    self._barge_in_barrier is barrier
+                    and barrier.response.generation == barrier.transport_generation
+                    and self._transport_generation == barrier.transport_generation
+                    and self._interrupt_generation == barrier.interrupt_generation
+                    and self._binding is binding
+                    and not self._closing
+                )
+                if self._barge_in_barrier is barrier:
+                    self._barge_in_barrier = None
+            if not valid or event is None:
+                return
+            admission = self._admission
+            assert admission is not None
+            result = await admission.admit(event)
+            if result.status is AdmissionStatus.SUBMITTED:
+                await self._start_native_response(
+                    result.receipt,
+                    event,
+                    barrier.transport_generation,
+                    barrier.interrupt_generation,
+                )
 
     async def _start_native_response(
         self,
@@ -682,6 +736,18 @@ class GatewayRealtimeVoiceController:
         async with self._native_lock:
             state = self._native_response
             event_identity = (event.response_id, event.turn_id)
+            barrier = self._barge_in_barrier
+            if (
+                barrier is not None
+                and type(event) in (ResponseCompleted, Interruption)
+                and barrier.response.response_id is not None
+                and event_identity
+                == (barrier.response.response_id, barrier.response.turn_id)
+                and generation == barrier.transport_generation
+                and generation == self._transport_generation
+            ):
+                barrier.provider_terminal.set()
+                return
             if state is None and event_identity in self._native_tombstone_ids:
                 raise RuntimeError("late duplicate native response event")
             if (
@@ -996,6 +1062,8 @@ class GatewayRealtimeVoiceController:
                 ):
                     raise RuntimeError("invalid native playback receipt")
                 state.receipt_validated = True
+                if expected_interrupted:
+                    state.playback_interrupted = True
                 retired = await self._host.retire_native_output(
                     state.request, lease, receipt
                 )
