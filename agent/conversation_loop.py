@@ -6494,53 +6494,58 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
-                _tool_turn_persisted = None
+                from agent.external_tool_batch import (
+                    ExternalToolBatchEnvelope,
+                    ExternalToolBatchPersistenceError,
+                    execute_external_tool_batch,
+                )
+
                 try:
-                    # Persist the assistant tool-call turn before any tool
-                    # side effects run. If a destructive tool restarts or
-                    # terminates Hermes mid-turn, resume logic still sees the
-                    # exact tool-call block that already executed.
-                    _tool_turn_persisted = agent._flush_messages_to_session_db(
-                        messages, conversation_history
+                    def _before_canonical_tool_execution():
+                        # Preserve the existing conversation projection order:
+                        # durable assistant row -> interim UI -> display close
+                        # -> canonical effects.
+                        if not duplicate_previous_interim:
+                            agent._emit_interim_assistant_message(assistant_msg)
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+
+                    # Conversation and external callers share this one durable
+                    # execution boundary.  The operation delegates dispatch to
+                    # AIAgent._execute_tool_calls; it does not own another
+                    # registry, policy, approval, or handler path.
+                    execute_external_tool_batch(
+                        agent=agent,
+                        assistant_message=assistant_message,
+                        assistant_row=assistant_msg,
+                        messages=messages,
+                        envelope=ExternalToolBatchEnvelope(
+                            task_id=effective_task_id,
+                            turn_id=getattr(agent, "_current_turn_id", "") or "",
+                            call_ids=tuple(
+                                tc.id for tc in assistant_message.tool_calls
+                            ),
+                            api_call_count=api_call_count,
+                        ),
+                        assistant_already_appended=True,
+                        conversation_history=conversation_history,
+                        require_receipt=False,
+                        before_execute=_before_canonical_tool_execution,
                     )
-                except Exception as exc:
-                    _tool_turn_persisted = False
+                except ExternalToolBatchPersistenceError as exc:
                     logger.warning(
-                        "Incremental tool-call persistence failed before execution "
+                        "Incremental tool-call persistence failed "
                         "(session=%s): %s",
                         agent.session_id or "none",
                         exc,
                     )
-
-                if _tool_turn_persisted is False:
-                    # The canonical append failed. Do not project the row or
-                    # run side-effecting tools from state that exists only in
-                    # this process. Breaking also avoids retrying the same
-                    # unpersisted turn until the iteration budget is exhausted.
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
                     break
-
-                # A UI must never observe an assistant/tool-call row that is
-                # still only an ephemeral in-memory projection. Emit interim
-                # commentary only after the canonical SessionDB append above.
-                if not duplicate_previous_interim:
-                    agent._emit_interim_assistant_message(assistant_msg)
-
-                # Close any open streaming display (response box, reasoning
-                # box) before tool execution begins.  Intermediate turns may
-                # have streamed early content that opened the response box;
-                # flushing here prevents it from wrapping tool feed lines.
-                # Only signal the display callback — TTS (_stream_callback)
-                # should NOT receive None (it uses None as end-of-stream).
-                if agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(None)
-                    except Exception:
-                        pass
-
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
