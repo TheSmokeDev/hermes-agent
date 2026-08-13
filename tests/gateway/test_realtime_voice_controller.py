@@ -1323,6 +1323,42 @@ async def test_speech_start_retains_pending_response_authority_for_exact_late_st
 
 
 @pytest.mark.asyncio
+async def test_late_response_start_after_send_acceptance_retains_pending_barge_in(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    state = controller._native_response
+    assert state is not None
+    assert session.response_requests
+
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    terminal_task = state.terminal_task
+    assert terminal_task is not None
+    done, _pending = await asyncio.wait({terminal_task}, timeout=0.05)
+
+    assert done == set()
+    assert controller._native_response is state
+    assert state.response_id is None
+    assert controller._barge_in_barrier is not None
+
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    await session.cancel_entered.wait()
+    await host.acquire_entered.wait()
+    lease = host.leases[0]
+    await lease.interrupt_entered.wait()
+    await controller._handle_event(Interruption("response", "host-turn"), 1)
+    await _eventually(lambda: controller._barge_in_barrier is None)
+
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 1
+    assert host.retire_calls == 1
+    assert controller._native_response is None
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
 async def test_speech_start_fences_native_response_without_blocking_event_pump(binding):
     session = _Session()
     session.block_cancel = True
@@ -2584,6 +2620,39 @@ async def test_failed_barge_in_host_gate_close_does_not_await_its_own_worker(bin
     assert done == {close_task}
     assert controller._closed is True
     assert controller._barge_in_barrier is None
+    assert not [
+        task for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_coro().__qualname__.endswith("._run_barge_in_barrier")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_public_interrupt_observes_failed_owned_barge_in_host_gate(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await host.interrupt_entered.wait()
+    interrupting = asyncio.create_task(controller.interrupt())
+    await _eventually(lambda: controller._barge_in_barrier is None)
+    host.interrupt_error = RuntimeError("host gate failed")
+    host.interrupt_release.set()
+
+    with pytest.raises(RuntimeError, match="host gate failed"):
+        await asyncio.wait_for(interrupting, timeout=0.2)
+
+    assert controller._closed is True
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 1
+    assert host.retire_calls == 1
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+    assert controller.lifecycle_events[-1].detail == "interrupt failed"
     assert not [
         task for task in asyncio.all_tasks()
         if task is not asyncio.current_task()

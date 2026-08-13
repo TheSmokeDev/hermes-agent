@@ -644,12 +644,16 @@ class GatewayRealtimeVoiceController:
             return_exceptions=True,
         )
         async with self._native_lock:
-            if self._barge_in_barrier is not barrier:
-                return
+            attached = self._barge_in_barrier is barrier
         if terminal_result is False and barrier.response.playback_interrupted:
             barrier.playback_terminal.set()
         if host_result is None:
             barrier.host_terminal.set()
+        if not attached:
+            if isinstance(host_result, BaseException):
+                await self._request_close("interrupt failed")
+                raise host_result
+            return
         if (
             terminal_result is True
             or isinstance(terminal_result, BaseException)
@@ -737,8 +741,6 @@ class GatewayRealtimeVoiceController:
                     raise
                 return
             finally:
-                if operation.done() and not operation.cancelled():
-                    state.response_start_ended.set()
                 async with self._native_lock:
                     if state.operation_task is operation and operation.done():
                         state.operation_task = None
@@ -973,7 +975,6 @@ class GatewayRealtimeVoiceController:
             state.terminal_intent = intent
         if intent != "drain":
             state.interrupted = True
-            state.response_start_ended.set()
             operation = state.operation_task
             if (
                 operation is not None
@@ -1337,7 +1338,11 @@ class GatewayRealtimeVoiceController:
                 self._closing = True
                 failure = exc
         if barrier_worker is not None and barrier_worker is not asyncio.current_task():
-            await asyncio.shield(barrier_worker)
+            try:
+                await asyncio.shield(barrier_worker)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
         if failure is not None:
             reason = (
                 "native response cleanup failed"
