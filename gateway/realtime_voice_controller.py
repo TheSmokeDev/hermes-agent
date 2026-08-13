@@ -17,6 +17,7 @@ from agent.realtime_voice_admission import (
 )
 from agent.realtime_voice_orchestrator import open_realtime_voice_session
 from agent.realtime_voice_provider import (
+    InputSpeechStarted,
     InputTranscript,
     OutputAudio,
     OutputTranscript,
@@ -234,6 +235,19 @@ class _NativeResponseState:
     retired: bool = False
 
 
+@dataclass(slots=True)
+class _BargeInBarrier:
+    response: _NativeResponseState
+    transport_generation: int
+    interrupt_generation: int
+    speech_item_id: str
+    provider_terminal: asyncio.Event
+    playback_terminal: asyncio.Event
+    host_terminal: asyncio.Event
+    transcript: InputTranscript | None = None
+    worker: asyncio.Task[None] | None = None
+
+
 class GatewayRealtimeVoiceController:
     """Own provider transport while leaving canonical turn authority with its host."""
 
@@ -296,6 +310,7 @@ class GatewayRealtimeVoiceController:
         self._native_response: _NativeResponseState | None = None
         self._native_lock = asyncio.Lock()
         self._native_terminal_task: asyncio.Task[bool] | None = None
+        self._barge_in_barrier: _BargeInBarrier | None = None
         self._native_tombstone_order: deque[tuple[str, str]] = deque()
         self._native_tombstone_ids: set[tuple[str, str]] = set()
 
@@ -493,6 +508,9 @@ class GatewayRealtimeVoiceController:
             )
             await self.close(reason=event.reason or "provider closed")
             return
+        if type(event) is InputSpeechStarted:
+            await self._handle_speech_started(event, generation)
+            return
         if isinstance(event, InputTranscript):
             fence = self._interrupt_generation
             async with self._admission_lock:
@@ -530,6 +548,62 @@ class GatewayRealtimeVoiceController:
             provider_event=event,
             generation=generation,
         )
+
+    async def _handle_speech_started(
+        self, event: InputSpeechStarted, generation: int
+    ) -> None:
+        async with self._native_lock:
+            state = self._native_response
+            if (
+                state is None
+                or generation != state.generation
+                or generation != self._transport_generation
+            ):
+                return
+            barrier = self._barge_in_barrier
+            if barrier is not None and barrier.response is state:
+                return
+            self._interrupt_generation += 1
+            terminal_task = self._claim_native_terminal_locked(state, "interrupt")
+            barrier = _BargeInBarrier(
+                response=state,
+                transport_generation=generation,
+                interrupt_generation=self._interrupt_generation,
+                speech_item_id=event.item_id,
+                provider_terminal=asyncio.Event(),
+                playback_terminal=asyncio.Event(),
+                host_terminal=asyncio.Event(),
+            )
+            self._barge_in_barrier = barrier
+            worker = asyncio.create_task(
+                self._run_barge_in_barrier(barrier, terminal_task)
+            )
+            barrier.worker = worker
+            worker.add_done_callback(self._observe_native_operation)
+
+    async def _run_barge_in_barrier(
+        self, barrier: _BargeInBarrier, terminal_task: asyncio.Task[bool]
+    ) -> None:
+        binding = self._binding
+        if binding is None:
+            return
+        host_task = self._create_native_task(
+            self._host.interrupt_and_wait(binding, self._interrupt_timeout)
+        )
+        terminal_result, host_result = await asyncio.gather(
+            asyncio.shield(terminal_task),
+            asyncio.shield(host_task),
+            return_exceptions=True,
+        )
+        barrier.provider_terminal.set()
+        barrier.playback_terminal.set()
+        barrier.host_terminal.set()
+        if (
+            terminal_result is True
+            or isinstance(terminal_result, BaseException)
+            or isinstance(host_result, BaseException)
+        ):
+            await self._request_close("native response cleanup failed")
 
     async def _start_native_response(
         self,

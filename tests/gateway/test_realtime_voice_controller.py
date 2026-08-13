@@ -17,6 +17,7 @@ from agent.realtime_voice_admission import (
     RealtimeUtterance,
 )
 from agent.realtime_voice_provider import (
+    InputSpeechStarted,
     InputTranscript,
     OutputAudio,
     OutputTranscript,
@@ -1268,6 +1269,66 @@ async def test_provider_completion_waits_for_local_drain_before_retirement(bindi
         item.lifecycle for item in controller.lifecycle_events
     }
     lease.finish_release.set()
+    await _eventually(lambda: len(host.retired) == 1)
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_speech_start_fences_native_response_without_blocking_event_pump(binding):
+    session = _Session()
+    session.block_cancel = True
+    session.cancel_release.clear()
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await _eventually(lambda: len(host.leases) == 1)
+    lease = host.leases[0]
+    lease.block_lease_interrupt = True
+    lease.interrupt_release.clear()
+
+    speech = InputSpeechStarted("speech-item", 123)
+    pump_marker = ToolCall(
+        call_id="call",
+        batch_id="batch",
+        turn_id="turn",
+        response_id="other-response",
+        name="inert",
+        arguments={},
+    )
+    await session.incoming.put(speech)
+    await session.incoming.put(speech)
+    await session.incoming.put(pump_marker)
+
+    await session.cancel_entered.wait()
+    await host.interrupt_entered.wait()
+    await _eventually(
+        lambda: any(event.provider_event is pump_marker for event in controller.lifecycle_events)
+    )
+    assert controller._native_response is not None
+    assert controller._native_response.interrupted is True
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 0
+
+    session.cancel_release.set()
+    await lease.interrupt_entered.wait()
+    assert lease.interrupt_calls == 1
+    host.interrupt_release.set()
+    lease.interrupt_release.set()
     await _eventually(lambda: len(host.retired) == 1)
     await controller.close(reason="test")
 
