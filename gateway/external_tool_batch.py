@@ -116,30 +116,41 @@ def _claim_route_execution_permit(pin: RouteOwnedAgentPin, permit: RouteExecutio
         raise ExternalToolBatchRouteChanged("execution permit ownership changed")
     runner = pin.runner
     store = runner.session_store
+    # Cheap pre-check is not authority.  The final comparison and consume below
+    # run under the TurnState owner's lock, closing release/rotation races.
+    state = _state(runner, pin.session_key)
+    if (
+        state is None
+        or state.turn.lease_token is not pin.turn_lease_token
+        or state.turn.lease_generation != pin.generation
+    ):
+        raise ExternalToolBatchRouteChanged("route authority changed")
     with runner._agent_cache_lock:
         with store._lock:
-            if permit._claimed:
-                raise ExternalToolBatchRouteChanged("execution permit already consumed")
             store._ensure_loaded_locked()
             entry = store._entries.get(pin.session_key)
             cached = runner._agent_cache.get(pin.session_key)
             state = _state(runner, pin.session_key)
-            if (
-                entry is not pin.session_entry
-                or entry is None
-                or entry.session_id != pin.session_id
-                or not isinstance(cached, tuple)
-                or not cached
-                or cached[0] is not pin.agent
-                or state is None
-                or state.turn.agent is not pin.agent
-                or state.persistent.run_generation != pin.generation
-                or state.turn.lease is not pin.active_session_lease
-                or state.turn.lease_token is not pin.turn_lease_token
-                or state.turn.lease_generation != pin.generation
-            ):
+            if state is None:
                 raise ExternalToolBatchRouteChanged("route authority changed")
-            permit._claimed = True
+            with state.turn_authority_lock:
+                if permit._claimed:
+                    raise ExternalToolBatchRouteChanged("execution permit already consumed")
+                if (
+                    entry is not pin.session_entry
+                    or entry is None
+                    or entry.session_id != pin.session_id
+                    or not isinstance(cached, tuple)
+                    or not cached
+                    or cached[0] is not pin.agent
+                    or state.turn.agent is not pin.agent
+                    or state.persistent.run_generation != pin.generation
+                    or state.turn.lease is not pin.active_session_lease
+                    or state.turn.lease_token is not pin.turn_lease_token
+                    or state.turn.lease_generation != pin.generation
+                ):
+                    raise ExternalToolBatchRouteChanged("route authority changed")
+                permit._claimed = True
 
 
 @contextmanager

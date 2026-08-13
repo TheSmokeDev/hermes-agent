@@ -2232,7 +2232,8 @@ class AIAgent:
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
                 _display_metadata = msg.get("display_metadata")
-                _batch_marker = getattr(self, "_external_tool_batch_marker", None)
+                from agent.external_tool_batch import get_external_tool_batch_marker
+                _batch_marker = get_external_tool_batch_marker()
                 if _batch_marker and role == "tool":
                     _display_metadata = (
                         dict(_display_metadata)

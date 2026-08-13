@@ -865,12 +865,7 @@ def _request_protected_instruction_approval(
     # is registered for this session (Telegram/Discord/Slack). One-operation
     # only — no session/permanent buttons are offered.
     session_key = _approval.get_current_session_key()
-    notify_cb = None
-    try:
-        with _approval._lock:
-            notify_cb = _approval._gateway_notify_cbs.get(session_key)
-    except Exception:
-        notify_cb = None
+    notify_cb = _approval._gateway_notify_for_owner(session_key)
 
     if notify_cb is not None:
         approval_data = {

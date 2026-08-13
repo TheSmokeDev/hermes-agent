@@ -1,6 +1,7 @@
 """Canonical host-owned external tool-batch operation contracts."""
 
 from types import SimpleNamespace
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,6 +10,7 @@ from agent.external_tool_batch import (
     ExternalToolBatchEnvelope,
     ExternalToolBatchPersistenceError,
     execute_external_tool_batch,
+    get_external_tool_batch_marker,
 )
 
 
@@ -61,7 +63,7 @@ def test_external_tool_batch_persists_executes_and_reads_back_exact_result():
             "tool_call_id": call.id,
             "content": "exact result",
             "display_metadata": {
-                "external_tool_batch_marker": agent._external_tool_batch_marker
+                "external_tool_batch_marker": get_external_tool_batch_marker()
             },
         })
         flush(current)
@@ -207,7 +209,7 @@ def test_equal_call_batches_keep_distinct_marker_receipts():
         messages.append({
             "role": "tool", "tool_call_id": "same-call", "content": "result",
             "display_metadata": {
-                "external_tool_batch_marker": agent._external_tool_batch_marker
+                "external_tool_batch_marker": get_external_tool_batch_marker()
             },
         })
         flush(messages)
@@ -225,3 +227,68 @@ def test_equal_call_batches_keep_distinct_marker_receipts():
 
     assert receipts[0].assistant_row_id != receipts[1].assistant_row_id
     assert receipts[0].tool_rows[0][0] != receipts[1].tool_rows[0][0]
+
+
+def test_simultaneous_equal_call_batches_never_cross_stamp_markers():
+    durable_rows = []
+    durable_lock = threading.Lock()
+    entered = threading.Barrier(2)
+
+    def flush(messages, _history=None):
+        with durable_lock:
+            for message in messages:
+                if not message.get("_test_persisted"):
+                    durable_rows.append({"id": len(durable_rows) + 1, **message})
+                    message["_test_persisted"] = True
+        return True
+
+    agent = SimpleNamespace(
+        session_id="durable-session",
+        _session_db=SimpleNamespace(get_messages=lambda _sid: list(durable_rows)),
+        _flush_messages_to_session_db=flush,
+        _incremental_persistence_failed=False,
+    )
+
+    def execute(_assistant, messages, *_args):
+        entered.wait(2)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": "same-call",
+            "content": messages[0]["content"],
+            "display_metadata": {
+                "external_tool_batch_marker": get_external_tool_batch_marker()
+            },
+        })
+        flush(messages)
+
+    agent._execute_tool_calls = execute
+    receipts = {}
+    errors = []
+
+    def invoke(turn):
+        try:
+            receipts[turn] = execute_external_tool_batch(
+                agent=agent,
+                assistant_message=SimpleNamespace(tool_calls=[]),
+                assistant_row={
+                    "role": "assistant",
+                    "content": turn,
+                    "tool_calls": [{"id": "same-call"}],
+                },
+                messages=[],
+                envelope=ExternalToolBatchEnvelope("task", turn, ("same-call",)),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=invoke, args=(turn,)) for turn in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3)
+
+    assert not errors
+    assert set(receipts) == {"one", "two"}
+    assert receipts["one"].tool_rows[0][2] == "one"
+    assert receipts["two"].tool_rows[0][2] == "two"
+    assert not hasattr(agent, "_external_tool_batch_marker")

@@ -19,6 +19,7 @@ from gateway.external_tool_batch import (
 from agent.external_tool_batch import ExternalToolBatchEnvelope
 from gateway.session import SessionEntry
 from gateway.session_state import SessionState
+from gateway.run import GatewayRunner
 
 
 def _runner():
@@ -118,6 +119,66 @@ def test_execution_permit_route_rotation_before_claim_has_zero_persistence_and_d
 
     assert persisted == []
     assert dispatched == []
+
+
+def test_execution_permit_claim_linearizes_with_production_lease_release(monkeypatch):
+    import gateway.external_tool_batch as batch_host
+
+    runner, key, agent, _entry, state = _runner()
+    persisted = []
+    dispatched = []
+    released = []
+    agent._session_db = SimpleNamespace(get_messages=lambda _sid: [])
+    agent._flush_messages_to_session_db = lambda *_args: persisted.append(True)
+    agent._execute_tool_calls = lambda *_args: dispatched.append(True)
+    agent._incremental_persistence_failed = False
+    runner._turn_leases = SimpleNamespace(release=lambda token: released.append(token) or True)
+    runner._peek_session_state = lambda session_key: runner._session_states.get(session_key)
+    pin = pin_route_owned_agent(runner, key)
+    permit = mint_route_execution_permit(pin)
+    checked = threading.Event()
+    resume = threading.Event()
+    original_state = batch_host._state
+    state_reads = 0
+
+    def barrier_state(current_runner, session_key):
+        nonlocal state_reads
+        state_reads += 1
+        if state_reads == 2:
+            checked.set()
+            assert resume.wait(2)
+        return original_state(current_runner, session_key)
+
+    monkeypatch.setattr(batch_host, "_state", barrier_state)
+    errors = []
+
+    def execute():
+        try:
+            execute_route_owned_external_tool_batch(
+                pin=pin,
+                execution_permit=permit,
+                assistant_message=SimpleNamespace(tool_calls=[]),
+                assistant_row={"role": "assistant", "tool_calls": []},
+                messages=[],
+                envelope=ExternalToolBatchEnvelope("task", "turn", ()),
+                approval_notifier=lambda _data: None,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    claim_thread = threading.Thread(target=execute)
+    claim_thread.start()
+    assert checked.wait(2)
+    assert GatewayRunner._release_turn_lease(runner, key, 7) is True
+    resume.set()
+    claim_thread.join(2)
+
+    assert not claim_thread.is_alive()
+    assert persisted == []
+    assert dispatched == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], ExternalToolBatchRouteChanged)
+    assert released == [pin.turn_lease_token]
 
 
 def test_execution_permit_is_one_use():

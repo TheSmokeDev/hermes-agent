@@ -7,12 +7,36 @@ it has no registry, handler map, policy, approval, or tool dispatch logic.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass
+import asyncio
+import threading
 from typing import Any, Sequence
 from uuid import uuid4
 
 
 _BATCH_MARKER_KEY = "external_tool_batch_marker"
+_external_batch_scope: ContextVar[tuple[str, int, Any] | None] = ContextVar(
+    "external_tool_batch_scope", default=None
+)
+
+
+def _current_task_identity() -> Any:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def get_external_tool_batch_marker() -> str | None:
+    """Return the marker only to the exact invocation thread/task owner."""
+    scope = _external_batch_scope.get()
+    if scope is None:
+        return None
+    marker, thread_id, task = scope
+    if thread_id != threading.get_ident() or task is not _current_task_identity():
+        return None
+    return marker
 
 
 class ExternalToolBatchPersistenceError(RuntimeError):
@@ -166,8 +190,9 @@ def execute_external_tool_batch(
     if before_execute is not None:
         before_execute()
 
-    previous_marker = getattr(agent, "_external_tool_batch_marker", None)
-    agent._external_tool_batch_marker = marker
+    marker_token = _external_batch_scope.set(
+        (marker, threading.get_ident(), _current_task_identity())
+    )
     try:
         agent._execute_tool_calls(
             assistant_message,
@@ -176,10 +201,7 @@ def execute_external_tool_batch(
             envelope.api_call_count,
         )
     finally:
-        if previous_marker is None:
-            delattr(agent, "_external_tool_batch_marker")
-        else:
-            agent._external_tool_batch_marker = previous_marker
+        _external_batch_scope.reset(marker_token)
     if getattr(agent, "_incremental_persistence_failed", False):
         raise ExternalToolBatchPersistenceError("tool-result persistence failed")
     if not require_receipt:

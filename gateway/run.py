@@ -10675,8 +10675,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # sentinel) sees the slot as occupied and queues behind it
             # instead of spinning up a duplicate AIAgent (#45456).
             _resume_state = self._session_state(entry.session_key)
-            _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
-            _resume_state.turn.started_ts = time.time()
+            with _resume_state.turn_authority_lock:
+                _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
+                _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
 
             # Empty-text internal event — the _is_resume_pending branch in
@@ -15994,10 +15995,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return _limit_message
         _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.started_ts = time.time()
+        with _claim_state.turn_authority_lock:
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.started_ts = time.time()
         try:
             _commit_realtime_voice_slot_claim(
                 self, event, _quick_key, _realtime_slot_claim
@@ -17021,9 +17023,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._clear_session_env(_session_env_tokens)
                 raise
             if _lease_token is not None:
-                _lease_state = self._session_state(_quick_key).turn
-                _lease_state.lease_token = _lease_token
-                _lease_state.lease_generation = run_generation
+                _lease_session_state = self._session_state(_quick_key)
+                with _lease_session_state.turn_authority_lock:
+                    _lease_state = _lease_session_state.turn
+                    _lease_state.lease_token = _lease_token
+                    _lease_state.lease_generation = run_generation
 
         # Revalidate the exact captured route/session only after final session
         # resolution and successful turn-lease acquisition.  This closes the
@@ -23307,7 +23311,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (agent / started_ts / lease / busy_ack_ts).  Turn-lease tokens
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
-            state.turn.clear()
+            with state.turn_authority_lock:
+                state.turn.clear()
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -23332,12 +23337,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = self._peek_session_state(session_key)
         if state is None or registry is None:
             return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
-            return False
-        token = turn.lease_token
-        turn.lease_token = None
-        turn.lease_generation = None
+        with state.turn_authority_lock:
+            turn = state.turn
+            if turn.lease_token is None or turn.lease_generation != run_generation:
+                return False
+            token = turn.lease_token
+            turn.lease_token = None
+            turn.lease_generation = None
         try:
             return registry.release(token)
         except Exception:
@@ -23364,11 +23370,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = self._peek_session_state(session_key)
         if state is None or registry is None:
             return False
-        turn = state.turn
-        if turn.lease_token is None or turn.lease_generation != run_generation:
-            return False
+        with state.turn_authority_lock:
+            turn = state.turn
+            if turn.lease_token is None or turn.lease_generation != run_generation:
+                return False
+            token = turn.lease_token
         try:
-            return registry.rebind(turn.lease_token, new_session_id)
+            return registry.rebind(token, new_session_id)
         except Exception:
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
@@ -25538,7 +25546,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation,
                 )
                 return
-            self._session_state(session_key).turn.agent = agent_holder[0]
+            _agent_state = self._session_state(session_key)
+            with _agent_state.turn_authority_lock:
+                _agent_state.turn.agent = agent_holder[0]
             if self._draining:
                 self._update_runtime_status("draining")
         
