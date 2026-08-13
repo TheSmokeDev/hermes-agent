@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
 from agent.external_tool_batch import (
@@ -27,6 +27,18 @@ class RouteOwnedAgentPin:
     generation: int
     active_session_lease: Any
     turn_lease_token: Any
+
+
+@dataclass(eq=False)
+class RouteExecutionPermit:
+    """Opaque, consume-once authority for one canonical admission."""
+
+    pin: RouteOwnedAgentPin
+    _claimed: bool = field(default=False, init=False, repr=False)
+
+
+def mint_route_execution_permit(pin: RouteOwnedAgentPin) -> RouteExecutionPermit:
+    return RouteExecutionPermit(pin)
 
 
 def _state(runner: Any, session_key: str) -> Any:
@@ -99,6 +111,37 @@ def revalidate_route_owned_agent(runner: Any, pin: RouteOwnedAgentPin) -> None:
         raise ExternalToolBatchRouteChanged("route authority changed")
 
 
+def _claim_route_execution_permit(pin: RouteOwnedAgentPin, permit: RouteExecutionPermit) -> None:
+    if type(permit) is not RouteExecutionPermit or permit.pin is not pin:
+        raise ExternalToolBatchRouteChanged("execution permit ownership changed")
+    runner = pin.runner
+    store = runner.session_store
+    with runner._agent_cache_lock:
+        with store._lock:
+            if permit._claimed:
+                raise ExternalToolBatchRouteChanged("execution permit already consumed")
+            store._ensure_loaded_locked()
+            entry = store._entries.get(pin.session_key)
+            cached = runner._agent_cache.get(pin.session_key)
+            state = _state(runner, pin.session_key)
+            if (
+                entry is not pin.session_entry
+                or entry is None
+                or entry.session_id != pin.session_id
+                or not isinstance(cached, tuple)
+                or not cached
+                or cached[0] is not pin.agent
+                or state is None
+                or state.turn.agent is not pin.agent
+                or state.persistent.run_generation != pin.generation
+                or state.turn.lease is not pin.active_session_lease
+                or state.turn.lease_token is not pin.turn_lease_token
+                or state.turn.lease_generation != pin.generation
+            ):
+                raise ExternalToolBatchRouteChanged("route authority changed")
+            permit._claimed = True
+
+
 @contextmanager
 def gateway_approval_context(
     session_key: str,
@@ -107,33 +150,39 @@ def gateway_approval_context(
     """Install the existing approval session/notifier for one host operation."""
     from tools.approval import (
         register_gateway_notify,
+        reset_gateway_notify_owner,
         reset_current_session_key,
+        set_gateway_notify_owner,
         set_current_session_key,
         unregister_gateway_notify,
     )
 
     token = set_current_session_key(session_key)
-    register_gateway_notify(session_key, notifier)
+    owner = register_gateway_notify(session_key, notifier)
+    owner_token = set_gateway_notify_owner(owner)
     try:
         yield
     finally:
-        unregister_gateway_notify(session_key)
-        reset_current_session_key(token)
+        try:
+            unregister_gateway_notify(session_key, owner)
+        finally:
+            reset_gateway_notify_owner(owner_token)
+            reset_current_session_key(token)
 
 
 def execute_route_owned_external_tool_batch(
     *,
     pin: RouteOwnedAgentPin,
+    execution_permit: RouteExecutionPermit,
     assistant_message: Any,
     assistant_row: dict[str, Any],
     messages: list[dict[str, Any]],
     envelope: ExternalToolBatchEnvelope,
     approval_notifier: Callable[[dict], None],
 ) -> ExternalToolBatchReceipt:
-    """Revalidate route authority and invoke the one canonical operation."""
-    revalidate_route_owned_agent(pin.runner, pin)
+    """Atomically claim current route authority, then invoke canonical operation."""
+    _claim_route_execution_permit(pin, execution_permit)
     with gateway_approval_context(pin.session_key, approval_notifier):
-        revalidate_route_owned_agent(pin.runner, pin)
         receipt = execute_external_tool_batch(
             agent=pin.agent,
             assistant_message=assistant_message,
@@ -141,6 +190,5 @@ def execute_route_owned_external_tool_batch(
             messages=messages,
             envelope=envelope,
         )
-    revalidate_route_owned_agent(pin.runner, pin)
     assert receipt is not None
     return receipt

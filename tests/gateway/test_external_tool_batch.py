@@ -8,10 +8,15 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.external_tool_batch import (
+    _claim_route_execution_permit,
     ExternalToolBatchRouteChanged,
+    execute_route_owned_external_tool_batch,
+    mint_route_execution_permit,
     pin_route_owned_agent,
     revalidate_route_owned_agent,
+    gateway_approval_context,
 )
+from agent.external_tool_batch import ExternalToolBatchEnvelope
 from gateway.session import SessionEntry
 from gateway.session_state import SessionState
 
@@ -84,6 +89,115 @@ def test_route_pin_fails_closed_on_route_rotation(mutation):
         runner.session_store._entries[key].session_id = "durable-2"
     else:
         state.turn.lease_token = object()
-
     with pytest.raises(ExternalToolBatchRouteChanged):
         revalidate_route_owned_agent(runner, pin)
+
+
+def test_execution_permit_route_rotation_before_claim_has_zero_persistence_and_dispatch():
+    runner, key, agent, _entry, state = _runner()
+    persisted = []
+    dispatched = []
+    agent._session_db = SimpleNamespace(get_messages=lambda _sid: [])
+    agent._flush_messages_to_session_db = lambda *_args: persisted.append(True)
+    agent._execute_tool_calls = lambda *_args: dispatched.append(True)
+    agent._incremental_persistence_failed = False
+    pin = pin_route_owned_agent(runner, key)
+    permit = mint_route_execution_permit(pin)
+    state.turn.lease_token = object()
+
+    with pytest.raises(ExternalToolBatchRouteChanged):
+        execute_route_owned_external_tool_batch(
+            pin=pin,
+            execution_permit=permit,
+            assistant_message=SimpleNamespace(tool_calls=[]),
+            assistant_row={"role": "assistant", "tool_calls": []},
+            messages=[],
+            envelope=ExternalToolBatchEnvelope("task", "turn", ()),
+            approval_notifier=lambda _data: None,
+        )
+
+    assert persisted == []
+    assert dispatched == []
+
+
+def test_execution_permit_is_one_use():
+    runner, key, _agent, _entry, _state = _runner()
+    pin = pin_route_owned_agent(runner, key)
+    permit = mint_route_execution_permit(pin)
+
+    _claim_route_execution_permit(pin, permit)
+    with pytest.raises(ExternalToolBatchRouteChanged):
+        _claim_route_execution_permit(pin, permit)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["agent", "entry", "generation", "lease", "lease_generation", "turn_token"],
+)
+def test_execution_permit_exact_binding_fails_before_effect(mutation):
+    runner, key, agent, entry, state = _runner()
+    pin = pin_route_owned_agent(runner, key)
+    permit = mint_route_execution_permit(pin)
+    if mutation == "agent":
+        runner._agent_cache[key] = (object(), "sig", 0, "durable-1")
+    elif mutation == "entry":
+        runner.session_store._entries[key] = SessionEntry(
+            session_key=entry.session_key,
+            session_id=entry.session_id,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+        )
+    elif mutation == "generation":
+        state.persistent.run_generation += 1
+    elif mutation == "lease":
+        state.turn.lease = object()
+    elif mutation == "lease_generation":
+        state.turn.lease_generation += 1
+    else:
+        state.turn.lease_token = object()
+
+    with pytest.raises(ExternalToolBatchRouteChanged):
+        _claim_route_execution_permit(pin, permit)
+    assert agent.session_id == "durable-1"
+
+
+def test_same_key_approval_context_restores_exact_owner():
+    from tools import approval
+
+    key = "same-public-key"
+    outer = lambda _data: None
+    inner = lambda _data: None
+    with gateway_approval_context(key, outer):
+        assert approval._gateway_notify_cbs[key] is outer
+        with gateway_approval_context(key, inner):
+            assert approval._gateway_notify_cbs[key] is inner
+        assert approval._gateway_notify_cbs[key] is outer
+    assert key not in approval._gateway_notify_cbs
+
+
+def test_same_key_approval_owner_teardown_only_releases_its_pending_request():
+    from tools import approval
+
+    key = "overlapping-owner-key"
+    outer_notices = []
+    inner_notices = []
+    outer_cb = outer_notices.append
+    inner_cb = inner_notices.append
+    outer = approval.register_gateway_notify(key, outer_cb)
+    inner = approval.register_gateway_notify(key, inner_cb)
+    outer_entry = approval._ApprovalEntry({"command": "outer"})
+    inner_entry = approval._ApprovalEntry({"command": "inner"})
+    outer_entry.owner = outer
+    inner_entry.owner = inner
+    approval._gateway_queues[key] = [outer_entry, inner_entry]
+    try:
+        approval.unregister_gateway_notify(key, inner)
+
+        assert inner_entry.event.is_set()
+        assert not outer_entry.event.is_set()
+        assert approval._gateway_queues[key] == [outer_entry]
+        assert approval._gateway_notify_cbs[key] is outer_cb
+        assert approval._gateway_notify_for_owner(key, outer) is outer_cb
+        assert approval._gateway_notify_for_owner(key, inner) is None
+    finally:
+        approval.unregister_gateway_notify(key)

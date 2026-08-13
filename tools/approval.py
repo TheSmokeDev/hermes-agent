@@ -51,6 +51,9 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_approval_notify_owner: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "approval_notify_owner", default=None
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -2446,7 +2449,7 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "owner")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2456,13 +2459,15 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        self.owner = _approval_notify_owner.get()
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_notify_owners: dict[str, list[tuple[object, object]]] = {}
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(session_key: str, cb) -> object:
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
@@ -2470,19 +2475,62 @@ def register_gateway_notify(session_key: str, cb) -> None:
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
     thread, must schedule the actual send on the event loop).
     """
+    owner = object()
     with _lock:
+        _gateway_notify_owners.setdefault(session_key, []).append((owner, cb))
         _gateway_notify_cbs[session_key] = cb
+    return owner
 
 
-def unregister_gateway_notify(session_key: str) -> None:
+def set_gateway_notify_owner(owner: object):
+    """Bind approval lookup and pending requests to one notifier owner."""
+    return _approval_notify_owner.set(owner)
+
+
+def reset_gateway_notify_owner(token) -> None:
+    _approval_notify_owner.reset(token)
+
+
+def _gateway_notify_for_owner(session_key: str, owner: object | None = None):
+    """Return only the callback owned by the active exact operation."""
+    if owner is None:
+        owner = _approval_notify_owner.get()
+    with _lock:
+        if owner is None:
+            return _gateway_notify_cbs.get(session_key)
+        for registered_owner, cb in reversed(_gateway_notify_owners.get(session_key, [])):
+            if registered_owner is owner:
+                return cb
+    return None
+
+
+def unregister_gateway_notify(session_key: str, owner: object | None = None) -> None:
     """Unregister the per-session gateway approval callback.
 
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
     """
     with _lock:
-        _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        if owner is not None:
+            registrations = _gateway_notify_owners.get(session_key, [])
+            registrations = [item for item in registrations if item[0] is not owner]
+            if registrations:
+                _gateway_notify_owners[session_key] = registrations
+                _gateway_notify_cbs[session_key] = registrations[-1][1]
+            else:
+                _gateway_notify_owners.pop(session_key, None)
+                _gateway_notify_cbs.pop(session_key, None)
+            queue = _gateway_queues.get(session_key, [])
+            entries = [entry for entry in queue if entry.owner is owner]
+            remaining = [entry for entry in queue if entry.owner is not owner]
+            if remaining:
+                _gateway_queues[session_key] = remaining
+            else:
+                _gateway_queues.pop(session_key, None)
+        else:
+            _gateway_notify_owners.pop(session_key, None)
+            _gateway_notify_cbs.pop(session_key, None)
+            entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
 
@@ -3266,7 +3314,7 @@ def _run_approval_gate(
         # approved/BLOCKED outcome.
         notify_cb = None
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_for_owner(session_key)
 
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
@@ -4006,7 +4054,7 @@ def check_all_command_guards(command: str, env_type: str,
     if is_gateway or is_ask:
         notify_cb = None
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_for_owner(session_key)
 
         if notify_cb is not None:
             # --- Blocking gateway approval (queue-based) ---
@@ -4364,7 +4412,7 @@ def check_execute_code_guard(code: str, env_type: str,
 
     notify_cb = None
     with _lock:
-        notify_cb = _gateway_notify_cbs.get(session_key)
+        notify_cb = _gateway_notify_for_owner(session_key)
 
     if notify_cb is None:
         # No gateway callback registered (e.g. ask-mode without a notifier):
@@ -4495,7 +4543,7 @@ def request_elicitation_consent(
 
     if _is_gateway_approval_context():
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_for_owner(session_key)
         if notify_cb is None:
             logger.warning(
                 "Elicitation requested in gateway session %s but no "

@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Sequence
+from uuid import uuid4
+
+
+_BATCH_MARKER_KEY = "external_tool_batch_marker"
 
 
 class ExternalToolBatchPersistenceError(RuntimeError):
@@ -48,6 +52,7 @@ def _prove_receipt(
     agent: Any,
     envelope: ExternalToolBatchEnvelope,
     before_ids: set[int],
+    marker: str,
 ) -> ExternalToolBatchReceipt:
     rows = _read_rows(agent)
     new_rows = [
@@ -55,6 +60,7 @@ def _prove_receipt(
         if type(row.get("id")) is int
         and row["id"] > envelope.high_water_row_id
         and row["id"] not in before_ids
+        and (row.get("display_metadata") or {}).get(_BATCH_MARKER_KEY) == marker
     ]
     assistant_rows = [
         row for row in new_rows
@@ -106,6 +112,14 @@ def execute_external_tool_batch(
     before_execute: Any = None,
 ) -> ExternalToolBatchReceipt | None:
     """Persist, canonically execute once, persist results, then prove read-back."""
+    if assistant_row.get("_db_persisted"):
+        raise ExternalToolBatchPersistenceError("external persistence marker is forbidden")
+    assistant_row.pop("_db_persisted", None)
+    marker = uuid4().hex
+    metadata = assistant_row.get("display_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata[_BATCH_MARKER_KEY] = marker
+    assistant_row["display_metadata"] = metadata
     before_ids: set[int] = set()
     if require_receipt:
         before_ids = {
@@ -132,18 +146,42 @@ def execute_external_tool_batch(
         raise ExternalToolBatchPersistenceError(
             "assistant tool-call row was not persisted before execution"
         )
+    assistant_matches = [
+        row for row in _read_rows(agent)
+        if type(row.get("id")) is int
+        and row["id"] > envelope.high_water_row_id
+        and row["id"] not in before_ids
+        and row.get("role") == "assistant"
+        and (row.get("display_metadata") or {}).get(_BATCH_MARKER_KEY) == marker
+        and tuple(
+            call.get("id") for call in (row.get("tool_calls") or [])
+            if isinstance(call, dict)
+        ) == envelope.call_ids
+    ]
+    if len(assistant_matches) != 1:
+        raise ExternalToolBatchPersistenceError(
+            "exact marked assistant row was not durable before execution"
+        )
 
     if before_execute is not None:
         before_execute()
 
-    agent._execute_tool_calls(
-        assistant_message,
-        messages,
-        envelope.task_id,
-        envelope.api_call_count,
-    )
+    previous_marker = getattr(agent, "_external_tool_batch_marker", None)
+    agent._external_tool_batch_marker = marker
+    try:
+        agent._execute_tool_calls(
+            assistant_message,
+            messages,
+            envelope.task_id,
+            envelope.api_call_count,
+        )
+    finally:
+        if previous_marker is None:
+            delattr(agent, "_external_tool_batch_marker")
+        else:
+            agent._external_tool_batch_marker = previous_marker
     if getattr(agent, "_incremental_persistence_failed", False):
         raise ExternalToolBatchPersistenceError("tool-result persistence failed")
     if not require_receipt:
         return None
-    return _prove_receipt(agent, envelope, before_ids)
+    return _prove_receipt(agent, envelope, before_ids, marker)
