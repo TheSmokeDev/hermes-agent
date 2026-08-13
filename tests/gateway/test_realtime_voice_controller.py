@@ -1275,6 +1275,46 @@ async def test_provider_completion_waits_for_local_drain_before_retirement(bindi
 
 
 @pytest.mark.asyncio
+async def test_speech_start_retains_pending_response_authority_for_exact_late_start(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    replacement = InputTranscript(
+        "speech-item", "replacement-turn", "replacement", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    marker = ToolCall(
+        call_id="call", batch_id="batch", turn_id="turn",
+        response_id="other-response", name="inert", arguments={},
+    )
+    await session.incoming.put(InputSpeechStarted("speech-item", 123))
+    await session.incoming.put(replacement)
+    await session.incoming.put(marker)
+    await _eventually(
+        lambda: any(event.provider_event is marker for event in controller.lifecycle_events)
+    )
+    assert controller._native_response is not None
+    assert controller._native_response.response_id is None
+    assert controller._barge_in_barrier is not None
+    assert controller._barge_in_barrier.transcript is replacement
+
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await host.acquire_entered.wait()
+    await session.cancel_entered.wait()
+    await host.leases[0].interrupt_entered.wait()
+    assert session.cancelled_responses == ["response"]
+    assert host.leases[0].interrupt_calls == 1
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        and event.detail == "native response event failed"
+        for event in controller.lifecycle_events
+    )
+    await session.incoming.put(Interruption("response", "host-turn"))
+    await _eventually(lambda: len(host.submitted) == 2)
+    assert [item.text for item in host.submitted] == ["question", "replacement"]
+    assert controller._barge_in_barrier is None
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
 async def test_speech_start_fences_native_response_without_blocking_event_pump(binding):
     session = _Session()
     session.block_cancel = True
@@ -1331,6 +1371,77 @@ async def test_speech_start_fences_native_response_without_blocking_event_pump(b
     host.interrupt_release.set()
     lease.interrupt_release.set()
     await _eventually(lambda: len(host.retired) == 1)
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_speech_start_waits_for_blocked_acquire_and_interrupts_exact_late_lease(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    host.block_acquire = True
+    host.acquire_release.clear()
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await host.acquire_entered.wait()
+    marker = ToolCall(
+        call_id="call", batch_id="batch", turn_id="turn",
+        response_id="other-response", name="inert", arguments={},
+    )
+
+    await session.incoming.put(InputSpeechStarted("speech-item", 123))
+    await session.incoming.put(marker)
+    await _eventually(
+        lambda: any(event.provider_event is marker for event in controller.lifecycle_events)
+    )
+    await session.cancel_entered.wait()
+    assert host.leases == []
+    assert session.cancelled_responses == ["response"]
+
+    host.acquire_release.set()
+    await _eventually(lambda: len(host.leases) == 1)
+    await host.leases[0].interrupt_entered.wait()
+    assert host.leases[0].interrupt_calls == 1
+    await _eventually(lambda: host.retire_calls == 1)
+    await session.incoming.put(Interruption("response", "host-turn"))
+    await _eventually(lambda: controller._barge_in_barrier is None)
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_speech_start_preempts_blocked_pcm_write_without_stalling_event_pump(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    lease.block_write = True
+    lease.write_release.clear()
+    await session.incoming.put(
+        OutputAudio(b"\x01\x00", "item", "host-turn", "response")
+    )
+    await lease.write_entered.wait()
+    marker = ToolCall(
+        call_id="call", batch_id="batch", turn_id="turn",
+        response_id="other-response", name="inert", arguments={},
+    )
+
+    await session.incoming.put(InputSpeechStarted("speech-item", 123))
+    await session.incoming.put(marker)
+    await _eventually(
+        lambda: any(event.provider_event is marker for event in controller.lifecycle_events)
+    )
+    await session.cancel_entered.wait()
+    await lease.interrupt_entered.wait()
+
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 1
+    assert lease.writes == []
+    await session.incoming.put(Interruption("response", "host-turn"))
+    await _eventually(lambda: controller._barge_in_barrier is None)
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
     await controller.close(reason="test")
 
 
