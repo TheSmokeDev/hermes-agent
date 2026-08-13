@@ -1618,6 +1618,175 @@ async def test_malformed_utf8_replacement_is_ignored_without_replacing_first_val
     await controller.close(reason="test")
 
 
+class _SubclassedInputTranscript(InputTranscript):
+    pass
+
+
+def _barge_in_transcript_case(case: str) -> tuple[list[InputTranscript], InputTranscript]:
+    valid = InputTranscript(
+        "speech-item", "replacement-turn", "accepted", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    partial = InputTranscript(
+        "speech-item", "partial-turn", "partial", False,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    if case == "partial-then-valid-final":
+        return [partial, valid], valid
+    if case == "valid-final-then-partial":
+        return [valid, partial], valid
+    if case == "duplicate-conflicting-finals":
+        conflicting = InputTranscript(
+            "speech-item", "conflicting-turn", "conflict", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        )
+        return [valid, valid, conflicting], valid
+    if case == "wrong-item":
+        rejected = InputTranscript(
+            "wrong-item", "wrong-turn", "wrong", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        )
+    elif case == "participant-provenance":
+        rejected = InputTranscript(
+            "speech-item", "participant-turn", "participant", True,
+            TranscriptRole.PARTICIPANT,
+            TranscriptProvenance.PARTICIPANT_INPUT_AUDIO,
+        )
+    elif case == "subclassed-input-transcript":
+        rejected = _SubclassedInputTranscript(
+            "speech-item", "subclass-turn", "subclass", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        )
+    elif case == "character-oversize":
+        rejected = InputTranscript(
+            "speech-item", "character-turn", "x" * 9, True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        )
+    elif case == "utf8-byte-oversize":
+        rejected = InputTranscript(
+            "speech-item", "byte-turn", "é" * 5, True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        )
+    elif case == "malformed-surrogate":
+        rejected = InputTranscript(
+            "speech-item", "surrogate-turn", "\ud800", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        )
+    else:
+        raise AssertionError(f"unknown transcript case: {case}")
+    return [rejected, valid], valid
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "partial-then-valid-final",
+        "valid-final-then-partial",
+        "duplicate-conflicting-finals",
+        "wrong-item",
+        "participant-provenance",
+        "subclassed-input-transcript",
+        "character-oversize",
+        "utf8-byte-oversize",
+        "malformed-surrogate",
+    ],
+)
+@pytest.mark.asyncio
+async def test_barge_in_transcript_filter_retains_only_first_exact_valid_final(
+    binding, case,
+):
+    controller, session, host = await _open_pending_native_response(
+        binding, max_transcript_chars=8
+    )
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    events, retained = _barge_in_transcript_case(case)
+
+    for event in events:
+        await session.incoming.put(event)
+    await host.interrupt_entered.wait()
+    await _eventually(lambda: controller._barge_in_barrier.transcript is retained)
+
+    assert [item.text for item in host.authorized] == ["question"]
+    assert [item.text for item in host.submitted] == ["question"]
+    assert len(session.response_requests) == 1
+    assert controller._barge_in_barrier is not None
+    assert not controller._barge_in_barrier.provider_terminal.is_set()
+
+    host.interrupt_release.set()
+    await _eventually(
+        lambda: controller._barge_in_barrier.playback_terminal.is_set()
+        and controller._barge_in_barrier.host_terminal.is_set()
+    )
+    assert [item.text for item in host.submitted] == ["question"]
+    await session.incoming.put(ResponseCompleted("response", "host-turn"))
+    await _eventually(lambda: len(host.submitted) == 2)
+    await _eventually(lambda: len(session.response_requests) == 2)
+
+    assert [item.text for item in host.authorized] == ["question", "accepted"]
+    assert [item.text for item in host.submitted] == ["question", "accepted"]
+    assert len(session.response_requests) == 2
+    assert controller._closed is False
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_barge_in_provider_terminal_requires_exact_current_authority(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    await session.cancel_entered.wait()
+    barrier = controller._barge_in_barrier
+    assert barrier is not None
+
+    class SubclassedCompletion(ResponseCompleted):
+        pass
+
+    rejected = [
+        (ResponseCompleted("wrong-response", "host-turn"), 1),
+        (ResponseCompleted("response", "wrong-turn"), 1),
+        (SubclassedCompletion("response", "host-turn"), 1),
+        (ResponseCompleted("response", "host-turn"), 0),
+    ]
+    for event, generation in rejected:
+        try:
+            await controller._handle_event(event, generation)
+        except RuntimeError:
+            pass
+        assert not barrier.provider_terminal.is_set()
+        assert [item.text for item in host.submitted] == ["question"]
+
+    exact = ResponseCompleted("response", "host-turn")
+    await controller._handle_event(exact, 1)
+    assert barrier.provider_terminal.is_set()
+    assert [item.text for item in host.submitted] == ["question"]
+    await controller._handle_event(exact, 1)
+    assert barrier.provider_terminal.is_set()
+    assert [item.text for item in host.submitted] == ["question"]
+
+    host.interrupt_release.set()
+    await _eventually(lambda: len(host.submitted) == 2)
+    await _eventually(lambda: len(session.response_requests) == 2)
+    assert [item.text for item in host.submitted] == ["question", "replacement"]
+    assert len(session.response_requests) == 2
+    await controller.close(reason="test")
+
+
 @pytest.mark.asyncio
 async def test_interrupt_cancels_only_bound_response_and_retires_interrupted_lease(
     binding,
@@ -1811,11 +1980,11 @@ async def test_incompatible_returned_session_closes_session_and_host_before_pump
     ]
 
 
-async def _open_pending_native_response(binding):
+async def _open_pending_native_response(binding, **controller_kwargs):
     session = _Session()
     assert register_provider(_Provider(session))
     host = _NativeHost()
-    controller = GatewayRealtimeVoiceController(host)
+    controller = GatewayRealtimeVoiceController(host, **controller_kwargs)
     await controller.open("fake", RealtimeVoiceSetup(), binding)
     await session.incoming.put(
         InputTranscript(
