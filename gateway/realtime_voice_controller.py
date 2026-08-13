@@ -469,6 +469,12 @@ class GatewayRealtimeVoiceController:
             self._emit(ControllerLifecycle.LISTENING, generation=generation)
             return
         if isinstance(event, SessionFailure):
+            session = self._session
+            resumable = (
+                session is not None
+                and RealtimeCapability.SESSION_RESUMPTION in session.capabilities
+                and self._resume_token is not None
+            )
             if self._native_response is not None:
                 self._emit(
                     ControllerLifecycle.FAILED,
@@ -476,14 +482,19 @@ class GatewayRealtimeVoiceController:
                     provider_event=event,
                     generation=generation,
                 )
+                if resumable:
+                    await self.interrupt()
+                    self._reconnecting = True
+                    await self._stop_audio_for_reconnect()
+                    self._emit(
+                        ControllerLifecycle.RECONNECTING,
+                        detail="native provider failure",
+                        generation=generation,
+                    )
+                    return
                 await self._native_failure("native provider failure")
                 return
-            session = self._session
-            if (
-                session is not None
-                and RealtimeCapability.SESSION_RESUMPTION in session.capabilities
-                and self._resume_token is not None
-            ):
+            if resumable:
                 self._reconnecting = True
                 await self._stop_audio_for_reconnect()
                 self._emit(
@@ -507,13 +518,14 @@ class GatewayRealtimeVoiceController:
                 if self._lifecycle_events
                 else ControllerLifecycle.CONNECTING
             )
+            detail = "provider closed" if self._native_response is not None else event.reason
             self._emit(
                 lifecycle,
-                detail=event.reason,
+                detail=detail,
                 provider_event=event,
                 generation=generation,
             )
-            await self.close(reason=event.reason or "provider closed")
+            await self.close(reason=detail or "provider closed")
             return
         if type(event) is InputSpeechStarted:
             await self._handle_speech_started(event, generation)
@@ -620,6 +632,9 @@ class GatewayRealtimeVoiceController:
             asyncio.shield(host_task),
             return_exceptions=True,
         )
+        async with self._native_lock:
+            if self._barge_in_barrier is not barrier:
+                return
         if terminal_result is False and barrier.response.playback_interrupted:
             barrier.playback_terminal.set()
         if host_result is None:
@@ -634,6 +649,9 @@ class GatewayRealtimeVoiceController:
         await barrier.provider_terminal.wait()
         if not barrier.playback_terminal.is_set() or not barrier.host_terminal.is_set():
             return
+        async with self._native_lock:
+            if self._barge_in_barrier is not barrier:
+                return
         async with self._admission_lock:
             async with self._native_lock:
                 event = barrier.transcript
@@ -944,6 +962,7 @@ class GatewayRealtimeVoiceController:
             operation = state.operation_task
             if (
                 operation is not None
+                and state.response_id is not None
                 and operation is not state.acquire_task
                 and not operation.done()
             ):
@@ -1184,10 +1203,21 @@ class GatewayRealtimeVoiceController:
     async def _native_failure(self, detail: str) -> None:
         if not self._closing:
             self._emit(ControllerLifecycle.FAILED, detail=detail)
+        async with self._native_lock:
+            barrier = self._barge_in_barrier
+            if barrier is not None:
+                barrier.transcript = None
+                barrier.provider_terminal.set()
+                barrier_worker = barrier.worker
+                self._barge_in_barrier = None
+            else:
+                barrier_worker = None
         terminal_task = await self._claim_native_terminal("failure")
         cleanup_failed = (
             await asyncio.shield(terminal_task) if terminal_task is not None else False
         )
+        if barrier_worker is not None and barrier_worker is not asyncio.current_task():
+            await asyncio.shield(barrier_worker)
         await self._request_close(
             "native response cleanup failed" if cleanup_failed else detail
         )
@@ -1250,12 +1280,20 @@ class GatewayRealtimeVoiceController:
     async def interrupt(self) -> None:
         self._interrupt_generation += 1
         failure: BaseException | None = None
+        barrier_worker: asyncio.Task[None] | None = None
         async with self._admission_lock:
             try:
                 session = self._session
                 binding = self._binding
                 if session is None or binding is None or self._closing:
                     return
+                async with self._native_lock:
+                    barrier = self._barge_in_barrier
+                    if barrier is not None:
+                        barrier.transcript = None
+                        barrier.provider_terminal.set()
+                        barrier_worker = barrier.worker
+                        self._barge_in_barrier = None
                 terminal_task = await self._claim_native_terminal("interrupt")
                 if terminal_task is not None:
                     cleanup_failed = await asyncio.shield(terminal_task)
@@ -1273,6 +1311,8 @@ class GatewayRealtimeVoiceController:
                 # could authorize against an attachment already known to be unsafe.
                 self._closing = True
                 failure = exc
+        if barrier_worker is not None and barrier_worker is not asyncio.current_task():
+            await asyncio.shield(barrier_worker)
         if failure is not None:
             reason = (
                 "native response cleanup failed"
@@ -1389,11 +1429,25 @@ class GatewayRealtimeVoiceController:
                 late_session = None
             if late_session is not None and self._session is None:
                 self._session = late_session
+        async with self._native_lock:
+            barrier = self._barge_in_barrier
+            if barrier is not None:
+                barrier.transcript = None
+                barrier.provider_terminal.set()
+                barrier_worker = barrier.worker
+                self._barge_in_barrier = None
+            else:
+                barrier_worker = None
         terminal_task = await self._claim_native_terminal("close")
         if terminal_task is not None:
             try:
                 if await asyncio.shield(terminal_task):
                     cleanup_detail = "native response cleanup failed"
+            except BaseException:
+                cleanup_detail = "native response cleanup failed"
+        if barrier_worker is not None and barrier_worker is not asyncio.current_task():
+            try:
+                await asyncio.shield(barrier_worker)
             except BaseException:
                 cleanup_detail = "native response cleanup failed"
         admission = self._admission

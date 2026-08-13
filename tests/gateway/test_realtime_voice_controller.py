@@ -71,6 +71,10 @@ class _Session(RealtimeVoiceSession):
         super().__init__(effective_capabilities)
         self.response_requests: list[RealtimeResponseRequest] = []
         self.response_started = asyncio.Event()
+        self.block_start = False
+        self.start_release = asyncio.Event()
+        self.start_release.set()
+        self.start_error: BaseException | None = None
         self.cancelled_responses: list[str] = []
         self.cancel_entered = asyncio.Event()
         self.cancel_release = asyncio.Event()
@@ -96,6 +100,10 @@ class _Session(RealtimeVoiceSession):
     async def _start_response(self, request: RealtimeResponseRequest) -> None:
         self.response_requests.append(request)
         self.response_started.set()
+        if self.block_start:
+            await self.start_release.wait()
+        if self.start_error is not None:
+            raise self.start_error
 
     async def _cancel_response(self, response_id: str) -> None:
         self.cancelled_responses.append(response_id)
@@ -2067,6 +2075,200 @@ async def test_interrupt_and_close_share_one_blocked_cancel_and_one_terminal_own
     assert host.retire_calls == 1
     assert host.close_calls == 1
     assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_public_interrupt_retires_active_barge_in_barrier_without_duplicate_cleanup(
+    binding,
+):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    replacement = InputTranscript(
+        "speech-item", "replacement-turn", "replacement", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(replacement, 1)
+    await host.interrupt_entered.wait()
+
+    interrupting = asyncio.create_task(controller.interrupt())
+    host.interrupt_release.set()
+    await interrupting
+
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 1
+    assert host.retire_calls == 1
+    assert [item.text for item in host.submitted] == ["question"]
+    assert not [
+        task for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_coro().__qualname__.endswith("._run_barge_in_barrier")
+    ]
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["close", "failure", "closed"])
+async def test_lifecycle_terminal_retires_blocked_barge_in_before_closed(
+    binding, terminal,
+):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    await host.interrupt_entered.wait()
+
+    if terminal == "close":
+        retiring = asyncio.create_task(controller.close(reason="operator close"))
+    else:
+        event = (
+            SessionFailure(code="network", message="secret failure")
+            if terminal == "failure"
+            else SessionClosed(reason="secret closure")
+        )
+        retiring = asyncio.create_task(controller._handle_event(event, 1))
+    host.interrupt_release.set()
+    await retiring
+    await controller.close(reason="join")
+
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert session.cancelled_responses == ["response"]
+    assert lease.interrupt_calls == 1
+    assert host.retire_calls == 1
+    assert [item.text for item in host.submitted] == ["question"]
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+    if terminal != "close":
+        assert all(
+            "secret" not in event.detail for event in controller.lifecycle_events
+        )
+
+
+@pytest.mark.asyncio
+async def test_resumable_failure_retires_active_barge_in_before_new_generation(binding):
+    session = _Session(frozenset({RealtimeCapability.SESSION_RESUMPTION}))
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await controller._handle_event(SessionReady(session_id="resume-token"), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "input", "input-turn", "question", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    host.block_interrupt = True
+    host.interrupt_release.clear()
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    await host.interrupt_entered.wait()
+
+    await session.incoming.put(SessionFailure(code="network", message="lost"))
+    host.interrupt_release.set()
+    await _eventually(lambda: controller._reconnecting)
+
+    assert controller._reconnecting is True
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert [item.text for item in host.submitted] == ["question"]
+    await controller.resume()
+    assert controller._transport_generation == 2
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "stale-turn", "stale", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    assert [item.text for item in host.submitted] == ["question"]
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_provider_start_failure_retires_pending_barge_in_without_fallback(binding):
+    session = _Session()
+    session.block_start = True
+    session.start_release.clear()
+    session.start_error = RuntimeError("secret start failure")
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    transcript = InputTranscript(
+        "input", "input-turn", "question", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    starting = asyncio.create_task(controller._handle_event(transcript, 1))
+    await session.response_started.wait()
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    session.start_release.set()
+    await starting
+    await controller.close(reason="join failure")
+
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert session.cancelled_responses == []
+    assert host.leases == []
+    assert [item.text for item in host.submitted] == ["question"]
+    assert any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        and event.detail == "native response start failed"
+        for event in controller.lifecycle_events
+    )
+    assert all("secret" not in event.detail for event in controller.lifecycle_events)
+
+
+@pytest.mark.asyncio
+async def test_playback_acquisition_failure_retires_pending_barge_in_without_fallback(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    host.acquire_error = RuntimeError("secret acquisition failure")
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    await controller.close(reason="join failure")
+
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert session.cancelled_responses == ["response"]
+    assert host.leases == []
+    assert [item.text for item in host.submitted] == ["question"]
+    assert all("secret" not in event.detail for event in controller.lifecycle_events)
 
 
 @pytest.mark.asyncio
