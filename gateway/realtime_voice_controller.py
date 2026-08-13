@@ -240,6 +240,7 @@ class _NativeResponseState:
     retired: bool = False
     playback_interrupted: bool = False
     response_started: asyncio.Event = field(default_factory=asyncio.Event)
+    response_start_ended: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(slots=True)
@@ -469,6 +470,7 @@ class GatewayRealtimeVoiceController:
             self._emit(ControllerLifecycle.LISTENING, generation=generation)
             return
         if isinstance(event, SessionFailure):
+            self._end_pending_response_start()
             session = self._session
             resumable = (
                 session is not None
@@ -531,6 +533,10 @@ class GatewayRealtimeVoiceController:
             await self._handle_speech_started(event, generation)
             return
         if type(event) is InputTranscript:
+            try:
+                text_bytes = event.text.encode("utf-8")
+            except (AttributeError, UnicodeEncodeError):
+                text_bytes = None
             async with self._native_lock:
                 barrier = self._barge_in_barrier
                 if (
@@ -542,9 +548,10 @@ class GatewayRealtimeVoiceController:
                     and event.role is TranscriptRole.OPERATOR
                     and event.provenance is TranscriptProvenance.OPERATOR_INPUT
                     and type(event.text) is str
+                    and text_bytes is not None
                     and bool(event.text.strip())
                     and len(event.text) <= self._max_transcript_chars
-                    and len(event.text.encode("utf-8")) <= self._max_transcript_chars
+                    and len(text_bytes) <= self._max_transcript_chars
                 ):
                     barrier.transcript = event
                 if barrier is not None:
@@ -602,12 +609,15 @@ class GatewayRealtimeVoiceController:
                 return
             self._interrupt_generation += 1
             terminal_task = self._claim_native_terminal_locked(state, "interrupt")
+            provider_terminal = asyncio.Event()
+            if state.provider_completed:
+                provider_terminal.set()
             barrier = _BargeInBarrier(
                 response=state,
                 transport_generation=generation,
                 interrupt_generation=self._interrupt_generation,
                 speech_item_id=event.item_id,
-                provider_terminal=asyncio.Event(),
+                provider_terminal=provider_terminal,
                 playback_terminal=asyncio.Event(),
                 host_terminal=asyncio.Event(),
             )
@@ -726,6 +736,8 @@ class GatewayRealtimeVoiceController:
                     raise
                 return
             finally:
+                if operation.done() and not operation.cancelled():
+                    state.response_start_ended.set()
                 async with self._native_lock:
                     if state.operation_task is operation and operation.done():
                         state.operation_task = None
@@ -746,6 +758,7 @@ class GatewayRealtimeVoiceController:
             )
             self._emit(ControllerLifecycle.THINKING, detail="native response pending")
         except BaseException:
+            state.response_start_ended.set()
             await self._native_failure("native response start failed")
 
     async def _handle_native_event(
@@ -959,6 +972,7 @@ class GatewayRealtimeVoiceController:
             state.terminal_intent = intent
         if intent != "drain":
             state.interrupted = True
+            state.response_start_ended.set()
             operation = state.operation_task
             if (
                 operation is not None
@@ -1024,12 +1038,15 @@ class GatewayRealtimeVoiceController:
                 and (state.terminal_intent or "failure") != "drain"
             )
         if wait_for_start:
-            try:
-                await asyncio.wait_for(
-                    state.response_started.wait(), timeout=self._interrupt_timeout
-                )
-            except BaseException:
-                cleanup_failed = True
+            started_waiter = asyncio.create_task(state.response_started.wait())
+            ended_waiter = asyncio.create_task(state.response_start_ended.wait())
+            done, pending = await asyncio.wait(
+                {started_waiter, ended_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for waiter in pending:
+                waiter.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
         try:
             authenticated = self._host.validate_native_output_request(state.request)
@@ -1393,6 +1410,7 @@ class GatewayRealtimeVoiceController:
         await self._request_close(reason)
 
     async def _request_close(self, reason: str) -> None:
+        self._end_pending_response_start()
         async with self._close_lock:
             if self._closed:
                 return
@@ -1405,9 +1423,23 @@ class GatewayRealtimeVoiceController:
                 close_task = asyncio.create_task(self._finish_close(reason))
                 self._close_task = close_task
                 close_task.add_done_callback(self._observe_close_task)
-        if asyncio.current_task() in {self._event_task, self._audio_task}:
+        current = asyncio.current_task()
+        barrier = self._barge_in_barrier
+        if current in {self._event_task, self._audio_task} or (
+            barrier is not None and current is barrier.worker
+        ):
             return
         await asyncio.shield(close_task)
+
+    def _end_pending_response_start(self) -> None:
+        state = self._native_response
+        if state is None or state.response_id is not None:
+            return
+        state.response_start_ended.set()
+        operation = state.operation_task
+        if operation is not None and not operation.done():
+            operation.cancel()
+
 
     @staticmethod
     def _observe_close_task(task: asyncio.Task[None]) -> None:

@@ -1133,7 +1133,7 @@ class _NativeHost(_Host):
         marker = self.turn_markers.pop(0) if self.turn_markers else "host-turn"
         reservation = _NativeReservation(
             binding.durable_session_id,
-            42,
+            len(self.submitted) + 40,
             marker,
             hashlib.sha256(text.encode()).hexdigest(),
             RealtimeOutputAudioFormat("audio/pcm", 24000, 1, "pcm_s16le", 2, "little"),
@@ -1558,6 +1558,63 @@ async def test_replacement_final_waits_for_three_exact_barge_in_gates(binding):
     await _eventually(lambda: len(host.submitted) == 2)
     assert [item.text for item in host.submitted] == ["question", "replacement"]
     assert controller._barge_in_barrier is None
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_completion_before_speech_start_satisfies_exact_provider_gate(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    await controller._handle_event(
+        OutputAudio(b"\x01\x00", "item", "host-turn", "response"), 1
+    )
+    lease.finish_release.clear()
+    await session.incoming.put(ResponseCompleted("response", "host-turn"))
+    await lease.finish_entered.wait()
+
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+    await _eventually(lambda: len(host.submitted) == 2)
+    await asyncio.sleep(0.05)
+
+    assert [item.text for item in host.submitted] == ["question", "replacement"]
+    assert len(session.response_requests) == 2, controller.lifecycle_events
+    assert controller._barge_in_barrier is None
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_malformed_utf8_replacement_is_ignored_without_replacing_first_valid(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    malformed = InputTranscript(
+        "speech-item", "bad-turn", "\ud800", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+    valid = InputTranscript(
+        "speech-item", "replacement-turn", "replacement", True,
+        TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+    )
+
+    await session.incoming.put(malformed)
+    await session.incoming.put(valid)
+    await session.incoming.put(Interruption("response", "host-turn"))
+    await _eventually(lambda: len(host.submitted) == 2)
+
+    assert [item.text for item in host.submitted] == ["question", "replacement"]
+    assert controller._closed is False
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
     await controller.close(reason="test")
 
 
@@ -2232,7 +2289,8 @@ async def test_provider_start_failure_retires_pending_barge_in_without_fallback(
         1,
     )
     session.start_release.set()
-    await starting
+    await asyncio.wait_for(starting, timeout=0.2)
+    await asyncio.wait_for(session.close_started.wait(), timeout=0.2)
     await controller.close(reason="join failure")
 
     assert controller._barge_in_barrier is None
@@ -2246,6 +2304,53 @@ async def test_provider_start_failure_retires_pending_barge_in_without_fallback(
         for event in controller.lifecycle_events
     )
     assert all("secret" not in event.detail for event in controller.lifecycle_events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["close", "closed"])
+async def test_lifecycle_terminal_immediately_retires_pending_response_start(
+    binding, terminal,
+):
+    session = _Session()
+    session.block_start = True
+    session.start_release.clear()
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    starting = asyncio.create_task(controller._handle_event(
+        InputTranscript(
+            "input", "input-turn", "question", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    ))
+    await session.response_started.wait()
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await controller._handle_event(
+        InputTranscript(
+            "speech-item", "replacement-turn", "replacement", True,
+            TranscriptRole.OPERATOR, TranscriptProvenance.OPERATOR_INPUT,
+        ),
+        1,
+    )
+
+    if terminal == "close":
+        terminalizing = asyncio.create_task(controller.close(reason="operator close"))
+    else:
+        event = SessionClosed(reason="provider closed")
+        terminalizing = asyncio.create_task(controller._handle_event(event, 1))
+    await asyncio.wait_for(terminalizing, timeout=0.2)
+    await asyncio.wait_for(starting, timeout=0.2)
+
+    assert controller._barge_in_barrier is None
+    assert controller._native_response is None
+    assert [item.text for item in host.submitted] == ["question"]
+    assert not [
+        task for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_coro().__qualname__.endswith("start_response")
+    ]
 
 
 @pytest.mark.asyncio
@@ -2269,6 +2374,27 @@ async def test_playback_acquisition_failure_retires_pending_barge_in_without_fal
     assert host.leases == []
     assert [item.text for item in host.submitted] == ["question"]
     assert all("secret" not in event.detail for event in controller.lifecycle_events)
+
+
+@pytest.mark.asyncio
+async def test_failed_barge_in_host_gate_close_does_not_await_its_own_worker(binding):
+    controller, session, host = await _open_pending_native_response(binding)
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    host.interrupt_error = RuntimeError("host gate failed")
+
+    await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await session.close_started.wait()
+    close_task = asyncio.create_task(controller.close(reason="join"))
+    done, _pending = await asyncio.wait({close_task}, timeout=0.1)
+
+    assert done == {close_task}
+    assert controller._closed is True
+    assert controller._barge_in_barrier is None
+    assert not [
+        task for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_coro().__qualname__.endswith("._run_barge_in_barrier")
+    ]
 
 
 @pytest.mark.asyncio
