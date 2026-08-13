@@ -1334,6 +1334,64 @@ async def test_speech_start_fences_native_response_without_blocking_event_pump(b
 
 
 @pytest.mark.asyncio
+async def test_speech_start_upgrades_blocked_drain_without_blocking_event_pump(binding):
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _NativeHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await session.incoming.put(ResponseStarted("response", "host-turn"))
+    await _eventually(lambda: len(host.leases) == 1)
+    lease = host.leases[0]
+    await session.incoming.put(
+        OutputAudio(b"\x01\x00", "item", "host-turn", "response")
+    )
+    await _eventually(lambda: lease.writes == [b"\x01\x00"])
+    lease.finish_release.clear()
+    await session.incoming.put(ResponseCompleted("response", "host-turn"))
+    await lease.finish_entered.wait()
+    terminal_owner = controller._native_response.terminal_task
+
+    marker = ToolCall(
+        call_id="call",
+        batch_id="batch",
+        turn_id="turn",
+        response_id="other-response",
+        name="inert",
+        arguments={},
+    )
+    await session.incoming.put(InputSpeechStarted("speech-item", 123))
+    await session.incoming.put(marker)
+
+    await lease.finish_cancelled.wait()
+    await lease.interrupt_entered.wait()
+    await _eventually(
+        lambda: any(event.provider_event is marker for event in controller.lifecycle_events)
+    )
+    assert controller._barge_in_barrier.response.terminal_task is terminal_owner
+    assert session.cancelled_responses == ["response"]
+    assert lease.finish_calls == 1
+    assert lease.interrupt_calls == 1
+    assert ControllerLifecycle.COMPLETED not in {
+        event.lifecycle for event in controller.lifecycle_events
+    }
+    await _eventually(lambda: len(host.retired) == 1)
+    assert len(host.retired) == 1
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
 async def test_interrupt_cancels_only_bound_response_and_retires_interrupted_lease(
     binding,
 ):

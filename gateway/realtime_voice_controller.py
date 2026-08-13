@@ -808,9 +808,10 @@ class GatewayRealtimeVoiceController:
             return
 
         assert terminal_task is not None
-        cleanup_failed = await asyncio.shield(terminal_task)
-        if cleanup_failed:
-            await self._request_close("native response cleanup failed")
+        if asyncio.current_task() is not self._event_task:
+            cleanup_failed = await asyncio.shield(terminal_task)
+            if cleanup_failed:
+                await self._request_close("native response cleanup failed")
 
     def _claim_native_terminal_locked(
         self, state: _NativeResponseState, intent: str
@@ -951,6 +952,20 @@ class GatewayRealtimeVoiceController:
 
             async with self._native_lock:
                 intent = state.terminal_intent or "failure"
+                response_id = state.response_id
+                send_cancel = (
+                    intent != "drain"
+                    and response_id is not None
+                    and not state.cancel_sent
+                )
+                if send_cancel:
+                    state.cancel_sent = True
+            if send_cancel and session is not None:
+                cancel_task = self._create_native_task(session.cancel_response(response_id))
+                try:
+                    await self._await_native_task(cancel_task)
+                except BaseException:
+                    cleanup_failed = True
             if receipt is None and intent != "drain":
                 terminal_method = "interrupt"
                 interrupt_task = self._create_native_task(
