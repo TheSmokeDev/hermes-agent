@@ -52,15 +52,11 @@ def test_realtime_attachment_capture_api_is_additive_and_fail_closed():
     from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
 
     ctx = _context()
+    original_state = dict(vars(ctx))
 
     with pytest.raises(RealtimeVoiceInvocationError, match="active gateway plugin command"):
         ctx.capture_realtime_voice_attachment_factory()
-    assert vars(ctx).keys() == {
-        "manifest",
-        "_manager",
-        "_llm",
-        "_subagent_lifecycle",
-    }
+    assert vars(ctx) == original_state
 
 
 def _write_plugin(

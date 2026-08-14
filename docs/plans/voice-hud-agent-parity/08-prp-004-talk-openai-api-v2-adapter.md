@@ -1,9 +1,9 @@
 # PRP-004 — Hermes Talk OpenAI Realtime API-v2 Input Adapter
 
-**Status:** Implementation-ready after one adversarial planning review  
-**Hermes Agent base:** `30b93e2410c212b0c62e761e365b10e5aeb1f374`  
-**Hermes Talk base:** `409787bf796e790050f35601fc9b1d0144e990e1`  
-**Depends on:** PRP-002 provider-neutral admission; PRP-003 gateway realtime controller and TUI host  
+**Status:** Implementation-ready after one adversarial planning review
+**Hermes Agent base:** `30b93e2410c212b0c62e761e365b10e5aeb1f374`
+**Hermes Talk base:** `409787bf796e790050f35601fc9b1d0144e990e1`
+**Depends on:** PRP-002 provider-neutral admission; PRP-003 gateway realtime controller and TUI host
 **Repositories:** Hermes Agent (bounded registration receipt fix + contract); Hermes Talk (provider implementation)
 
 ## Outcome
