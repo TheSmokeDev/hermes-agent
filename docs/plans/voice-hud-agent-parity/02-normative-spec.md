@@ -46,6 +46,15 @@ Normative terms **MUST**, **SHALL**, **SHOULD**, and **MAY** are binding for thi
 - **VH-025 Migration:** Talk SHALL implement/register the core provider API before its fixed tool executor is retired. Compatibility lanes MAY remain explicitly capability-gated and SHALL report degraded status truthfully.
 - **VH-026 Desktop:** Desktop owns the compact HUD controls and projections; it consumes the backend contract and canonical stores.
 
+## Surface-mountable Talk and manager routing
+
+- **VH-027 One Talk capability:** HUD, Bot Mode, Desktop chat, Discord, and future authorized surfaces SHALL mount one reusable Talk attachment contract. They SHALL NOT create surface-specific manager brains, tool executors, memories, or orchestration ledgers.
+- **VH-028 Exact surface binding:** Every attachment SHALL bind a host-issued surface identifier, profile, routing key, runtime session, durable session, provider session, attachment generation, and principal policy. Selected-bot, visible-task, pane, or workspace context is advisory unless the canonical host resolves it against that binding.
+- **VH-029 Intelligent execution choice:** The canonical Hermes manager SHALL own the requested outcome and MAY reason or act directly, use canonical tools, operate the computer, delegate to persistent profiles, spawn temporary subagents, or invoke approved external-agent lanes. No surface SHALL hardcode which lane the manager must use.
+- **VH-030 Surface hooks:** A surface MAY expose bounded hooks for its own UI context and actions. Hook schemas and results SHALL pass through host registration, authorization, approval, and receipt policy; hooks SHALL NOT provide a second dispatch path around canonical Hermes middleware.
+- **VH-031 Complementary cockpit views:** HUD SHALL project immediate conversation, interruption, approval, progress, and receipt state. Bot Mode SHALL project persistent profiles, capabilities, canonical chats, routines, and activity. Both SHALL consume canonical backend state rather than mirror it into independent truth stores.
+- **VH-032 Detach semantics:** Closing or switching a HUD/Bot Mode/Discord attachment SHALL stop that transport's capture, playback, and admission. It SHALL NOT cancel canonical background work unless the operator explicitly requests cancellation through the owning Hermes session.
+
 ## Required host bridge
 
 A provider-neutral same-session bridge SHALL define equivalents of:
@@ -82,3 +91,5 @@ A release candidate SHALL demonstrate with a fake provider and temporary `HERMES
 6. interruption, inactivity, provider failure, reconnect, and repeated close leave no microphone/playback/session leak;
 7. participant speech cannot mint operator authority;
 8. background work survives voice close unless explicitly cancelled.
+9. the same Talk attachment contract can bind HUD and Bot Mode to the intended canonical session without duplicating tools, memory, approvals, or work state;
+10. the manager can choose direct execution or delegation and both paths produce canonical progress and final receipts.

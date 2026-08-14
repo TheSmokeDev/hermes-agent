@@ -1,6 +1,6 @@
 # Voice HUD Agent Parity — Intent / PRD
 
-**Status:** Draft for one adversarial review
+**Status:** Product direction locked; delivery remains staged
 **Epic:** Voice HUD Agent Parity
 **Product owner:** SmokeDev
 **Repositories:** `NousResearch/hermes-agent` + standalone `TheSmokeDev/hermes-talk`
@@ -10,6 +10,20 @@
 Hermes should stop feeling like a window the operator must switch into. It should become an always-available agent layer over whatever app the operator is already using: summon the Desktop Quick Entry HUD, speak naturally, and ask the same Hermes session to think, use tools, operate the computer, run skills, manage Kanban, delegate agents, or answer a quick question.
 
 The voice surface is not a second agent. It is another input/output transport for the active Hermes session.
+
+## Locked product shape
+
+Hermes presents one fast, intelligent manager through multiple authorized surfaces. The manager owns the outcome and chooses the best execution lane for each step: reason or act directly, use a canonical Hermes tool, operate the computer, delegate to a persistent profile, spawn a temporary subagent, or hand work to Codex/Claude. Delegation is a routing decision, not a limitation on what the manager may do itself.
+
+Hermes Talk is one reusable realtime voice capability, not a separate voice brain per product surface. HUD, Bot Mode, Desktop chat, Discord, and future surfaces may mount that capability against an exact active profile and canonical Hermes session. Closing one surface detaches its transport; it does not create, replace, or silently cancel the manager or its background work.
+
+HUD and Bot Mode are complementary views of the same manager cockpit:
+
+- **HUD** owns immediate summon, voice/text input, interruption, compact progress, approvals, and receipts.
+- **Bot Mode** owns the persistent workforce view: named profile agents, capabilities, chats, routines, activity, and selection.
+- **Hermes core/gateway** remains the sole authority for sessions, tools, hooks, approvals, persistence, delegation, and receipts.
+
+Surface hooks may provide trusted context and bounded surface actions, such as the selected bot, visible task, or opening a canonical pane. They do not become an alternate tool registry or grant mutation authority.
 
 ## Product promise
 
@@ -29,6 +43,8 @@ When the operator speaks through the HUD or an authorized voice surface:
 3. **Work orchestration:** use skills, create/manage Kanban work, delegate Codex/Claude/subagents, and monitor or redirect them.
 4. **Business operation:** draft or publish content, manage email and calendars, prepare workbooks/documents, and update systems through the same normal approval path.
 5. **Ambient continuity:** summon or dismiss the HUD without losing the active Hermes session.
+6. **Intelligent routing:** ask one manager for an outcome and let it choose direct execution, canonical tools, computer use, persistent agents, or temporary workers while remaining conversationally available.
+7. **Workforce visibility:** inspect and address persistent profile agents and their routines through Bot Mode without turning those profiles into a second orchestration authority.
 
 ## Experience
 

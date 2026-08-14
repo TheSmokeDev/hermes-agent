@@ -5,7 +5,7 @@
 
 ## North star
 
-Quick Entry becomes the compact, always-available voice surface for the same active Hermes session. Turn-based full-capability parity ships first; provider-native realtime replaces the transport behind the same authority and HUD contracts later.
+Quick Entry becomes the compact, always-available voice surface for the same active Hermes manager session. Turn-based full-capability parity ships first; provider-native realtime replaces the transport behind the same authority and HUD contracts later. Bot Mode provides the complementary persistent-workforce view over profile agents, canonical chats, capabilities, and routines.
 
 The HUD and Discord voice are peer operator surfaces, not tool executors. Both admit speech into the same authoritative Hermes session; Hermes owns computer use, screenshots, approvals, tools, persistence, and receipts. A remote operator can therefore ask through Discord voice for work on the Desktop without copying the computer-use catalog into either audio surface.
 
@@ -16,6 +16,7 @@ The HUD and Discord voice are peer operator surfaces, not tool executors. Both a
 | Hermes core/gateway | active session, turn lease, agent/tool policy, approvals, persistence, normalized realtime contract/events | provider credentials, Desktop presentation |
 | Hermes Desktop | HUD, native mic permission, capture/playback, captions and projections, active target selection | tools, approval truth, provider credentials |
 | Hermes Talk plugin | OpenAI Realtime adapter, terminal/Discord audio, immutable Discord speaker attribution, setup/doctor | general Hermes tool executor, canonical session persistence |
+| Bot Mode desktop plugin | persistent profile roster, profile configuration, canonical bot-chat navigation, routines, activity and selection | manager authority, general tool dispatch, approval truth, separate voice brain |
 
 ## Epic slices
 
@@ -32,6 +33,7 @@ The HUD and Discord voice are peer operator surfaces, not tool executors. Both a
 | PRP-009 | Resilience and presence truth | Hermes Agent + Talk | prior runtime slices | inactivity/reconnect/profile switch/teardown are visible, bounded and leak-free |
 | PRP-010 | Setup, compatibility, docs and release gate | both | all | provider catalog/config/doctor, turn-based fallback, E2E fake-provider proof |
 | PRP-011 | Remote visual receipts and optional live desktop stream | Hermes Agent + Talk adapter | PRP-006, PRP-007, PRP-009 | Discord/HUD can request canonical screenshots and receive bounded visual receipts; any live stream is explicit, permissioned, observable and revocable |
+| PRP-012 | Surface-mountable Talk + manager cockpit integration | Hermes Agent Desktop + Bot Mode + Talk | PRP-003–005, PRP-007 | HUD and Bot Mode mount the same Talk attachment contract against an exact canonical manager session; direct and delegated work share progress, approvals, and receipts |
 
 ## Requirement ownership
 
@@ -47,6 +49,7 @@ The HUD and Discord voice are peer operator surfaces, not tool executors. Both a
 | VH-007–011 provenance/memory | PRP-008 |
 | VH-014–017 complete resilience | PRP-009 |
 | VH-021, VH-025 compatibility/setup/release | PRP-010 |
+| VH-027–032 reusable Talk attachment and manager cockpit | PRP-012 |
 
 ## Critical path
 
