@@ -45,7 +45,9 @@ class _Provider(RealtimeVoiceProvider):
 
 
 def _context():
-    return PluginContext(PluginManifest(name="receipt-test"), object())
+    from hermes_cli.plugins import PluginManager
+
+    return PluginContext(PluginManifest(name="receipt-test"), PluginManager())
 
 
 def test_realtime_attachment_capture_api_is_additive_and_fail_closed():
@@ -174,6 +176,9 @@ class TestRegisterRealtimeVoiceProvider:
             f"Plugin failed to load: {manager._plugins['my-realtime-plugin'].error}"
         )
         assert realtime_voice_registry.get_provider("fake-realtime") is not None
+
+        assert manager.unload("my-realtime-plugin") is True
+        assert realtime_voice_registry.get_provider("fake-realtime") is None
 
         realtime_voice_registry._reset_for_tests()
 

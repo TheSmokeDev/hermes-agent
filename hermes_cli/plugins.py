@@ -2813,6 +2813,7 @@ class PluginContext:
 
     # -- realtime voice provider registration -------------------------------
 
+    @_serialized_replacement
     def register_realtime_voice_provider(self, provider) -> bool:
         """Register a bidirectional realtime voice backend and report acceptance.
 
@@ -2831,7 +2832,11 @@ class PluginContext:
         return ``False`` without disabling the plugin.
         """
         from agent.realtime_voice_provider import RealtimeVoiceProvider
-        from agent.realtime_voice_registry import register_provider
+        from agent.realtime_voice_registry import (
+            register_provider,
+            restore_registration,
+            snapshot_registration,
+        )
 
         if not isinstance(provider, RealtimeVoiceProvider):
             logger.warning(
@@ -2840,8 +2845,24 @@ class PluginContext:
                 self.manifest.name,
             )
             return False
-        accepted = register_provider(provider)
+        registry_name = provider.name.strip().lower()
+        scope = self._manager.scope_key
+        previous = snapshot_registration(registry_name, scope=scope)
+        accepted = register_provider(provider, scope=scope)
         if accepted:
+            current = snapshot_registration(registry_name, scope=scope)
+            if current is not provider:
+                return False
+            self._track_replacement(
+                "realtime_voice_provider",
+                registry_name,
+                slot=("realtime_voice_provider", scope, registry_name),
+                current=provider,
+                previous=previous,
+                restore=lambda replacement: restore_registration(
+                    registry_name, provider, replacement, scope=scope
+                ),
+            )
             logger.info(
                 "Plugin '%s' registered realtime voice provider: %s",
                 self.manifest.name,
