@@ -46,6 +46,15 @@ class RealtimeExecutionAttachment:
 
         _close_realtime_execution_attachment(self)
 
+    def tool_definitions(self) -> list[dict[str, object]]:
+        """Return a detached provider-neutral snapshot of host-curated tools."""
+
+        from gateway.realtime_voice_invocation import (
+            _tool_definitions_for_realtime_execution_attachment,
+        )
+
+        return _tool_definitions_for_realtime_execution_attachment(self)
+
 
 def _mint_realtime_execution_attachment() -> RealtimeExecutionAttachment:
     return RealtimeExecutionAttachment(_MINT)

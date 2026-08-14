@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import math
+import re
 import threading
 import weakref
 from dataclasses import dataclass
@@ -79,6 +82,12 @@ class _GatewayHostState:
 
 _MINT = object()
 _state_lock = threading.RLock()
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAX_REALTIME_TOOLS = 128
+_MAX_TOOL_DESCRIPTION_BYTES = 16_384
+_MAX_TOOL_SCHEMA_DEPTH = 16
+_MAX_TOOL_SCHEMA_NODES = 4_096
+_MAX_TOOL_DEFINITIONS_BYTES = 262_144
 _invocation_states: weakref.WeakKeyDictionary[PluginCommandInvocation, _InvocationState]
 _factory_records: weakref.WeakKeyDictionary[
     RealtimeVoiceAttachmentFactory, _FactoryRecord
@@ -577,6 +586,137 @@ def _record_for_realtime_execution_attachment(
             "realtime execution attachment authority changed"
         )
     return record
+
+
+def _tool_definitions_for_realtime_execution_attachment(
+    value: object,
+) -> list[dict[str, object]]:
+    """Project the exact live agent's already-curated provider tool surface."""
+
+    with _state_lock:
+        record = _execution_attachment_records.get(value)
+    runner = record.runner_ref() if record is not None else None
+    if runner is None:
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment authority changed"
+        )
+    record = _record_for_realtime_execution_attachment(value, runner)
+    agent = record.route_pin.agent
+    from tools.mcp_tool import _agent_tools_lock
+
+    with _agent_tools_lock:
+        tools = getattr(agent, "tools", None)
+        valid_names = getattr(agent, "valid_tool_names", None)
+        projected = _project_realtime_tool_definitions(tools, valid_names)
+    # A route/agent/lease rotation that wins while the bounded projection runs
+    # invalidates the result. A later rotation linearizes after this call.
+    _record_for_realtime_execution_attachment(value, runner)
+    return projected
+
+
+def _unsafe_tool_schema() -> RealtimeVoiceInvocationError:
+    # Never interpolate attacker-controlled schema values into the exception.
+    return RealtimeVoiceInvocationError("live agent tool schema is unsafe")
+
+
+def _copy_bounded_json(value: object, *, depth: int, budget: list[int]) -> object:
+    if depth > _MAX_TOOL_SCHEMA_DEPTH:
+        raise _unsafe_tool_schema()
+    budget[0] += 1
+    if budget[0] > _MAX_TOOL_SCHEMA_NODES:
+        raise _unsafe_tool_schema()
+    if type(value) is dict:
+        copied: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str or key == "default":
+                raise _unsafe_tool_schema()
+            try:
+                if len(key.encode("utf-8")) > 512:
+                    raise _unsafe_tool_schema()
+            except UnicodeEncodeError as exc:
+                raise _unsafe_tool_schema() from exc
+            copied[key] = _copy_bounded_json(
+                item, depth=depth + 1, budget=budget
+            )
+        return copied
+    if type(value) is list:
+        return [
+            _copy_bounded_json(item, depth=depth + 1, budget=budget)
+            for item in value
+        ]
+    if type(value) is str:
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _unsafe_tool_schema() from exc
+        return value
+    if value is None or type(value) is bool or type(value) is int:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise _unsafe_tool_schema()
+
+
+def _project_realtime_tool_definitions(
+    tools: object, valid_names: object
+) -> list[dict[str, object]]:
+    if type(tools) is not list or len(tools) > _MAX_REALTIME_TOOLS:
+        raise _unsafe_tool_schema()
+    if type(valid_names) is not set or any(type(name) is not str for name in valid_names):
+        raise _unsafe_tool_schema()
+    projected: list[dict[str, object]] = []
+    names: set[str] = set()
+    for tool in tools:
+        if type(tool) is not dict or tool.get("type") != "function":
+            raise _unsafe_tool_schema()
+        function = tool.get("function")
+        if type(function) is not dict:
+            raise _unsafe_tool_schema()
+        name = function.get("name")
+        description = function.get("description")
+        parameters = function.get("parameters")
+        if (
+            type(name) is not str
+            or _TOOL_NAME_RE.fullmatch(name) is None
+            or name in names
+            or name not in valid_names
+            or type(description) is not str
+            or type(parameters) is not dict
+            or parameters.get("type") != "object"
+        ):
+            raise _unsafe_tool_schema()
+        try:
+            description_bytes = description.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _unsafe_tool_schema() from exc
+        if len(description_bytes) > _MAX_TOOL_DESCRIPTION_BYTES or any(
+            ord(char) < 32 and ord(char) not in (9, 10, 13)
+            for char in description
+        ):
+            raise _unsafe_tool_schema()
+        copied_parameters = _copy_bounded_json(parameters, depth=0, budget=[0])
+        projected.append(
+            {
+                "name": name,
+                "description": description,
+                "parameters": copied_parameters,
+            }
+        )
+        names.add(name)
+    if names != valid_names:
+        raise _unsafe_tool_schema()
+    try:
+        encoded = json.dumps(
+            projected,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise _unsafe_tool_schema() from exc
+    if len(encoded) > _MAX_TOOL_DEFINITIONS_BYTES:
+        raise _unsafe_tool_schema()
+    return projected
 
 
 def _is_realtime_execution_attachment_closed(value: object) -> bool:

@@ -209,6 +209,7 @@ async def test_contextual_invocation_mints_one_opaque_execution_attachment():
     assert [name for name in dir(attachment) if not name.startswith("_")] == [
         "close",
         "closed",
+        "tool_definitions",
     ]
     for leaked_name in (
         "runner",
@@ -1145,3 +1146,236 @@ def test_compression_retry_without_matching_route_does_not_advance_generations()
     store.append_to_transcript("parent", {"role": "assistant", "content": "reroute"})
 
     assert store.get_exact_session_entry_snapshot(route) == before
+
+
+async def _committed_execution_attachment(runner, source):
+    captured = []
+    await _invoke(
+        runner,
+        source,
+        lambda _args, invocation: captured.append(
+            invocation.capture_realtime_execution_attachment()
+        ),
+    )
+    return captured[0]
+
+
+@pytest.mark.asyncio
+async def test_execution_attachment_projects_exact_live_curated_tool_surface():
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    agent = runner._session_states[build_session_key(source)].turn.agent
+    permitted = {
+        "type": "function",
+        "function": {
+            "name": "permitted_tool",
+            "description": "Already authorized by the live agent.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }
+    hidden = {
+        "type": "function",
+        "function": {
+            "name": "hidden_tool",
+            "description": "Denied by canonical host curation.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    agent.tools = [permitted]
+    agent.valid_tool_names = {"permitted_tool"}
+    agent._denied_test_tool = hidden
+
+    attachment = await _committed_execution_attachment(runner, source)
+
+    assert attachment.tool_definitions() == [permitted["function"]]
+    assert "hidden_tool" not in repr(attachment.tool_definitions())
+
+    first = attachment.tool_definitions()
+    second = attachment.tool_definitions()
+    assert first == second
+    assert first is not second
+    assert first[0] is not second[0]
+    assert first[0]["parameters"] is not second[0]["parameters"]
+    first[0]["parameters"]["properties"]["query"]["type"] = "integer"
+    assert second[0]["parameters"]["properties"]["query"]["type"] == "string"
+    json.dumps(second, allow_nan=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wrapper_subclass",
+        "function_subclass",
+        "name_subclass",
+        "bad_name",
+        "description_subclass",
+        "description_oversize",
+        "parameters_subclass",
+        "non_json",
+        "too_deep",
+        "duplicate",
+        "secret_default",
+        "too_many",
+        "too_large",
+    ],
+)
+async def test_execution_attachment_rejects_unsafe_tool_schema_matrix(case):
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    class DictLookalike(dict):
+        pass
+
+    class StringLookalike(str):
+        pass
+
+    def schema(name="safe_tool"):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Safe description.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    agent = runner._session_states[build_session_key(source)].turn.agent
+    tools = [schema()]
+    if case == "wrapper_subclass":
+        tools[0] = DictLookalike(tools[0])
+    elif case == "function_subclass":
+        tools[0]["function"] = DictLookalike(tools[0]["function"])
+    elif case == "name_subclass":
+        tools[0]["function"]["name"] = StringLookalike("safe_tool")
+    elif case == "bad_name":
+        tools[0]["function"]["name"] = " unsafe tool "
+    elif case == "description_subclass":
+        tools[0]["function"]["description"] = StringLookalike("unsafe")
+    elif case == "description_oversize":
+        tools[0]["function"]["description"] = "d" * 16_385
+    elif case == "parameters_subclass":
+        tools[0]["function"]["parameters"] = DictLookalike(
+            tools[0]["function"]["parameters"]
+        )
+    elif case == "non_json":
+        tools[0]["function"]["parameters"]["properties"]["x"] = {
+            "enum": ("not", "json")
+        }
+    elif case == "too_deep":
+        node = tools[0]["function"]["parameters"]
+        for _ in range(20):
+            child = {}
+            node["nested"] = child
+            node = child
+    elif case == "duplicate":
+        tools.append(schema())
+    elif case == "secret_default":
+        tools[0]["function"]["parameters"]["properties"]["api_key"] = {
+            "type": "string",
+            "default": "sk-never-leak-this-value",
+        }
+    elif case == "too_many":
+        tools = [schema(f"tool_{index}") for index in range(129)]
+    elif case == "too_large":
+        tools[0]["function"]["parameters"]["description"] = "x" * 300_000
+    agent.tools = tools
+    agent.valid_tool_names = {
+        tool["function"]["name"] for tool in tools if type(tool) is dict
+    }
+    attachment = await _committed_execution_attachment(runner, source)
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="tool schema") as exc_info:
+        attachment.tool_definitions()
+    assert "sk-never-leak-this-value" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_tool_definitions_require_commit_allow_child_threads_and_fail_after_close():
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    agent = runner._session_states[build_session_key(source)].turn.agent
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "thread_safe_tool",
+                "description": "Thread-safe provider projection.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    agent.valid_tool_names = {"thread_safe_tool"}
+    captured = []
+
+    def handler(_args, invocation):
+        attachment = invocation.capture_realtime_execution_attachment()
+        captured.append(attachment)
+        with pytest.raises(RealtimeVoiceInvocationError, match="authority changed"):
+            attachment.tool_definitions()
+
+    await _invoke(runner, source, handler)
+    attachment = captured[0]
+    results = await asyncio.gather(
+        *(asyncio.to_thread(attachment.tool_definitions) for _ in range(8))
+    )
+    assert all(result == results[0] for result in results)
+    assert len({id(result) for result in results}) == len(results)
+    assert len({id(result[0]) for result in results}) == len(results)
+
+    attachment.close()
+    with pytest.raises(RealtimeVoiceInvocationError, match="authority changed"):
+        attachment.tool_definitions()
+
+
+@pytest.mark.asyncio
+async def test_tool_definitions_rotation_wins_before_projection_can_return(
+    monkeypatch,
+):
+    import gateway.realtime_voice_invocation as invocation_module
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    state = runner._session_states[build_session_key(source)]
+    agent = state.turn.agent
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "stale_tool",
+                "description": "Must not escape after rotation wins.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    agent.valid_tool_names = {"stale_tool"}
+    attachment = await _committed_execution_attachment(runner, source)
+    projection_entered = threading.Event()
+    permit_projection = threading.Event()
+    original_project = invocation_module._project_realtime_tool_definitions
+
+    def blocked_project(tools, valid_names):
+        projection_entered.set()
+        assert permit_projection.wait(timeout=5)
+        return original_project(tools, valid_names)
+
+    monkeypatch.setattr(
+        invocation_module, "_project_realtime_tool_definitions", blocked_project
+    )
+    pending = asyncio.create_task(asyncio.to_thread(attachment.tool_definitions))
+    assert await asyncio.to_thread(projection_entered.wait, 5)
+    with state.turn_authority_lock:
+        state.persistent.run_generation += 1
+    permit_projection.set()
+
+    with pytest.raises(
+        invocation_module.RealtimeVoiceInvocationError, match="authority changed"
+    ):
+        await pending
