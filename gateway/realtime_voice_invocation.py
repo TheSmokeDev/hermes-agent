@@ -430,10 +430,10 @@ def _mint_invocation_state(
 
     try:
         execution_route_pin = pin_route_owned_agent(runner, route)
-    except ExternalToolBatchRouteChanged:
+    except (ExternalToolBatchRouteChanged, AttributeError):
         # Contextual commands and the pre-existing voice attachment remain
-        # available without an active canonical turn.  Only execution capture
-        # requires this exact invocation-time route authority.
+        # available without an active or initialized canonical execution turn.
+        # Any later execution capture still fails closed on the missing pin.
         execution_route_pin = None
     try:
         owner_task = asyncio.current_task()
