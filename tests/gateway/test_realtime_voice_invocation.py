@@ -1206,6 +1206,68 @@ async def test_execution_attachment_projects_exact_live_curated_tool_surface():
 
 
 @pytest.mark.asyncio
+async def test_execution_attachment_projects_canonical_tools_without_defaults():
+    from model_tools import get_tool_definitions
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    agent = runner._session_states[build_session_key(source)].turn.agent
+    canonical_tools = copy.deepcopy(get_tool_definitions(quiet_mode=True))
+    by_name = {tool["function"]["name"]: tool for tool in canonical_tools}
+    representative_names = {"computer_use", "read_file", "search_files", "terminal"}
+    assert representative_names <= by_name.keys()
+
+    secret_default = "sk-canonical-default-must-never-escape"
+    opaque_default = [object() for _ in range(4_097)]
+    probe_properties = by_name["read_file"]["function"]["parameters"][
+        "properties"
+    ]
+    probe_properties["default_probe"] = {
+        "type": "object",
+        "properties": {
+            "secret": {"type": "string", "default": secret_default},
+            "opaque": {"type": "string", "default": opaque_default},
+        },
+    }
+    agent.tools = canonical_tools
+    agent.valid_tool_names = set(by_name)
+    attachment = await _committed_execution_attachment(runner, source)
+
+    first = attachment.tool_definitions()
+    second = attachment.tool_definitions()
+    projected_names = {tool["name"] for tool in first}
+    assert representative_names <= projected_names
+
+    def assert_no_defaults(value):
+        if type(value) is dict:
+            assert "default" not in value
+            for item in value.values():
+                assert_no_defaults(item)
+        elif type(value) is list:
+            for item in value:
+                assert_no_defaults(item)
+
+    assert_no_defaults(first)
+    assert secret_default not in repr(first)
+    json.dumps(first, allow_nan=False)
+    assert first == second
+    assert first is not second
+    first[0]["parameters"]["properties"]["detached"] = {"type": "null"}
+    assert "detached" not in second[0]["parameters"]["properties"]
+    assert "detached" not in canonical_tools[0]["function"]["parameters"][
+        "properties"
+    ]
+    assert (
+        probe_properties["default_probe"]["properties"]["secret"]["default"]
+        == secret_default
+    )
+    assert (
+        probe_properties["default_probe"]["properties"]["opaque"]["default"]
+        is opaque_default
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     [
@@ -1219,13 +1281,14 @@ async def test_execution_attachment_projects_exact_live_curated_tool_surface():
         "non_json",
         "too_deep",
         "duplicate",
-        "secret_default",
         "too_many",
         "too_large",
     ],
 )
 async def test_execution_attachment_rejects_unsafe_tool_schema_matrix(case):
     from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    secret_value = "sk-never-leak-this-value"
 
     class DictLookalike(dict):
         pass
@@ -1265,7 +1328,7 @@ async def test_execution_attachment_rejects_unsafe_tool_schema_matrix(case):
         )
     elif case == "non_json":
         tools[0]["function"]["parameters"]["properties"]["x"] = {
-            "enum": ("not", "json")
+            "enum": (secret_value, object())
         }
     elif case == "too_deep":
         node = tools[0]["function"]["parameters"]
@@ -1275,11 +1338,6 @@ async def test_execution_attachment_rejects_unsafe_tool_schema_matrix(case):
             node = child
     elif case == "duplicate":
         tools.append(schema())
-    elif case == "secret_default":
-        tools[0]["function"]["parameters"]["properties"]["api_key"] = {
-            "type": "string",
-            "default": "sk-never-leak-this-value",
-        }
     elif case == "too_many":
         tools = [schema(f"tool_{index}") for index in range(129)]
     elif case == "too_large":
@@ -1292,7 +1350,7 @@ async def test_execution_attachment_rejects_unsafe_tool_schema_matrix(case):
 
     with pytest.raises(RealtimeVoiceInvocationError, match="tool schema") as exc_info:
         attachment.tool_definitions()
-    assert "sk-never-leak-this-value" not in str(exc_info.value)
+    assert secret_value not in str(exc_info.value)
 
 
 @pytest.mark.asyncio

@@ -628,8 +628,10 @@ def _copy_bounded_json(value: object, *, depth: int, budget: list[int]) -> objec
     if type(value) is dict:
         copied: dict[str, object] = {}
         for key, item in value.items():
-            if type(key) is not str or key == "default":
+            if type(key) is not str:
                 raise _unsafe_tool_schema()
+            if key == "default":
+                continue
             try:
                 if len(key.encode("utf-8")) > 512:
                     raise _unsafe_tool_schema()
