@@ -212,6 +212,7 @@ async def test_contextual_invocation_mints_one_opaque_execution_attachment():
     assert [name for name in dir(attachment) if not name.startswith("_")] == [
         "close",
         "closed",
+        "execute_tool_batch",
         "mint_tool_call_permit",
         "tool_definitions",
     ]

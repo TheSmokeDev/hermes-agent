@@ -101,6 +101,20 @@ class RealtimeExecutionAttachment:
             arguments=arguments,
         )
 
+    async def execute_tool_batch(
+        self,
+        permits: tuple[RealtimeToolCallPermit, ...],
+    ) -> tuple[dict[str, str], ...]:
+        """Execute one admitted batch through the canonical Hermes owner."""
+
+        from gateway.realtime_voice_invocation import (
+            _execute_tool_batch_for_realtime_execution_attachment,
+        )
+
+        return await _execute_tool_batch_for_realtime_execution_attachment(
+            self, permits
+        )
+
 
 def _mint_realtime_execution_attachment() -> RealtimeExecutionAttachment:
     return RealtimeExecutionAttachment(_MINT)

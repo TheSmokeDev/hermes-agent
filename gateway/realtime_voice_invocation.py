@@ -18,7 +18,9 @@ import threading
 import unicodedata
 import weakref
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable
+from uuid import uuid4
 
 
 class RealtimeVoiceInvocationError(PermissionError):
@@ -126,6 +128,7 @@ _MAX_TOOL_ARGUMENT_KEYS = 4_096
 _MAX_TOOL_ARGUMENT_KEY_BYTES = 512
 _MAX_TOOL_ARGUMENT_BYTES = 262_144
 _MAX_OUTSTANDING_TOOL_CALL_PERMITS = 128
+_MAX_TOOL_CALL_PERMITS_PER_BATCH = 128
 _invocation_states: weakref.WeakKeyDictionary[PluginCommandInvocation, _InvocationState]
 _factory_records: weakref.WeakKeyDictionary[
     RealtimeVoiceAttachmentFactory, _FactoryRecord
@@ -1083,6 +1086,208 @@ def _record_for_realtime_tool_call_permit(
     ):
         raise RealtimeVoiceInvocationError("provider tool call permit is unavailable")
     return record
+
+
+def _mint_realtime_execution_receipt_id() -> str:
+    """Mint a provider-opaque receipt unrelated to durable row/session IDs."""
+
+    return uuid4().hex
+
+
+def _provider_ready_tool_output(content: object) -> str:
+    """Project canonical tool content to the existing bounded text surface."""
+
+    from agent.message_content import flatten_message_text
+    from tools.tool_output_limits import get_max_bytes
+
+    output = flatten_message_text(content)
+    encoded = output.encode("utf-8", errors="replace")
+    limit = get_max_bytes()
+    if len(encoded) <= limit:
+        return output
+    marker = b"\n...[tool output truncated]"
+    if limit <= len(marker):
+        return marker[: max(0, limit)].decode("ascii")
+    keep = limit - len(marker)
+    return (encoded[:keep] + marker).decode("utf-8", errors="ignore")
+
+
+def _admit_realtime_tool_batch(
+    attachment: object, permits: object
+) -> tuple[_ExecutionAttachmentRecord, tuple[_ToolCallPermitRecord, ...], object]:
+    """Validate the whole batch and consume it at one host lock boundary."""
+
+    from gateway.external_tool_batch import mint_route_execution_permit
+    from gateway.realtime_execution_attachment import (
+        RealtimeExecutionAttachment,
+        RealtimeToolCallPermit,
+    )
+
+    if (
+        type(attachment) is not RealtimeExecutionAttachment
+        or type(permits) is not tuple
+        or not permits
+        or len(permits) > _MAX_TOOL_CALL_PERMITS_PER_BATCH
+    ):
+        raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+    with _state_lock:
+        attachment_record = _execution_attachment_records.get(attachment)
+        state = _attachment_permit_states.get(attachment)
+        if attachment_record is None or state is None:
+            raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+        if any(type(permit) is not RealtimeToolCallPermit for permit in permits):
+            raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+        if len({id(permit) for permit in permits}) != len(permits):
+            raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+
+        records: list[_ToolCallPermitRecord] = []
+        for permit in permits:
+            record = _tool_call_permit_records.get(permit)
+            if (
+                record is None
+                or record.consumed
+                or permit not in state.permits
+                or record.attachment_ref() is not attachment
+                or record.attachment_record is not attachment_record
+            ):
+                raise RealtimeVoiceInvocationError(
+                    "provider tool call batch is unavailable"
+                )
+            current = _record_for_realtime_tool_call_permit(attachment, permit)
+            if current is not record or current.route_pin is not attachment_record.route_pin:
+                raise RealtimeVoiceInvocationError(
+                    "provider tool call batch is unavailable"
+                )
+            records.append(record)
+        if len({record.call_id for record in records}) != len(records):
+            raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+
+        execution_permit = mint_route_execution_permit(attachment_record.route_pin)
+        for record in records:
+            record.consumed = True
+        return attachment_record, tuple(records), execution_permit
+
+
+def _execute_admitted_realtime_tool_batch(
+    attachment_record: _ExecutionAttachmentRecord,
+    records: tuple[_ToolCallPermitRecord, ...],
+    execution_permit: object,
+    approval_notifier: Callable[[dict], None],
+) -> tuple[dict[str, str], ...]:
+    """Build one exact canonical batch and project only its durable results."""
+
+    from agent.external_tool_batch import ExternalToolBatchEnvelope
+    from gateway.external_tool_batch import execute_route_owned_external_tool_batch
+
+    calls = [
+        SimpleNamespace(
+            id=record.call_id,
+            type="function",
+            function=SimpleNamespace(
+                name=record.tool_name,
+                arguments=record.arguments_bytes.decode("utf-8"),
+            ),
+        )
+        for record in records
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=calls)
+    assistant_row = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in calls
+        ],
+    }
+    messages: list[dict[str, Any]] = []
+    receipt = execute_route_owned_external_tool_batch(
+        pin=attachment_record.route_pin,
+        execution_permit=execution_permit,
+        assistant_message=assistant_message,
+        assistant_row=assistant_row,
+        messages=messages,
+        envelope=ExternalToolBatchEnvelope(
+            task_id=f"realtime-tool-batch-{uuid4().hex}",
+            turn_id=uuid4().hex,
+            call_ids=tuple(record.call_id for record in records),
+        ),
+        approval_notifier=approval_notifier,
+    )
+    outputs = tuple(_provider_ready_tool_output(row[2]) for row in receipt.tool_rows)
+    return tuple(
+        {
+            "call_id": record.call_id,
+            "output": output,
+            "receipt_id": _mint_realtime_execution_receipt_id(),
+        }
+        for record, output in zip(records, outputs, strict=True)
+    )
+
+
+async def _execute_tool_batch_for_realtime_execution_attachment(
+    attachment: object, permits: object
+) -> tuple[dict[str, str], ...]:
+    """Public async bridge with host-retained canonical execution ownership."""
+
+    attachment_record, records, execution_permit = _admit_realtime_tool_batch(
+        attachment, permits
+    )
+    adapter = attachment_record.adapter_ref()
+    if adapter is None:
+        raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+    loop = asyncio.get_running_loop()
+    binding = attachment_record.binding
+
+    def notify(approval_data: dict) -> None:
+        from gateway import run as gateway_run
+
+        gateway_run._approval_notify_sync(
+            approval_data,
+            adapter=adapter,
+            chat_id=binding.chat_id,
+            session_key=attachment_record.route_pin.session_key,
+            thread_metadata=(
+                {"thread_id": binding.thread_id} if binding.thread_id else None
+            ),
+            loop=loop,
+        )
+
+    owner = asyncio.create_task(
+        asyncio.to_thread(
+            _execute_admitted_realtime_tool_batch,
+            attachment_record,
+            records,
+            execution_permit,
+            notify,
+        )
+    )
+    try:
+        return await asyncio.shield(owner)
+    except asyncio.CancelledError:
+        owner.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        raise
+    except Exception as exc:
+        from agent.external_tool_batch import ExternalToolBatchPersistenceError
+        from gateway.external_tool_batch import ExternalToolBatchRouteChanged
+
+        if isinstance(exc, ExternalToolBatchPersistenceError):
+            raise ExternalToolBatchPersistenceError(
+                "canonical tool batch durability proof failed"
+            ) from exc
+        if isinstance(exc, ExternalToolBatchRouteChanged):
+            raise
+        raise RealtimeVoiceInvocationError(
+            "canonical provider tool batch execution failed"
+        ) from exc
 
 
 def _is_realtime_execution_attachment_closed(value: object) -> bool:
