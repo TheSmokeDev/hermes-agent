@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import copy
 import dataclasses
+import json
 import pickle
 import threading
 from datetime import datetime
@@ -16,6 +18,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session_state import SessionState
 from hermes_cli.plugins import PluginContext, PluginManifest
 
 
@@ -46,7 +49,7 @@ def _plugin_context() -> PluginContext:
     return PluginContext(PluginManifest(name="talk"), object())
 
 
-def _runner(source: SessionSource):
+def _runner(source: SessionSource, *, execution_authority: bool = False):
     from gateway.run import GatewayRunner
     from gateway.realtime_voice_invocation import _register_gateway_runner
     from plugins.platforms.discord.adapter import DiscordAdapter
@@ -78,7 +81,32 @@ def _runner(source: SessionSource):
     runner.session_store.get_or_create_session.return_value = entry
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = True
+    runner.session_store._lock = threading.RLock()
+    runner.session_store._entries = {entry.session_key: entry}
+    runner.session_store._ensure_loaded_locked = lambda: None
+    agent = SimpleNamespace(session_id=entry.session_id)
+    state = SessionState()
+    if execution_authority:
+        state.turn.agent = agent
+        state.turn.lease = object()
+        state.turn.lease_token = object()
+        state.turn.lease_generation = 11
+        state.persistent.run_generation = 11
+    runner._agent_cache_lock = threading.RLock()
+    runner._agent_cache = OrderedDict()
+    if execution_authority:
+        runner._agent_cache[entry.session_key] = (
+            agent,
+            "signature",
+            0,
+            entry.session_id,
+        )
+    runner._session_states = {entry.session_key: state}
+    runner._sessions = runner._session_states
     runner._running_agents = {}
+    if execution_authority:
+        # The legacy _sessions compatibility assignment rebuilds the turn view.
+        state.turn.agent = agent
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._session_db = None
@@ -92,6 +120,10 @@ def _runner(source: SessionSource):
     runner._emit_gateway_run_progress = AsyncMock()
     _register_gateway_runner(runner)
     return runner, entry
+
+
+def _execution_runner(source: SessionSource):
+    return _runner(source, execution_authority=True)
 
 
 async def _invoke(runner, source, handler, *, authenticated=True, internal=False):
@@ -145,6 +177,287 @@ async def test_contextual_handler_receives_immutable_host_invocation_and_can_cap
     assert binding.principal_id == "operator"
     with pytest.raises(RealtimeVoiceInvocationError, match="active opted-in"):
         invocations[0].capture_realtime_voice_attachment_factory()
+
+
+@pytest.mark.asyncio
+async def test_contextual_invocation_mints_one_opaque_execution_attachment():
+    from gateway.realtime_execution_attachment import RealtimeExecutionAttachment
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _is_host_realtime_execution_attachment,
+    )
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    captured = []
+
+    def handler(raw_args, invocation):
+        assert raw_args == "join"
+        attachment = invocation.capture_realtime_execution_attachment()
+        assert attachment.closed is False
+        captured.append(attachment)
+        with pytest.raises(RealtimeVoiceInvocationError, match="exactly one"):
+            invocation.capture_realtime_execution_attachment()
+        return "joined"
+
+    assert await _invoke(runner, source, handler) == "joined"
+    attachment = captured[0]
+    assert type(attachment) is RealtimeExecutionAttachment
+    assert _is_host_realtime_execution_attachment(attachment)
+    assert attachment.closed is False
+    assert repr(attachment) == "<host realtime execution attachment>"
+    assert [name for name in dir(attachment) if not name.startswith("_")] == [
+        "close",
+        "closed",
+    ]
+    for leaked_name in (
+        "runner",
+        "registry",
+        "agent",
+        "session_entry",
+        "session_key",
+        "principal",
+        "route_pin",
+        "credential",
+        "handler",
+        "approval_notifier",
+    ):
+        assert not hasattr(attachment, leaked_name)
+    with pytest.raises(TypeError):
+        vars(attachment)
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        copy.copy(attachment)
+    with pytest.raises(TypeError):
+        pickle.dumps(attachment)
+    with pytest.raises(TypeError):
+        json.dumps(attachment)
+    with pytest.raises(TypeError):
+        RealtimeExecutionAttachment()
+
+    attachment.close()
+    assert attachment.closed is True
+    attachment.close()
+    assert not _is_host_realtime_execution_attachment(attachment)
+
+
+@pytest.mark.asyncio
+async def test_close_during_handler_revokes_provisional_execution_attachment():
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _is_host_realtime_execution_attachment,
+    )
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    captured = []
+
+    def handler(_args, invocation):
+        attachment = invocation.capture_realtime_execution_attachment()
+        captured.append(attachment)
+        attachment.close()
+        assert attachment.closed is True
+        with pytest.raises(RealtimeVoiceInvocationError, match="exactly one"):
+            invocation.capture_realtime_execution_attachment()
+
+    await _invoke(runner, source, handler)
+    assert captured[0].closed is True
+    assert not _is_host_realtime_execution_attachment(captured[0])
+
+
+@pytest.mark.asyncio
+async def test_execution_capture_rejects_child_task_copied_context_and_thread():
+    import contextvars
+
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    captured = []
+
+    async def handler(_args, invocation):
+        copied = contextvars.copy_context()
+
+        async def child_capture():
+            return copied.run(invocation.capture_realtime_execution_attachment)
+
+        child = asyncio.create_task(child_capture())
+        with pytest.raises(RealtimeVoiceInvocationError, match="exact gateway dispatch task"):
+            await child
+        with pytest.raises(RealtimeVoiceInvocationError, match="gateway dispatch thread"):
+            await asyncio.to_thread(invocation.capture_realtime_execution_attachment)
+        captured.append(invocation.capture_realtime_execution_attachment())
+
+    await _invoke(runner, source, handler)
+    assert captured[0].closed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "cancelled"])
+async def test_failed_or_cancelled_handler_revokes_execution_attachment(failure):
+    from gateway.realtime_voice_invocation import (
+        _is_host_realtime_execution_attachment,
+    )
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    captured = []
+
+    async def handler(_args, invocation):
+        captured.append(invocation.capture_realtime_execution_attachment())
+        if failure == "cancelled":
+            raise asyncio.CancelledError
+        raise RuntimeError("failed")
+
+    expected = asyncio.CancelledError if failure == "cancelled" else RuntimeError
+    with pytest.raises(expected):
+        await _invoke(runner, source, handler)
+    assert captured[0].closed is True
+    assert not _is_host_realtime_execution_attachment(captured[0])
+
+
+@pytest.mark.asyncio
+async def test_retained_or_lookalike_invocation_cannot_capture_for_another_command():
+    from gateway.realtime_voice_invocation import (
+        PluginCommandInvocation,
+        RealtimeVoiceInvocationError,
+    )
+
+    source = _source()
+    runner, _entry = _runner(source)
+    retained = []
+    await _invoke(runner, source, lambda _args, invocation: retained.append(invocation))
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="active opted-in"):
+        retained[0].capture_realtime_execution_attachment()
+    with pytest.raises(TypeError, match="host-minted"):
+        PluginCommandInvocation()
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        copy.copy(retained[0])
+
+    async def wrong_command(_args, _invocation):
+        with pytest.raises(RealtimeVoiceInvocationError, match="active opted-in"):
+            retained[0].capture_realtime_execution_attachment()
+
+    await _invoke(runner, source, wrong_command)
+
+
+def test_plugin_load_and_noncontextual_handlers_have_no_execution_capture():
+    context = _plugin_context()
+    assert not hasattr(context, "capture_realtime_execution_attachment")
+    calls = []
+
+    def ordinary_handler(raw_args):
+        calls.append(raw_args)
+
+    ordinary_handler("join")
+    assert calls == ["join"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "adapter",
+        "routing_generation",
+        "entry_recreation",
+        "session_identity",
+        "agent_lookalike",
+        "run_generation",
+        "lease",
+        "lease_token",
+    ],
+)
+async def test_execution_capture_rejects_route_drift_before_mint(mutation):
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _is_host_realtime_execution_attachment,
+    )
+
+    source = _source()
+    runner, entry = _execution_runner(source)
+    state = runner._sessions[entry.session_key]
+    created = []
+
+    def handler(_args, invocation):
+        if mutation == "adapter":
+            replacement = SimpleNamespace(gateway_runner=runner)
+            runner.adapters[Platform.DISCORD] = replacement
+        elif mutation == "routing_generation":
+            runner.session_store.get_exact_session_entry_snapshot.return_value = (
+                entry,
+                8,
+            )
+        elif mutation == "entry_recreation":
+            replacement = dataclasses.replace(entry)
+            runner.session_store._entries[entry.session_key] = replacement
+            runner.session_store.get_exact_session_entry_snapshot.return_value = (
+                replacement,
+                7,
+            )
+        elif mutation == "session_identity":
+            entry.session_id = "recreated-session"
+            state.turn.agent.session_id = entry.session_id
+        elif mutation == "agent_lookalike":
+            replacement = SimpleNamespace(session_id=entry.session_id)
+            runner._agent_cache[entry.session_key] = (
+                replacement,
+                "signature",
+                0,
+                entry.session_id,
+            )
+            state.turn.agent = replacement
+        elif mutation == "run_generation":
+            state.persistent.run_generation += 1
+            state.turn.lease_generation += 1
+        elif mutation == "lease":
+            state.turn.lease = object()
+        else:
+            state.turn.lease_token = object()
+        created.append(invocation.capture_realtime_execution_attachment())
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="changed before capture"):
+        await _invoke(runner, source, handler)
+    assert created == []
+    assert not any(_is_host_realtime_execution_attachment(item) for item in created)
+
+
+@pytest.mark.asyncio
+async def test_execution_attachment_retains_exact_private_pin_and_revalidates_live_route():
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _record_for_realtime_execution_attachment,
+    )
+
+    source = _source()
+    runner, entry = _execution_runner(source)
+    state = runner._sessions[entry.session_key]
+    captured = []
+    await _invoke(
+        runner,
+        source,
+        lambda _args, invocation: captured.append(
+            invocation.capture_realtime_execution_attachment()
+        ),
+    )
+
+    record = _record_for_realtime_execution_attachment(captured[0], runner)
+    assert record.runner_ref() is runner
+    assert record.adapter_ref() is runner.adapters[Platform.DISCORD]
+    assert record.entry_ref() is entry
+    assert record.routing_generation == 7
+    assert record.binding.principal_id == "operator"
+    assert record.binding.profile is None
+    assert record.binding.routing_key == entry.session_key
+    assert record.binding.durable_session_id == entry.session_id
+    assert record.route_pin.agent is state.turn.agent
+    assert record.route_pin.session_entry is entry
+    assert record.route_pin.generation == 11
+    assert record.route_pin.active_session_lease is state.turn.lease
+    assert record.route_pin.turn_lease_token is state.turn.lease_token
+
+    state.turn.lease = object()
+    with pytest.raises(RealtimeVoiceInvocationError, match="authority changed"):
+        _record_for_realtime_execution_attachment(captured[0], runner)
 
 
 @pytest.mark.asyncio

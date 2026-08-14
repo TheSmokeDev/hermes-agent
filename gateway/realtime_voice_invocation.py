@@ -43,6 +43,18 @@ class _FactoryRecord:
     binding: _RealtimeVoiceAttachmentBinding
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionAttachmentRecord:
+    runner_ref: weakref.ReferenceType[object]
+    adapter_ref: weakref.ReferenceType[object]
+    host_state: "_GatewayHostState"
+    entry_ref: weakref.ReferenceType[object]
+    routing_generation: int
+    binding: _RealtimeVoiceAttachmentBinding
+    route_pin: object
+    invocation_identity: object
+
+
 @dataclass(slots=True)
 class _InvocationState:
     runner: object
@@ -51,9 +63,12 @@ class _InvocationState:
     entry: object
     routing_generation: int
     binding: _RealtimeVoiceAttachmentBinding
+    execution_route_pin: object | None
     owner_task: asyncio.Task[Any] | None
     owner_thread_id: int
     provisional: tuple["RealtimeVoiceAttachmentFactory", _FactoryRecord] | None
+    execution_provisional: tuple[object, _ExecutionAttachmentRecord] | None
+    execution_minted: bool
     active: bool = True
 
 
@@ -68,6 +83,10 @@ _invocation_states: weakref.WeakKeyDictionary[PluginCommandInvocation, _Invocati
 _factory_records: weakref.WeakKeyDictionary[
     RealtimeVoiceAttachmentFactory, _FactoryRecord
 ]
+_execution_attachment_records: weakref.WeakKeyDictionary[
+    object, _ExecutionAttachmentRecord
+]
+_execution_provisional_states: weakref.WeakKeyDictionary[object, _InvocationState]
 _gateway_hosts: weakref.WeakKeyDictionary[object, _GatewayHostState]
 
 
@@ -124,6 +143,100 @@ class PluginCommandInvocation:
             )
             state.provisional = (factory, record)
             return factory
+
+    def capture_realtime_execution_attachment(self) -> object:
+        """Mint this invocation's one opaque canonical execution attachment."""
+
+        with _state_lock:
+            state = _invocation_states.get(self)
+            if state is None or not state.active:
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution capture requires an active opted-in plugin command"
+                )
+            if threading.get_ident() != state.owner_thread_id:
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution capture is limited to the gateway dispatch thread"
+                )
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if current_task is not state.owner_task:
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution capture is limited to the exact gateway dispatch task"
+                )
+            if state.execution_minted:
+                raise RealtimeVoiceInvocationError(
+                    "exactly one realtime execution attachment may be minted per invocation"
+                )
+
+            from gateway.config import Platform
+            from gateway.external_tool_batch import (
+                ExternalToolBatchRouteChanged,
+                revalidate_route_owned_agent,
+            )
+            from gateway.realtime_execution_attachment import (
+                _mint_realtime_execution_attachment,
+            )
+            from gateway.session import SessionSource
+
+            resolve_adapter = getattr(state.runner, "_adapter_for_source", None)
+            source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=state.binding.chat_id,
+                chat_type=state.binding.chat_type,
+                user_id=state.binding.principal_id,
+                thread_id=state.binding.thread_id,
+                scope_id=state.binding.scope_id,
+                profile=state.binding.profile,
+                is_bot=False,
+            )
+            if (
+                not callable(resolve_adapter)
+                or resolve_adapter(source) is not state.adapter
+                or getattr(state.adapter, "gateway_runner", None) is not state.runner
+            ):
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution route adapter changed before capture"
+                )
+            route_pin = state.execution_route_pin
+            if route_pin is None:
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution route authority changed before capture"
+                )
+            try:
+                revalidate_route_owned_agent(state.runner, route_pin)
+            except ExternalToolBatchRouteChanged as exc:
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution route authority changed before capture"
+                ) from exc
+            snapshot = state.runner.session_store.get_exact_session_entry_snapshot(
+                state.binding.routing_key
+            )
+            if (
+                snapshot[0] is not state.entry
+                or snapshot[1] != state.routing_generation
+                or route_pin.session_entry is not state.entry
+                or route_pin.session_id != state.binding.durable_session_id
+            ):
+                raise RealtimeVoiceInvocationError(
+                    "realtime execution session authority changed before capture"
+                )
+            attachment = _mint_realtime_execution_attachment()
+            record = _ExecutionAttachmentRecord(
+                runner_ref=weakref.ref(state.runner),
+                adapter_ref=weakref.ref(state.adapter),
+                host_state=state.host_state,
+                entry_ref=weakref.ref(state.entry),
+                routing_generation=state.routing_generation,
+                binding=state.binding,
+                route_pin=route_pin,
+                invocation_identity=self,
+            )
+            state.execution_provisional = (attachment, record)
+            state.execution_minted = True
+            _execution_provisional_states[attachment] = state
+            return attachment
 
 
 class RealtimeVoiceAttachmentFactory:
@@ -182,6 +295,8 @@ class RealtimeVoiceAttachmentFactory:
 
 _invocation_states = weakref.WeakKeyDictionary()
 _factory_records = weakref.WeakKeyDictionary()
+_execution_attachment_records = weakref.WeakKeyDictionary()
+_execution_provisional_states = weakref.WeakKeyDictionary()
 _consumed_factories = weakref.WeakSet()
 _gateway_hosts = weakref.WeakKeyDictionary()
 
@@ -308,6 +423,18 @@ def _mint_invocation_state(
         routing_key=route,
         durable_session_id=entry.session_id,
     )
+    from gateway.external_tool_batch import (
+        ExternalToolBatchRouteChanged,
+        pin_route_owned_agent,
+    )
+
+    try:
+        execution_route_pin = pin_route_owned_agent(runner, route)
+    except ExternalToolBatchRouteChanged:
+        # Contextual commands and the pre-existing voice attachment remain
+        # available without an active canonical turn.  Only execution capture
+        # requires this exact invocation-time route authority.
+        execution_route_pin = None
     try:
         owner_task = asyncio.current_task()
     except RuntimeError:
@@ -320,9 +447,12 @@ def _mint_invocation_state(
         entry=entry,
         routing_generation=generation,
         binding=binding,
+        execution_route_pin=execution_route_pin,
         owner_task=owner_task,
         owner_thread_id=threading.get_ident(),
         provisional=None,
+        execution_provisional=None,
+        execution_minted=False,
     )
     with _state_lock:
         _invocation_states[invocation] = state
@@ -362,7 +492,117 @@ async def _invoke_plugin_command_with_context(
             if succeeded and state.provisional is not None:
                 factory, record = state.provisional
                 _factory_records[factory] = record
+            if succeeded and state.execution_provisional is not None:
+                attachment, record = state.execution_provisional
+                _execution_attachment_records[attachment] = record
+            if state.execution_provisional is not None:
+                _execution_provisional_states.pop(
+                    state.execution_provisional[0], None
+                )
             state.provisional = None
+            state.execution_provisional = None
+
+
+def _is_host_realtime_execution_attachment(value: object) -> bool:
+    from gateway.realtime_execution_attachment import RealtimeExecutionAttachment
+
+    if type(value) is not RealtimeExecutionAttachment:
+        return False
+    with _state_lock:
+        return value in _execution_attachment_records
+
+
+def _record_for_realtime_execution_attachment(
+    value: object, runner: object
+) -> _ExecutionAttachmentRecord:
+    """Return the private record only while every captured authority is exact."""
+
+    from gateway.config import Platform
+    from gateway.external_tool_batch import (
+        ExternalToolBatchRouteChanged,
+        revalidate_route_owned_agent,
+    )
+    from gateway.realtime_execution_attachment import RealtimeExecutionAttachment
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    if type(value) is not RealtimeExecutionAttachment or type(runner) is not GatewayRunner:
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment was not issued by this host"
+        )
+    with _state_lock:
+        record = _execution_attachment_records.get(value)
+        current_host_state = _gateway_hosts.get(runner)
+    if (
+        record is None
+        or record.runner_ref() is not runner
+        or current_host_state is not record.host_state
+    ):
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment authority changed"
+        )
+
+    adapter = record.adapter_ref()
+    resolve_adapter = getattr(runner, "_adapter_for_source", None)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=record.binding.chat_id,
+        chat_type=record.binding.chat_type,
+        user_id=record.binding.principal_id,
+        thread_id=record.binding.thread_id,
+        scope_id=record.binding.scope_id,
+        profile=record.binding.profile,
+        is_bot=False,
+    )
+    snapshot = runner.session_store.get_exact_session_entry_snapshot(
+        record.binding.routing_key
+    )
+    try:
+        revalidate_route_owned_agent(runner, record.route_pin)
+    except ExternalToolBatchRouteChanged as exc:
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment authority changed"
+        ) from exc
+    if (
+        adapter is None
+        or not callable(resolve_adapter)
+        or resolve_adapter(source) is not adapter
+        or getattr(adapter, "gateway_runner", None) is not runner
+        or snapshot[0] is not record.entry_ref()
+        or snapshot[1] != record.routing_generation
+        or snapshot[0] is not record.route_pin.session_entry
+        or snapshot[0].session_id != record.binding.durable_session_id
+    ):
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment authority changed"
+        )
+    return record
+
+
+def _is_realtime_execution_attachment_closed(value: object) -> bool:
+    with _state_lock:
+        return (
+            value not in _execution_attachment_records
+            and value not in _execution_provisional_states
+        )
+
+
+def _close_realtime_execution_attachment(value: object) -> None:
+    from gateway.realtime_execution_attachment import RealtimeExecutionAttachment
+
+    if type(value) is not RealtimeExecutionAttachment:
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment was not issued by this host"
+        )
+    with _state_lock:
+        _execution_attachment_records.pop(value, None)
+        state = _execution_provisional_states.pop(value, None)
+        if (
+            state is not None
+            and state.execution_provisional is not None
+            and state.execution_provisional[0] is value
+        ):
+            state.execution_provisional = None
 
 
 def _is_host_realtime_voice_attachment_factory(value: object) -> bool:
