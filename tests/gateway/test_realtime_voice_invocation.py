@@ -1218,7 +1218,7 @@ async def test_execution_attachment_projects_canonical_tools_without_defaults():
     assert representative_names <= by_name.keys()
 
     secret_default = "sk-canonical-default-must-never-escape"
-    opaque_default = [object() for _ in range(4_097)]
+    opaque_default = [{"nested": [None, True, 7, 1.5]}]
     probe_properties = by_name["read_file"]["function"]["parameters"][
         "properties"
     ]
@@ -1265,6 +1265,107 @@ async def test_execution_attachment_projects_canonical_tools_without_defaults():
         probe_properties["default_probe"]["properties"]["opaque"]["default"]
         is opaque_default
     )
+
+
+def _tool_with_default(default):
+    return {
+        "type": "function",
+        "function": {
+            "name": "bounded_default_tool",
+            "description": "Default resource-bound probe.",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string", "default": default}},
+            },
+        },
+    }
+
+
+def test_stripped_million_element_default_is_rejected_by_node_bound():
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _project_realtime_tool_definitions,
+    )
+
+    default = [None] * 1_000_000
+    tool = _tool_with_default(default)
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="tool schema"):
+        _project_realtime_tool_definitions([tool], {"bounded_default_tool"})
+    assert tool["function"]["parameters"]["properties"]["value"]["default"] is default
+
+
+def test_stripped_thousand_level_default_is_rejected_by_depth_bound():
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _project_realtime_tool_definitions,
+    )
+
+    default = None
+    for _ in range(1_000):
+        default = [default]
+    tool = _tool_with_default(default)
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="tool schema"):
+        _project_realtime_tool_definitions([tool], {"bounded_default_tool"})
+
+
+@pytest.mark.parametrize(
+    "default",
+    [
+        "x" * 262_145,
+        {str(index): None for index in range(4_097)},
+        [None] * 4_097,
+    ],
+    ids=["string-bytes", "dict-nodes", "list-nodes"],
+)
+def test_stripped_default_is_rejected_by_aggregate_resource_bounds(default):
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _project_realtime_tool_definitions,
+    )
+
+    tool = _tool_with_default(default)
+    with pytest.raises(RealtimeVoiceInvocationError, match="tool schema"):
+        _project_realtime_tool_definitions([tool], {"bounded_default_tool"})
+
+
+def test_stripped_defaults_share_discarded_input_byte_budget():
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _project_realtime_tool_definitions,
+    )
+
+    tool = _tool_with_default("x" * 100_000)
+    properties = tool["function"]["parameters"]["properties"]
+    properties["second"] = {"type": "string", "default": "y" * 100_000}
+    properties["third"] = {"type": "string", "default": "z" * 100_000}
+
+    with pytest.raises(RealtimeVoiceInvocationError, match="tool schema"):
+        _project_realtime_tool_definitions([tool], {"bounded_default_tool"})
+
+
+@pytest.mark.parametrize(
+    "case", ["object", "nan", "dict-subclass", "non-string-key"]
+)
+def test_stripped_default_still_requires_exact_json_values(case):
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _project_realtime_tool_definitions,
+    )
+
+    class DictLookalike(dict):
+        pass
+
+    default = {
+        "object": object(),
+        "nan": float("nan"),
+        "dict-subclass": DictLookalike({"key": None}),
+        "non-string-key": {1: None},
+    }[case]
+    tool = _tool_with_default(default)
+    with pytest.raises(RealtimeVoiceInvocationError, match="tool schema"):
+        _project_realtime_tool_definitions([tool], {"bounded_default_tool"})
 
 
 @pytest.mark.asyncio

@@ -228,6 +228,64 @@ def test_execution_permit_claim_linearizes_with_real_generation_writer(monkeypat
     assert state.persistent.run_generation == 8
 
 
+def test_route_revalidation_linearizes_with_real_generation_writer():
+    runner, key, _agent, _entry, state = _runner()
+    runner._peek_session_state = lambda session_key: runner._session_states.get(session_key)
+    runner._session_state = lambda session_key: runner._session_states[session_key]
+    pin = pin_route_owned_agent(runner, key)
+    generation_read = threading.Event()
+    resume_read = threading.Event()
+    validator_thread = None
+
+    class BarrierPersistent:
+        def __init__(self, generation):
+            self._generation = generation
+
+        @property
+        def run_generation(self):
+            captured = self._generation
+            if threading.current_thread() is validator_thread and not generation_read.is_set():
+                generation_read.set()
+                assert resume_read.wait(2)
+            return captured
+
+        @run_generation.setter
+        def run_generation(self, value):
+            self._generation = value
+
+    state.persistent = BarrierPersistent(pin.generation)
+    validation_errors = []
+
+    def validate():
+        try:
+            revalidate_route_owned_agent(runner, pin)
+        except Exception as exc:
+            validation_errors.append(exc)
+
+    validator_thread = threading.Thread(target=validate)
+    validator_thread.start()
+    assert generation_read.wait(2)
+
+    rotated = threading.Event()
+    rotation_thread = threading.Thread(
+        target=lambda: (
+            GatewayRunner._begin_session_run_generation(runner, key),
+            rotated.set(),
+        )
+    )
+    rotation_thread.start()
+    assert not rotated.wait(0.1)
+    resume_read.set()
+    validator_thread.join(2)
+    rotation_thread.join(2)
+
+    assert not validator_thread.is_alive()
+    assert not rotation_thread.is_alive()
+    assert validation_errors == []
+    assert rotated.is_set()
+    assert state.persistent.run_generation == pin.generation + 1
+
+
 def test_execution_permit_is_one_use():
     runner, key, _agent, _entry, _state = _runner()
     pin = pin_route_owned_agent(runner, key)

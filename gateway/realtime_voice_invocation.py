@@ -88,6 +88,7 @@ _MAX_TOOL_DESCRIPTION_BYTES = 16_384
 _MAX_TOOL_SCHEMA_DEPTH = 16
 _MAX_TOOL_SCHEMA_NODES = 4_096
 _MAX_TOOL_DEFINITIONS_BYTES = 262_144
+_MAX_DISCARDED_TOOL_SCHEMA_BYTES = _MAX_TOOL_DEFINITIONS_BYTES
 _invocation_states: weakref.WeakKeyDictionary[PluginCommandInvocation, _InvocationState]
 _factory_records: weakref.WeakKeyDictionary[
     RealtimeVoiceAttachmentFactory, _FactoryRecord
@@ -619,38 +620,125 @@ def _unsafe_tool_schema() -> RealtimeVoiceInvocationError:
     return RealtimeVoiceInvocationError("live agent tool schema is unsafe")
 
 
-def _copy_bounded_json(value: object, *, depth: int, budget: list[int]) -> object:
+def _claim_schema_node(value: object, *, depth: int, budget: list[int]) -> None:
     if depth > _MAX_TOOL_SCHEMA_DEPTH:
         raise _unsafe_tool_schema()
     budget[0] += 1
     if budget[0] > _MAX_TOOL_SCHEMA_NODES:
         raise _unsafe_tool_schema()
+    if type(value) in (dict, list) and len(value) > _MAX_TOOL_SCHEMA_NODES - budget[0]:
+        raise _unsafe_tool_schema()
+
+
+def _encoded_schema_string(value: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _unsafe_tool_schema() from exc
+
+
+def _account_discarded_string(value: str, byte_budget: list[int]) -> None:
+    remaining = _MAX_DISCARDED_TOOL_SCHEMA_BYTES - byte_budget[0]
+    # Every Unicode scalar requires at least one UTF-8 byte.  Reject impossible
+    # fits before allocating an encoded copy of an attacker-sized string.
+    if len(value) > remaining:
+        raise _unsafe_tool_schema()
+    byte_budget[0] += len(_encoded_schema_string(value))
+    if byte_budget[0] > _MAX_DISCARDED_TOOL_SCHEMA_BYTES:
+        raise _unsafe_tool_schema()
+
+
+def _account_discarded_json(
+    value: object,
+    *,
+    depth: int,
+    budget: list[int],
+    byte_budget: list[int],
+) -> None:
+    """Validate and bound an omitted subtree without retaining or copying it."""
+
+    _claim_schema_node(value, depth=depth, budget=budget)
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise _unsafe_tool_schema()
+            remaining = _MAX_DISCARDED_TOOL_SCHEMA_BYTES - byte_budget[0]
+            if len(key) > 512 or len(key) > remaining:
+                raise _unsafe_tool_schema()
+            encoded_key = _encoded_schema_string(key)
+            if len(encoded_key) > 512:
+                raise _unsafe_tool_schema()
+            byte_budget[0] += len(encoded_key)
+            if byte_budget[0] > _MAX_DISCARDED_TOOL_SCHEMA_BYTES:
+                raise _unsafe_tool_schema()
+            _account_discarded_json(
+                item,
+                depth=depth + 1,
+                budget=budget,
+                byte_budget=byte_budget,
+            )
+        return
+    if type(value) is list:
+        for item in value:
+            _account_discarded_json(
+                item,
+                depth=depth + 1,
+                budget=budget,
+                byte_budget=byte_budget,
+            )
+        return
+    if type(value) is str:
+        _account_discarded_string(value, byte_budget)
+        return
+    if value is None or type(value) is bool or type(value) is int:
+        return
+    if type(value) is float and math.isfinite(value):
+        return
+    raise _unsafe_tool_schema()
+
+
+def _copy_bounded_json(
+    value: object,
+    *,
+    depth: int,
+    budget: list[int],
+    discarded_bytes: list[int],
+) -> object:
+    _claim_schema_node(value, depth=depth, budget=budget)
     if type(value) is dict:
         copied: dict[str, object] = {}
         for key, item in value.items():
             if type(key) is not str:
                 raise _unsafe_tool_schema()
             if key == "default":
+                _account_discarded_json(
+                    item,
+                    depth=depth + 1,
+                    budget=budget,
+                    byte_budget=discarded_bytes,
+                )
                 continue
-            try:
-                if len(key.encode("utf-8")) > 512:
-                    raise _unsafe_tool_schema()
-            except UnicodeEncodeError as exc:
-                raise _unsafe_tool_schema() from exc
+            if len(_encoded_schema_string(key)) > 512:
+                raise _unsafe_tool_schema()
             copied[key] = _copy_bounded_json(
-                item, depth=depth + 1, budget=budget
+                item,
+                depth=depth + 1,
+                budget=budget,
+                discarded_bytes=discarded_bytes,
             )
         return copied
     if type(value) is list:
         return [
-            _copy_bounded_json(item, depth=depth + 1, budget=budget)
+            _copy_bounded_json(
+                item,
+                depth=depth + 1,
+                budget=budget,
+                discarded_bytes=discarded_bytes,
+            )
             for item in value
         ]
     if type(value) is str:
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise _unsafe_tool_schema() from exc
+        _encoded_schema_string(value)
         return value
     if value is None or type(value) is bool or type(value) is int:
         return value
@@ -696,7 +784,12 @@ def _project_realtime_tool_definitions(
             for char in description
         ):
             raise _unsafe_tool_schema()
-        copied_parameters = _copy_bounded_json(parameters, depth=0, budget=[0])
+        copied_parameters = _copy_bounded_json(
+            parameters,
+            depth=0,
+            budget=[0],
+            discarded_bytes=[0],
+        )
         projected.append(
             {
                 "name": name,
