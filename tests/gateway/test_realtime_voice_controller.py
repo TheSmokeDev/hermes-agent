@@ -1101,6 +1101,23 @@ class _PlaybackLease:
         self.close_calls += 1
 
 
+class _SecondWriteFailLease(_PlaybackLease):
+    def __init__(self, *args) -> None:
+        super().__init__(*args)
+        self.first_write_entered = asyncio.Event()
+        self.release_first_write = asyncio.Event()
+        self.write_count = 0
+
+    async def write_pcm(self, data: bytes) -> None:
+        self.write_count += 1
+        if self.write_count == 1:
+            self.first_write_entered.set()
+            await self.release_first_write.wait()
+            self.writes.append(data)
+            return
+        raise RuntimeError("second write failed")
+
+
 class _NativeHost(_Host):
     def __init__(self) -> None:
         super().__init__()
@@ -1193,6 +1210,27 @@ class _NativeHost(_Host):
         self.close_calls += 1
         self.closed = True
         self.requests.clear()
+
+
+class _SecondWriteFailHost(_NativeHost):
+    async def acquire_native_playback(
+        self, request, *, lease_id, response_id, transport_generation
+    ):
+        original = await super().acquire_native_playback(
+            request,
+            lease_id=lease_id,
+            response_id=response_id,
+            transport_generation=transport_generation,
+        )
+        lease = _SecondWriteFailLease(
+            original.lease_id,
+            original.response_id,
+            original.turn_marker,
+            original.generation,
+            self.order,
+        )
+        self.leases[-1] = lease
+        return lease
 
 
 @pytest.mark.asyncio
@@ -2882,6 +2920,118 @@ async def test_real_native_pcm_capacity_blocked_write_interrupts_and_stays_liste
         for event in controller.lifecycle_events
     )
     await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_real_native_pcm_serializes_audio_deltas_under_backpressure(binding):
+    from plugins.platforms.discord.voice_mixer import VoiceMixer
+
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _RealLeaseHost(VoiceMixer(native_frame_capacity=1))
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    first_payload = struct.pack("<960h", *range(960))
+    first_write = asyncio.create_task(
+        controller._handle_event(
+            OutputAudio(first_payload, "item", "host-turn", "response"), 1
+        )
+    )
+    for _ in range(20):
+        if lease._space_waiters:
+            break
+        await _next_loop_turn()
+    assert lease._space_waiters
+
+    await controller._handle_event(
+        OutputAudio(b"\x02\x00", "item", "host-turn", "response"), 1
+    )
+    await controller._handle_event(
+        OutputAudio(b"\x03\x00", "item", "host-turn", "response"), 1
+    )
+    for _ in range(5):
+        await _next_loop_turn()
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
+
+    for _ in range(10):
+        host.mixer.read()
+        await _next_loop_turn()
+        if first_write.done():
+            break
+    await asyncio.wait_for(first_write, timeout=1.0)
+    for _ in range(20):
+        state = controller._native_response
+        if state is not None and state.successful_audio_bytes == len(first_payload) + 4:
+            break
+        await _next_loop_turn()
+    assert controller._native_response is not None
+    assert controller._native_response.successful_audio_bytes == len(first_payload) + 4
+    assert controller._native_response.event_tail_task is None
+
+    await controller.interrupt()
+    assert not any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        for event in controller.lifecycle_events
+    )
+    await controller.close(reason="test")
+
+
+@pytest.mark.asyncio
+async def test_deferred_native_write_failure_closes_instead_of_self_cancelling(binding):
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _SecondWriteFailHost()
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    first_write = asyncio.create_task(
+        controller._handle_event(
+            OutputAudio(b"\x01\x00", "item", "host-turn", "response"), 1
+        )
+    )
+    await lease.first_write_entered.wait()
+
+    await controller._handle_event(
+        OutputAudio(b"\x02\x00", "item", "host-turn", "response"), 1
+    )
+    lease.release_first_write.set()
+    await first_write
+
+    await _eventually(lambda: host.closed)
+    assert controller.lifecycle_events[-1].lifecycle is ControllerLifecycle.CLOSED
+    assert any(
+        event.lifecycle is ControllerLifecycle.FAILED
+        and event.detail == "native playback write failed"
+        for event in controller.lifecycle_events
+    )
 
 
 @pytest.mark.asyncio

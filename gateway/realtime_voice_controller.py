@@ -229,6 +229,7 @@ class _NativeResponseState:
     lease: object | None = None
     acquire_task: asyncio.Task[object] | None = None
     operation_task: asyncio.Task[object] | None = None
+    event_tail_task: asyncio.Task[object] | None = None
     terminal_task: asyncio.Task[bool] | None = None
     terminal_intent: str | None = None
     provider_completed: bool = False
@@ -765,7 +766,11 @@ class GatewayRealtimeVoiceController:
             await self._native_failure("native response start failed")
 
     async def _handle_native_event(
-        self, event: RealtimeVoiceEvent, generation: int
+        self,
+        event: RealtimeVoiceEvent,
+        generation: int,
+        *,
+        serialized: bool = False,
     ) -> None:
         _validate_native_event(event, max_transcript_chars=self._max_transcript_chars)
         async with self._native_lock:
@@ -835,18 +840,19 @@ class GatewayRealtimeVoiceController:
                     raise RuntimeError("native response identity mismatch")
                 if state.provider_completed:
                     raise RuntimeError("native response event after completion")
-                pending_operation = state.operation_task
+                pending_operation = state.event_tail_task or state.operation_task
                 if (
-                    type(event) is not OutputAudio
+                    not serialized
                     and pending_operation is not None
                     and pending_operation is not state.acquire_task
                     and not pending_operation.done()
                 ):
-                    self._create_native_task(
+                    deferred = self._create_native_task(
                         self._defer_native_event_after_operation(
-                            event, generation, pending_operation
+                            state, event, generation, pending_operation
                         )
                     )
+                    state.event_tail_task = deferred
                     return
                 if type(event) in (OutputAudio, OutputTranscript):
                     if state.item_id is None:
@@ -930,15 +936,22 @@ class GatewayRealtimeVoiceController:
 
     async def _defer_native_event_after_operation(
         self,
+        state: _NativeResponseState,
         event: RealtimeVoiceEvent,
         generation: int,
         operation: asyncio.Task[object],
     ) -> None:
         try:
-            await asyncio.shield(operation)
-        except BaseException:
-            return
-        await self._handle_native_event(event, generation)
+            try:
+                await asyncio.shield(operation)
+            except BaseException:
+                return
+            await self._handle_native_event(event, generation, serialized=True)
+        finally:
+            current = asyncio.current_task()
+            async with self._native_lock:
+                if state.event_tail_task is current:
+                    state.event_tail_task = None
 
     async def _complete_native_acquire(
         self, state: _NativeResponseState, acquire_task: asyncio.Task[object]
@@ -983,6 +996,13 @@ class GatewayRealtimeVoiceController:
                 and not operation.done()
             ):
                 operation.cancel()
+            event_tail = state.event_tail_task
+            if (
+                event_tail is not None
+                and event_tail is not asyncio.current_task()
+                and not event_tail.done()
+            ):
+                event_tail.cancel()
         if state.terminal_task is None:
             task = asyncio.create_task(self._terminalize_native(state))
             state.terminal_task = task
