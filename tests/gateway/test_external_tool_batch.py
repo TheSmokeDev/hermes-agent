@@ -181,6 +181,53 @@ def test_execution_permit_claim_linearizes_with_production_lease_release(monkeyp
     assert released == [pin.turn_lease_token]
 
 
+def test_execution_permit_claim_linearizes_with_real_generation_writer(monkeypatch):
+    import gateway.external_tool_batch as batch_host
+
+    runner, key, _agent, _entry, state = _runner()
+    runner._peek_session_state = lambda session_key: runner._session_states.get(session_key)
+    runner._session_state = lambda session_key: runner._session_states[session_key]
+    pin = pin_route_owned_agent(runner, key)
+    permit = mint_route_execution_permit(pin)
+    final_read = threading.Event()
+    resume = threading.Event()
+    original_read = batch_host._current_run_generation
+
+    def barrier_read(current_state):
+        final_read.set()
+        assert resume.wait(2)
+        return original_read(current_state)
+
+    monkeypatch.setattr(batch_host, "_current_run_generation", barrier_read)
+    claim_errors = []
+    def claim():
+        try:
+            _claim_route_execution_permit(pin, permit)
+        except Exception as exc:
+            claim_errors.append(exc)
+
+    claim_thread = threading.Thread(target=claim)
+    claim_thread.start()
+    assert final_read.wait(2)
+
+    rotated = threading.Event()
+    rotation_thread = threading.Thread(
+        target=lambda: (
+            GatewayRunner._begin_session_run_generation(runner, key),
+            rotated.set(),
+        )
+    )
+    rotation_thread.start()
+    assert not rotated.wait(0.1)
+    resume.set()
+    claim_thread.join(2)
+    rotation_thread.join(2)
+
+    assert claim_errors == []
+    assert permit._claimed is True
+    assert state.persistent.run_generation == 8
+
+
 def test_execution_permit_is_one_use():
     runner, key, _agent, _entry, _state = _runner()
     pin = pin_route_owned_agent(runner, key)
@@ -260,5 +307,39 @@ def test_same_key_approval_owner_teardown_only_releases_its_pending_request():
         assert approval._gateway_notify_cbs[key] is outer_cb
         assert approval._gateway_notify_for_owner(key, outer) is outer_cb
         assert approval._gateway_notify_for_owner(key, inner) is None
+    finally:
+        approval.unregister_gateway_notify(key)
+
+
+def test_same_session_crossed_approval_decisions_resolve_exact_opaque_requests():
+    from tools import approval
+
+    key = "crossed-owner-key"
+    outer = approval.register_gateway_notify(key, lambda _data: None)
+    inner = approval.register_gateway_notify(key, lambda _data: None)
+    outer_token = approval.set_gateway_notify_owner(outer)
+    outer_entry = approval._ApprovalEntry({"command": "outer"})
+    approval.reset_gateway_notify_owner(outer_token)
+    inner_token = approval.set_gateway_notify_owner(inner)
+    inner_entry = approval._ApprovalEntry({"command": "inner"})
+    approval.reset_gateway_notify_owner(inner_token)
+    approval._gateway_queues[key] = [outer_entry, inner_entry]
+    try:
+        assert outer_entry.data["request_id"] != inner_entry.data["request_id"]
+        assert approval.resolve_gateway_approval(
+            key, "deny", request_id=inner_entry.data["request_id"]
+        ) == 1
+        assert inner_entry.event.is_set()
+        assert not outer_entry.event.is_set()
+        assert approval.resolve_gateway_approval(
+            key, "once", request_id=outer_entry.data["request_id"]
+        ) == 1
+        assert outer_entry.event.is_set()
+        assert approval.resolve_gateway_approval(
+            key, "deny", request_id=outer_entry.data["request_id"]
+        ) == 0
+        assert approval.resolve_gateway_approval(
+            "wrong-session", "deny", request_id=inner_entry.data["request_id"]
+        ) == 0
     finally:
         approval.unregister_gateway_notify(key)

@@ -2449,11 +2449,15 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "owner")
+    __slots__ = ("event", "data", "result", "reason", "owner", "request_id")
 
     def __init__(self, data: dict):
+        import secrets
+
         self.event = threading.Event()
-        self.data = data          # command, description, pattern_keys, …
+        self.request_id = secrets.token_urlsafe(24)
+        self.data = dict(data)    # command, description, pattern_keys, …
+        self.data["request_id"] = self.request_id
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
@@ -2537,7 +2541,8 @@ def unregister_gateway_notify(session_key: str, owner: object | None = None) -> 
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             request_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2555,11 +2560,25 @@ def resolve_gateway_approval(session_key: str, choice: str,
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
-            targets = list(queue)
-            queue.clear()
+        owner = _approval_notify_owner.get()
+        if request_id is not None:
+            targets = [entry for entry in queue if entry.request_id == request_id]
+            if owner is not None:
+                targets = [entry for entry in targets if entry.owner is owner]
+            if not targets:
+                return 0
+            queue.remove(targets[0])
+        elif resolve_all:
+            targets = [entry for entry in queue if owner is None or entry.owner is owner]
+            if not targets:
+                return 0
+            queue[:] = [entry for entry in queue if entry not in targets]
         else:
-            targets = [queue.pop(0)]
+            matching = [entry for entry in queue if owner is None or entry.owner is owner]
+            if not matching:
+                return 0
+            targets = [matching[0]]
+            queue.remove(targets[0])
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -3699,7 +3718,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
-        notify_cb(approval_data)
+        notify_cb(entry.data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()

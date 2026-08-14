@@ -48,6 +48,11 @@ def _state(runner: Any, session_key: str) -> Any:
     return getattr(runner, "_session_states", {}).get(session_key)
 
 
+def _current_run_generation(state: Any) -> int:
+    """Read the generation at an authority-lock linearization point."""
+    return state.persistent.run_generation
+
+
 def _locked_route_snapshot(runner: Any, session_key: str) -> tuple[Any, Any, Any]:
     store = runner.session_store
     # Match the gateway's established cache -> session-store lock order (the
@@ -144,7 +149,7 @@ def _claim_route_execution_permit(pin: RouteOwnedAgentPin, permit: RouteExecutio
                     or not cached
                     or cached[0] is not pin.agent
                     or state.turn.agent is not pin.agent
-                    or state.persistent.run_generation != pin.generation
+                    or _current_run_generation(state) != pin.generation
                     or state.turn.lease is not pin.active_session_lease
                     or state.turn.lease_token is not pin.turn_lease_token
                     or state.turn.lease_generation != pin.generation

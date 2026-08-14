@@ -5210,7 +5210,10 @@ class TurnRunner:
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata={
+                                **(ctx._status_thread_metadata or {}),
+                                "_approval_request_id": approval_data.get("request_id"),
+                            },
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -23488,10 +23491,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return 0
-        persistent = self._session_state(session_key).persistent
-        # Monotonic by design (#28686): incremented here, NEVER reset.
-        persistent.run_generation = int(persistent.run_generation) + 1
-        return persistent.run_generation
+        state = self._session_state(session_key)
+        # Serialize this authority writer with permit consumption.  This
+        # narrow lock is never held across effects or cache/store locks.
+        with state.turn_authority_lock:
+            persistent = state.persistent
+            # Monotonic by design (#28686): incremented here, NEVER reset.
+            persistent.run_generation = int(persistent.run_generation) + 1
+            return persistent.run_generation
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
@@ -23510,7 +23517,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return True
         state = self._peek_session_state(session_key)
-        current = state.persistent.run_generation if state is not None else 0
+        if state is None:
+            current = 0
+        else:
+            with state.turn_authority_lock:
+                current = state.persistent.run_generation
         return int(current) == int(generation)
 
     def _bind_adapter_run_generation(

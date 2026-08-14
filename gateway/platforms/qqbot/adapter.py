@@ -1166,7 +1166,8 @@ class QQAdapter(BasePlatformAdapter):
 
         approval = parse_approval_button_data(button_data)
         if approval is not None:
-            session_key, decision = approval
+            session_key, decision, *request_ids = approval
+            request_id = request_ids[0] if request_ids else None
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning(
@@ -1185,7 +1186,12 @@ class QQAdapter(BasePlatformAdapter):
                 # Import lazily to keep the adapter importable in tests that
                 # don't exercise the approval subsystem.
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(session_key, choice)
+                if request_id is None:
+                    count = resolve_gateway_approval(session_key, choice)
+                else:
+                    count = resolve_gateway_approval(
+                        session_key, choice, request_id=request_id
+                    )
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s "
                     "(choice=%s, operator=%s)",
@@ -2716,7 +2722,6 @@ class QQAdapter(BasePlatformAdapter):
         :func:`tools.approval.resolve_gateway_approval` — dispatched by the
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
         """
-        del metadata  # QQ doesn't have thread_id / DM targeting overrides.
         del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
         if smart_denied:
             description += " Owner override applies to this one operation only."
@@ -2729,6 +2734,7 @@ class QQAdapter(BasePlatformAdapter):
         req = ApprovalRequest(
             session_key=session_key,
             title="Execute this command?",
+            request_id=(metadata or {}).get("_approval_request_id"),
             description=description,
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,

@@ -1744,7 +1744,11 @@ class RelayAdapter(BasePlatformAdapter):
 
         prompt_id = self._mint_prompt(
             "exec_approval",
-            {"session_key": session_key, "chat_id": str(chat_id)},
+            {
+                "session_key": session_key,
+                "request_id": (metadata or {}).get("_approval_request_id"),
+                "chat_id": str(chat_id),
+            },
         )
         result = await self._send_prompt(
             chat_id,
@@ -1893,7 +1897,9 @@ class RelayAdapter(BasePlatformAdapter):
                     if option_id in {"once", "session", "always", "deny"}
                     else "deny"
                 )
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key, choice, request_id=state.get("request_id")
+                )
                 label = {
                     "once": "✅ Approved once",
                     "session": "✅ Approved for session",

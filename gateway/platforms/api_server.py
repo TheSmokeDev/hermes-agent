@@ -6918,6 +6918,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                # Interactive API clients receive the host-minted ID in the
+                # approval event and must return it for exact routing.  Omit
+                # it only for legacy clients that still use FIFO semantics.
+                request_id=(
+                    body.get("approvalId")
+                    or body.get("approval_id")
+                    or body.get("approval_request_id")
+                ),
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)

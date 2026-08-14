@@ -179,7 +179,11 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
     if (overlay.approval) {
       return gateway
-        .rpc<ApprovalRespondResponse>('approval.respond', { choice: 'deny', session_id: getUiState().sid })
+        .rpc<ApprovalRespondResponse>('approval.respond', {
+          ...(overlay.approval.requestId ? { approval_request_id: overlay.approval.requestId } : {}),
+          choice: 'deny',
+          session_id: getUiState().sid
+        })
         .then(r => r && (patchOverlayState({ approval: null }), patchTurnState({ outcome: 'denied' })))
     }
 
