@@ -6,9 +6,12 @@ import asyncio
 from collections import OrderedDict
 import copy
 import dataclasses
+import gc
+import hashlib
 import json
 import pickle
 import threading
+import weakref
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -209,6 +212,7 @@ async def test_contextual_invocation_mints_one_opaque_execution_attachment():
     assert [name for name in dir(attachment) if not name.startswith("_")] == [
         "close",
         "closed",
+        "mint_tool_call_permit",
         "tool_definitions",
     ]
     for leaked_name in (
@@ -1538,3 +1542,400 @@ async def test_tool_definitions_rotation_wins_before_projection_can_return(
         invocation_module.RealtimeVoiceInvocationError, match="authority changed"
     ):
         await pending
+
+
+@pytest.mark.asyncio
+async def test_execution_attachment_mints_opaque_exact_tool_call_permit():
+    from gateway.realtime_execution_attachment import RealtimeToolCallPermit
+    from gateway.realtime_voice_invocation import (
+        _record_for_realtime_tool_call_permit,
+    )
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    state = runner._session_states[build_session_key(source)]
+    agent = state.turn.agent
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "permitted_tool",
+                "description": "Canonical permit probe.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    agent.valid_tool_names = {"permitted_tool"}
+    attachment = await _committed_execution_attachment(runner, source)
+    arguments = {"z": [1, True, None], "a": {"value": "safe"}}
+
+    permit = attachment.mint_tool_call_permit(
+        response_id="response-1",
+        item_id="item-2",
+        call_id="call-3",
+        batch_id="batch-4",
+        tool_name="permitted_tool",
+        arguments=arguments,
+    )
+    arguments["z"][0] = 999
+    arguments["a"]["value"] = "mutated"
+
+    assert type(permit) is RealtimeToolCallPermit
+    assert repr(permit) == "<host realtime tool call permit>"
+    assert not hasattr(permit, "execute")
+    assert not hasattr(permit, "response_id")
+    assert not hasattr(permit, "arguments")
+    with pytest.raises((AttributeError, TypeError)):
+        permit.extra = True
+    with pytest.raises(TypeError):
+        pickle.dumps(permit)
+
+    record = _record_for_realtime_tool_call_permit(attachment, permit)
+    canonical = b'{"a":{"value":"safe"},"z":[1,true,null]}'
+    assert record.attachment_ref() is attachment
+    assert record.attachment_record.route_pin is record.route_pin
+    assert record.route_pin.agent is agent
+    assert record.tool_surface is agent.tools
+    assert record.valid_tool_names is agent.valid_tool_names
+    assert record.response_id == "response-1"
+    assert record.item_id == "item-2"
+    assert record.call_id == "call-3"
+    assert record.batch_id == "batch-4"
+    assert record.tool_name == "permitted_tool"
+    assert record.arguments_bytes == canonical
+    assert record.arguments_digest == hashlib.sha256(canonical).digest()
+    assert record.consumed is False
+    public = repr(permit)
+    for secret in ("response-1", "item-2", "call-3", "batch-4", "safe"):
+        assert secret not in public
+
+
+def _install_permit_tool(runner, source, name="permitted_tool"):
+    agent = runner._session_states[build_session_key(source)].turn.agent
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Permit matrix tool.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    agent.valid_tool_names = {name}
+    return agent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "id-subclass",
+        "id-empty",
+        "id-whitespace",
+        "id-control",
+        "id-surrogate",
+        "id-bytes",
+        "arguments-subclass",
+        "nested-dict-subclass",
+        "nested-list-subclass",
+        "non-string-key",
+        "nan",
+        "infinity",
+        "argument-surrogate",
+        "argument-depth",
+        "argument-nodes",
+        "argument-keys",
+        "argument-bytes",
+        "name-subclass",
+        "unknown-name",
+    ],
+)
+async def test_tool_call_permit_rejects_hostile_ids_arguments_and_names(case):
+    from gateway.realtime_voice_invocation import RealtimeVoiceInvocationError
+
+    class StringLookalike(str):
+        pass
+
+    class DictLookalike(dict):
+        pass
+
+    class ListLookalike(list):
+        pass
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    _install_permit_tool(runner, source)
+    attachment = await _committed_execution_attachment(runner, source)
+    values = {
+        "response_id": "response-safe",
+        "item_id": "item-safe",
+        "call_id": "call-safe",
+        "batch_id": "batch-safe",
+        "tool_name": "permitted_tool",
+        "arguments": {"safe": True},
+    }
+    if case == "id-subclass":
+        values["call_id"] = StringLookalike("secret-subclass")
+    elif case == "id-empty":
+        values["item_id"] = ""
+    elif case == "id-whitespace":
+        values["response_id"] = " secret-whitespace "
+    elif case == "id-control":
+        values["batch_id"] = "secret\u0000control"
+    elif case == "id-surrogate":
+        values["call_id"] = "secret\ud800surrogate"
+    elif case == "id-bytes":
+        values["call_id"] = "x" * 513
+    elif case == "arguments-subclass":
+        values["arguments"] = DictLookalike({"secret": True})
+    elif case == "nested-dict-subclass":
+        values["arguments"] = {"value": DictLookalike({"secret": True})}
+    elif case == "nested-list-subclass":
+        values["arguments"] = {"value": ListLookalike(["secret"])}
+    elif case == "non-string-key":
+        values["arguments"] = {1: "secret"}
+    elif case == "nan":
+        values["arguments"] = {"value": float("nan")}
+    elif case == "infinity":
+        values["arguments"] = {"value": float("inf")}
+    elif case == "argument-surrogate":
+        values["arguments"] = {"value": "secret\ud800surrogate"}
+    elif case == "argument-depth":
+        nested = None
+        for _ in range(18):
+            nested = [nested]
+        values["arguments"] = {"value": nested}
+    elif case == "argument-nodes":
+        values["arguments"] = {"value": [None] * 4_097}
+    elif case == "argument-keys":
+        values["arguments"] = {str(index): None for index in range(4_097)}
+    elif case == "argument-bytes":
+        values["arguments"] = {"value": "x" * 262_145}
+    elif case == "name-subclass":
+        values["tool_name"] = StringLookalike("permitted_tool")
+    elif case == "unknown-name":
+        values["tool_name"] = "secret_unknown_tool"
+
+    with pytest.raises(RealtimeVoiceInvocationError) as exc_info:
+        attachment.mint_tool_call_permit(**values)
+    assert "secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_permit_duplicate_identity_positions_and_attachment_scope():
+    from gateway.realtime_execution_attachment import RealtimeToolCallPermit
+    from gateway.realtime_voice_invocation import (
+        RealtimeVoiceInvocationError,
+        _record_for_realtime_tool_call_permit,
+    )
+
+    with pytest.raises(TypeError):
+        RealtimeToolCallPermit()
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    _install_permit_tool(runner, source)
+    first_attachment = await _committed_execution_attachment(runner, source)
+    second_attachment = await _committed_execution_attachment(runner, source)
+    common = dict(
+        response_id="same",
+        item_id="same",
+        call_id="same",
+        batch_id="same",
+        tool_name="permitted_tool",
+        arguments={},
+    )
+    permit = first_attachment.mint_tool_call_permit(**common)
+    record = _record_for_realtime_tool_call_permit(first_attachment, permit)
+    assert (record.response_id, record.item_id, record.call_id, record.batch_id) == (
+        "same",
+        "same",
+        "same",
+        "same",
+    )
+    with pytest.raises(RealtimeVoiceInvocationError, match="already admitted"):
+        first_attachment.mint_tool_call_permit(**common)
+    for field in ("response_id", "item_id", "call_id", "batch_id"):
+        distinct = dict(common)
+        distinct[field] = f"different-{field}"
+        first_attachment.mint_tool_call_permit(**distinct)
+    with pytest.raises(RealtimeVoiceInvocationError, match="unavailable"):
+        _record_for_realtime_tool_call_permit(second_attachment, permit)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_permit_duplicate_close_and_rotation_barriers(monkeypatch):
+    import gateway.realtime_voice_invocation as invocation_module
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    _install_permit_tool(runner, source)
+    attachment = await _committed_execution_attachment(runner, source)
+    common = dict(
+        response_id="response-race",
+        item_id="item-race",
+        call_id="call-race",
+        batch_id="batch-race",
+        tool_name="permitted_tool",
+        arguments={},
+    )
+    original = invocation_module._live_tool_surface_for_permit
+    first_calls = threading.Barrier(2)
+    thread_counts = {}
+    counts_lock = threading.Lock()
+
+    def duplicate_barrier(record, tool_name):
+        ident = threading.get_ident()
+        with counts_lock:
+            count = thread_counts.get(ident, 0)
+            thread_counts[ident] = count + 1
+        if count == 0:
+            first_calls.wait(timeout=5)
+        return original(record, tool_name)
+
+    monkeypatch.setattr(
+        invocation_module, "_live_tool_surface_for_permit", duplicate_barrier
+    )
+
+    def mint_duplicate():
+        try:
+            return attachment.mint_tool_call_permit(**common)
+        except Exception as exc:  # exact outcome asserted below
+            return exc
+
+    outcomes = await asyncio.gather(
+        asyncio.to_thread(mint_duplicate), asyncio.to_thread(mint_duplicate)
+    )
+    assert sum(type(item).__name__ == "RealtimeToolCallPermit" for item in outcomes) == 1
+    failures = [item for item in outcomes if isinstance(item, Exception)]
+    assert len(failures) == 1
+    assert "already admitted" in str(failures[0])
+
+    monkeypatch.setattr(invocation_module, "_live_tool_surface_for_permit", original)
+    close_attachment = await _committed_execution_attachment(runner, source)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def close_barrier(record, tool_name):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(record, tool_name)
+
+    monkeypatch.setattr(
+        invocation_module, "_live_tool_surface_for_permit", close_barrier
+    )
+    pending_close = asyncio.create_task(
+        asyncio.to_thread(
+            close_attachment.mint_tool_call_permit,
+            response_id="response-close",
+            item_id="item-close",
+            call_id="call-close",
+            batch_id="batch-close",
+            tool_name="permitted_tool",
+            arguments={},
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    close_attachment.close()
+    release.set()
+    with pytest.raises(invocation_module.RealtimeVoiceInvocationError):
+        await pending_close
+
+    monkeypatch.setattr(invocation_module, "_live_tool_surface_for_permit", original)
+    rotation_attachment = await _committed_execution_attachment(runner, source)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def rotation_barrier(record, tool_name):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(record, tool_name)
+
+    monkeypatch.setattr(
+        invocation_module, "_live_tool_surface_for_permit", rotation_barrier
+    )
+    pending_rotation = asyncio.create_task(
+        asyncio.to_thread(
+            rotation_attachment.mint_tool_call_permit,
+            response_id="response-rotation",
+            item_id="item-rotation",
+            call_id="call-rotation",
+            batch_id="batch-rotation",
+            tool_name="permitted_tool",
+            arguments={},
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    state = runner._session_states[build_session_key(source)]
+    with state.turn_authority_lock:
+        state.persistent.run_generation += 1
+    release.set()
+    with pytest.raises(
+        invocation_module.RealtimeVoiceInvocationError, match="authority changed"
+    ):
+        await pending_rotation
+
+
+@pytest.mark.asyncio
+async def test_tool_call_permit_capacity_close_and_gc_cleanup():
+    import gateway.realtime_voice_invocation as invocation_module
+
+    source = _source()
+    runner, _entry = _execution_runner(source)
+    _install_permit_tool(runner, source)
+    attachment = await _committed_execution_attachment(runner, source)
+    permits = [
+        attachment.mint_tool_call_permit(
+            response_id=f"response-{index}",
+            item_id=f"item-{index}",
+            call_id=f"call-{index}",
+            batch_id=f"batch-{index}",
+            tool_name="permitted_tool",
+            arguments={},
+        )
+        for index in range(invocation_module._MAX_OUTSTANDING_TOOL_CALL_PERMITS)
+    ]
+    with pytest.raises(
+        invocation_module.RealtimeVoiceInvocationError, match="capacity"
+    ):
+        attachment.mint_tool_call_permit(
+            response_id="response-overflow",
+            item_id="item-overflow",
+            call_id="call-overflow",
+            batch_id="batch-overflow",
+            tool_name="permitted_tool",
+            arguments={},
+        )
+    retired = permits.pop()
+    retired_ref = weakref.ref(retired)
+    del retired
+    gc.collect()
+    assert retired_ref() is None
+    replacement = attachment.mint_tool_call_permit(
+        response_id="response-replacement",
+        item_id="item-replacement",
+        call_id="call-replacement",
+        batch_id="batch-replacement",
+        tool_name="permitted_tool",
+        arguments={},
+    )
+    permits.append(replacement)
+    attachment.close()
+    assert not any(
+        permit in invocation_module._tool_call_permit_records for permit in permits
+    )
+
+    gc_attachment = await _committed_execution_attachment(runner, source)
+    retained_permit = gc_attachment.mint_tool_call_permit(
+        response_id="response-gc",
+        item_id="item-gc",
+        call_id="call-gc",
+        batch_id="batch-gc",
+        tool_name="permitted_tool",
+        arguments={},
+    )
+    attachment_ref = weakref.ref(gc_attachment)
+    del gc_attachment
+    gc.collect()
+    assert attachment_ref() is None
+    assert retained_permit not in invocation_module._tool_call_permit_records

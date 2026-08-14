@@ -9,11 +9,13 @@ successfully and remain bound to the exact runner and live routing entry.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import math
 import re
 import threading
+import unicodedata
 import weakref
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -59,6 +61,34 @@ class _ExecutionAttachmentRecord:
 
 
 @dataclass(slots=True)
+class _ToolCallPermitRecord:
+    attachment_ref: weakref.ReferenceType[object]
+    attachment_record: _ExecutionAttachmentRecord
+    route_pin: object
+    agent: object
+    tool_surface: object
+    valid_tool_names: object
+    response_id: str
+    item_id: str
+    call_id: str
+    batch_id: str
+    tool_name: str
+    arguments_bytes: bytes
+    arguments_digest: bytes
+    mint_generation: int
+    mint_routing_generation: int
+    mint_high_water: object | None
+    consumed: bool = False
+
+
+@dataclass(slots=True)
+class _AttachmentPermitState:
+    seen_identities: set[tuple[str, str, str, str]]
+    permits: weakref.WeakSet[object]
+    finalizer: object | None = None
+
+
+@dataclass(slots=True)
 class _InvocationState:
     runner: object
     adapter: object
@@ -89,6 +119,13 @@ _MAX_TOOL_SCHEMA_DEPTH = 16
 _MAX_TOOL_SCHEMA_NODES = 4_096
 _MAX_TOOL_DEFINITIONS_BYTES = 262_144
 _MAX_DISCARDED_TOOL_SCHEMA_BYTES = _MAX_TOOL_DEFINITIONS_BYTES
+_MAX_PROVIDER_ID_BYTES = 512
+_MAX_TOOL_ARGUMENT_DEPTH = 16
+_MAX_TOOL_ARGUMENT_NODES = 4_096
+_MAX_TOOL_ARGUMENT_KEYS = 4_096
+_MAX_TOOL_ARGUMENT_KEY_BYTES = 512
+_MAX_TOOL_ARGUMENT_BYTES = 262_144
+_MAX_OUTSTANDING_TOOL_CALL_PERMITS = 128
 _invocation_states: weakref.WeakKeyDictionary[PluginCommandInvocation, _InvocationState]
 _factory_records: weakref.WeakKeyDictionary[
     RealtimeVoiceAttachmentFactory, _FactoryRecord
@@ -97,6 +134,8 @@ _execution_attachment_records: weakref.WeakKeyDictionary[
     object, _ExecutionAttachmentRecord
 ]
 _execution_provisional_states: weakref.WeakKeyDictionary[object, _InvocationState]
+_tool_call_permit_records: weakref.WeakKeyDictionary[object, _ToolCallPermitRecord]
+_attachment_permit_states: weakref.WeakKeyDictionary[object, _AttachmentPermitState]
 _gateway_hosts: weakref.WeakKeyDictionary[object, _GatewayHostState]
 
 
@@ -307,6 +346,8 @@ _invocation_states = weakref.WeakKeyDictionary()
 _factory_records = weakref.WeakKeyDictionary()
 _execution_attachment_records = weakref.WeakKeyDictionary()
 _execution_provisional_states = weakref.WeakKeyDictionary()
+_tool_call_permit_records = weakref.WeakKeyDictionary()
+_attachment_permit_states = weakref.WeakKeyDictionary()
 _consumed_factories = weakref.WeakSet()
 _gateway_hosts = weakref.WeakKeyDictionary()
 
@@ -814,6 +855,236 @@ def _project_realtime_tool_definitions(
     return projected
 
 
+def _invalid_tool_call_permit() -> RealtimeVoiceInvocationError:
+    return RealtimeVoiceInvocationError("provider tool call permit input is invalid")
+
+
+def _normalized_provider_id(value: object) -> str:
+    if type(value) is not str or not value or value.strip() != value:
+        raise _invalid_tool_call_permit()
+    if any(unicodedata.category(char) in {"Cc", "Cs"} for char in value):
+        raise _invalid_tool_call_permit()
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _invalid_tool_call_permit() from exc
+    if len(encoded) > _MAX_PROVIDER_ID_BYTES:
+        raise _invalid_tool_call_permit()
+    return value
+
+
+def _validate_tool_arguments(
+    value: object,
+    *,
+    depth: int,
+    counts: list[int],
+) -> None:
+    if depth > _MAX_TOOL_ARGUMENT_DEPTH:
+        raise _invalid_tool_call_permit()
+    counts[0] += 1
+    if counts[0] > _MAX_TOOL_ARGUMENT_NODES:
+        raise _invalid_tool_call_permit()
+    if type(value) is dict:
+        counts[1] += len(value)
+        if counts[1] > _MAX_TOOL_ARGUMENT_KEYS:
+            raise _invalid_tool_call_permit()
+        for key, item in value.items():
+            if type(key) is not str or len(key) > _MAX_TOOL_ARGUMENT_BYTES:
+                raise _invalid_tool_call_permit()
+            try:
+                encoded_key = key.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise _invalid_tool_call_permit() from exc
+            if len(encoded_key) > _MAX_TOOL_ARGUMENT_KEY_BYTES:
+                raise _invalid_tool_call_permit()
+            _validate_tool_arguments(item, depth=depth + 1, counts=counts)
+        return
+    if type(value) is list:
+        if len(value) > _MAX_TOOL_ARGUMENT_NODES - counts[0]:
+            raise _invalid_tool_call_permit()
+        for item in value:
+            _validate_tool_arguments(item, depth=depth + 1, counts=counts)
+        return
+    if type(value) is str:
+        if len(value) > _MAX_TOOL_ARGUMENT_BYTES:
+            raise _invalid_tool_call_permit()
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _invalid_tool_call_permit() from exc
+        return
+    if value is None or type(value) is bool or type(value) is int:
+        return
+    if type(value) is float and math.isfinite(value):
+        return
+    raise _invalid_tool_call_permit()
+
+
+def _canonical_tool_arguments(value: object) -> bytes:
+    if type(value) is not dict:
+        raise _invalid_tool_call_permit()
+    _validate_tool_arguments(value, depth=0, counts=[0, 0])
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise _invalid_tool_call_permit() from exc
+    if len(encoded) > _MAX_TOOL_ARGUMENT_BYTES:
+        raise _invalid_tool_call_permit()
+    return encoded
+
+
+def _purge_tool_call_permit_state(state: _AttachmentPermitState) -> None:
+    with _state_lock:
+        for permit in tuple(state.permits):
+            _tool_call_permit_records.pop(permit, None)
+        state.permits.clear()
+        state.seen_identities.clear()
+
+
+def _live_tool_surface_for_permit(
+    record: _ExecutionAttachmentRecord, tool_name: object
+) -> tuple[object, object, object]:
+    if type(tool_name) is not str:
+        raise _invalid_tool_call_permit()
+    agent = record.route_pin.agent
+    from tools.mcp_tool import _agent_tools_lock
+
+    with _agent_tools_lock:
+        tools = getattr(agent, "tools", None)
+        valid_names = getattr(agent, "valid_tool_names", None)
+        projected = _project_realtime_tool_definitions(tools, valid_names)
+        if tool_name not in {definition["name"] for definition in projected}:
+            raise _invalid_tool_call_permit()
+        return agent, tools, valid_names
+
+
+def _mint_tool_call_permit_for_realtime_execution_attachment(
+    value: object,
+    *,
+    response_id: object,
+    item_id: object,
+    call_id: object,
+    batch_id: object,
+    tool_name: object,
+    arguments: object,
+) -> object:
+    """Mint a bounded opaque receipt without dispatching or executing a tool."""
+
+    with _state_lock:
+        attachment_record = _execution_attachment_records.get(value)
+    runner = attachment_record.runner_ref() if attachment_record is not None else None
+    if runner is None:
+        raise RealtimeVoiceInvocationError(
+            "realtime execution attachment authority changed"
+        )
+    attachment_record = _record_for_realtime_execution_attachment(value, runner)
+    normalized_ids = (
+        _normalized_provider_id(response_id),
+        _normalized_provider_id(item_id),
+        _normalized_provider_id(call_id),
+        _normalized_provider_id(batch_id),
+    )
+    arguments_bytes = _canonical_tool_arguments(arguments)
+    _live_tool_surface_for_permit(attachment_record, tool_name)
+
+    from gateway.realtime_execution_attachment import _mint_realtime_tool_call_permit
+
+    with _state_lock:
+        if _execution_attachment_records.get(value) is not attachment_record:
+            raise RealtimeVoiceInvocationError(
+                "realtime execution attachment authority changed"
+            )
+        current = _record_for_realtime_execution_attachment(value, runner)
+        agent, tools, valid_names = _live_tool_surface_for_permit(current, tool_name)
+        state = _attachment_permit_states.get(value)
+        if state is None:
+            state = _AttachmentPermitState(set(), weakref.WeakSet())
+            state.finalizer = weakref.finalize(
+                value, _purge_tool_call_permit_state, state
+            )
+            _attachment_permit_states[value] = state
+        if normalized_ids in state.seen_identities:
+            raise RealtimeVoiceInvocationError(
+                "provider tool call identity was already admitted"
+            )
+        if len(state.permits) >= _MAX_OUTSTANDING_TOOL_CALL_PERMITS:
+            raise RealtimeVoiceInvocationError(
+                "provider tool call permit capacity is exhausted"
+            )
+        permit = _mint_realtime_tool_call_permit()
+        permit_record = _ToolCallPermitRecord(
+            attachment_ref=weakref.ref(value),
+            attachment_record=current,
+            route_pin=current.route_pin,
+            agent=agent,
+            tool_surface=tools,
+            valid_tool_names=valid_names,
+            response_id=normalized_ids[0],
+            item_id=normalized_ids[1],
+            call_id=normalized_ids[2],
+            batch_id=normalized_ids[3],
+            tool_name=tool_name,
+            arguments_bytes=arguments_bytes,
+            arguments_digest=hashlib.sha256(arguments_bytes).digest(),
+            mint_generation=current.route_pin.generation,
+            mint_routing_generation=current.routing_generation,
+            mint_high_water=None,
+        )
+        _tool_call_permit_records[permit] = permit_record
+        state.permits.add(permit)
+        state.seen_identities.add(normalized_ids)
+        return permit
+
+
+def _record_for_realtime_tool_call_permit(
+    attachment: object, permit: object
+) -> _ToolCallPermitRecord:
+    """Private A1.4 seam: resolve exact ownership without consuming authority."""
+
+    from gateway.realtime_execution_attachment import (
+        RealtimeExecutionAttachment,
+        RealtimeToolCallPermit,
+    )
+
+    if (
+        type(attachment) is not RealtimeExecutionAttachment
+        or type(permit) is not RealtimeToolCallPermit
+    ):
+        raise RealtimeVoiceInvocationError("provider tool call permit is unavailable")
+    with _state_lock:
+        record = _tool_call_permit_records.get(permit)
+        state = _attachment_permit_states.get(attachment)
+        attachment_record = _execution_attachment_records.get(attachment)
+        if (
+            record is None
+            or state is None
+            or permit not in state.permits
+            or record.attachment_ref() is not attachment
+            or record.attachment_record is not attachment_record
+        ):
+            raise RealtimeVoiceInvocationError("provider tool call permit is unavailable")
+    runner = attachment_record.runner_ref()
+    if runner is None:
+        raise RealtimeVoiceInvocationError("provider tool call permit is unavailable")
+    current = _record_for_realtime_execution_attachment(attachment, runner)
+    agent, tools, valid_names = _live_tool_surface_for_permit(current, record.tool_name)
+    if (
+        current is not record.attachment_record
+        or current.route_pin is not record.route_pin
+        or agent is not record.agent
+        or tools is not record.tool_surface
+        or valid_names is not record.valid_tool_names
+    ):
+        raise RealtimeVoiceInvocationError("provider tool call permit is unavailable")
+    return record
+
+
 def _is_realtime_execution_attachment_closed(value: object) -> bool:
     with _state_lock:
         return (
@@ -831,6 +1102,12 @@ def _close_realtime_execution_attachment(value: object) -> None:
         )
     with _state_lock:
         _execution_attachment_records.pop(value, None)
+        permit_state = _attachment_permit_states.pop(value, None)
+        if permit_state is not None:
+            finalizer = permit_state.finalizer
+            if finalizer is not None:
+                finalizer.detach()
+            _purge_tool_call_permit_state(permit_state)
         state = _execution_provisional_states.pop(value, None)
         if (
             state is not None
