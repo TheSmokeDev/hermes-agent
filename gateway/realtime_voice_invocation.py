@@ -225,7 +225,7 @@ class PluginCommandInvocation:
             from gateway.config import Platform
             from gateway.external_tool_batch import (
                 ExternalToolBatchRouteChanged,
-                revalidate_route_owned_agent,
+                revalidate_durable_route_owned_agent,
             )
             from gateway.realtime_execution_attachment import (
                 _mint_realtime_execution_attachment,
@@ -257,7 +257,7 @@ class PluginCommandInvocation:
                     "realtime execution route authority changed before capture"
                 )
             try:
-                revalidate_route_owned_agent(state.runner, route_pin)
+                revalidate_durable_route_owned_agent(state.runner, route_pin)
             except ExternalToolBatchRouteChanged as exc:
                 raise RealtimeVoiceInvocationError(
                     "realtime execution route authority changed before capture"
@@ -479,11 +479,13 @@ def _mint_invocation_state(
     )
     from gateway.external_tool_batch import (
         ExternalToolBatchRouteChanged,
-        pin_route_owned_agent,
+        pin_durable_route_owned_agent,
     )
 
     try:
-        execution_route_pin = pin_route_owned_agent(runner, route)
+        execution_route_pin = pin_durable_route_owned_agent(
+            runner, route, source=source
+        )
     except (ExternalToolBatchRouteChanged, AttributeError):
         # Contextual commands and the pre-existing voice attachment remain
         # available without an active or initialized canonical execution turn.
@@ -574,7 +576,7 @@ def _record_for_realtime_execution_attachment(
     from gateway.config import Platform
     from gateway.external_tool_batch import (
         ExternalToolBatchRouteChanged,
-        revalidate_route_owned_agent,
+        revalidate_durable_route_owned_agent,
     )
     from gateway.realtime_execution_attachment import RealtimeExecutionAttachment
     from gateway.run import GatewayRunner
@@ -612,7 +614,7 @@ def _record_for_realtime_execution_attachment(
         record.binding.routing_key
     )
     try:
-        revalidate_route_owned_agent(runner, record.route_pin)
+        revalidate_durable_route_owned_agent(runner, record.route_pin)
     except ExternalToolBatchRouteChanged as exc:
         raise RealtimeVoiceInvocationError(
             "realtime execution attachment authority changed"
@@ -1035,7 +1037,7 @@ def _mint_tool_call_permit_for_realtime_execution_attachment(
             tool_name=tool_name,
             arguments_bytes=arguments_bytes,
             arguments_digest=hashlib.sha256(arguments_bytes).digest(),
-            mint_generation=current.route_pin.generation,
+            mint_generation=current.route_pin.session_state.persistent.run_generation,
             mint_routing_generation=current.routing_generation,
             mint_high_water=None,
         )
@@ -1113,7 +1115,7 @@ def _provider_ready_tool_output(content: object) -> str:
 
 
 def _admit_realtime_tool_batch(
-    attachment: object, permits: object
+    attachment: object, permits: object, route_pin: object
 ) -> tuple[_ExecutionAttachmentRecord, tuple[_ToolCallPermitRecord, ...], object]:
     """Validate the whole batch and consume it at one host lock boundary."""
 
@@ -1162,7 +1164,13 @@ def _admit_realtime_tool_batch(
         if len({record.call_id for record in records}) != len(records):
             raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
 
-        execution_permit = mint_route_execution_permit(attachment_record.route_pin)
+        if (
+            route_pin.agent is not attachment_record.route_pin.agent
+            or route_pin.session_entry is not attachment_record.route_pin.session_entry
+            or route_pin.session_id != attachment_record.route_pin.session_id
+        ):
+            raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
+        execution_permit = mint_route_execution_permit(route_pin)
         for record in records:
             record.consumed = True
         return attachment_record, tuple(records), execution_permit
@@ -1170,6 +1178,7 @@ def _admit_realtime_tool_batch(
 
 def _execute_admitted_realtime_tool_batch(
     attachment_record: _ExecutionAttachmentRecord,
+    route_pin: object,
     records: tuple[_ToolCallPermitRecord, ...],
     execution_permit: object,
     approval_notifier: Callable[[dict], None],
@@ -1208,7 +1217,7 @@ def _execute_admitted_realtime_tool_batch(
     }
     messages: list[dict[str, Any]] = []
     receipt = execute_route_owned_external_tool_batch(
-        pin=attachment_record.route_pin,
+        pin=route_pin,
         execution_permit=execution_permit,
         assistant_message=assistant_message,
         assistant_row=assistant_row,
@@ -1234,16 +1243,29 @@ def _execute_admitted_realtime_tool_batch(
 async def _execute_tool_batch_for_realtime_execution_attachment(
     attachment: object, permits: object
 ) -> tuple[dict[str, str], ...]:
-    """Public async bridge with host-retained canonical execution ownership."""
+    """Acquire a canonical turn, then retain admitted execution through cleanup."""
 
-    attachment_record, records, execution_permit = _admit_realtime_tool_batch(
-        attachment, permits
-    )
+    with _state_lock:
+        attachment_record = _execution_attachment_records.get(attachment)
+    runner = attachment_record.runner_ref() if attachment_record is not None else None
+    if runner is None:
+        raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
     adapter = attachment_record.adapter_ref()
     if adapter is None:
         raise RealtimeVoiceInvocationError("provider tool call batch is unavailable")
     loop = asyncio.get_running_loop()
     binding = attachment_record.binding
+    turn_context = runner._acquire_external_tool_batch_turn(
+        attachment_record.route_pin
+    )
+    route_pin = await turn_context.__aenter__()
+    try:
+        attachment_record, records, execution_permit = _admit_realtime_tool_batch(
+            attachment, permits, route_pin
+        )
+    except BaseException:
+        await turn_context.__aexit__(None, None, None)
+        raise
 
     def notify(approval_data: dict) -> None:
         from gateway import run as gateway_run
@@ -1252,22 +1274,27 @@ async def _execute_tool_batch_for_realtime_execution_attachment(
             approval_data,
             adapter=adapter,
             chat_id=binding.chat_id,
-            session_key=attachment_record.route_pin.session_key,
+            session_key=route_pin.session_key,
             thread_metadata=(
                 {"thread_id": binding.thread_id} if binding.thread_id else None
             ),
             loop=loop,
         )
 
-    owner = asyncio.create_task(
-        asyncio.to_thread(
-            _execute_admitted_realtime_tool_batch,
-            attachment_record,
-            records,
-            execution_permit,
-            notify,
-        )
-    )
+    async def execute_and_release() -> tuple[dict[str, str], ...]:
+        try:
+            return await asyncio.to_thread(
+                _execute_admitted_realtime_tool_batch,
+                attachment_record,
+                route_pin,
+                records,
+                execution_permit,
+                notify,
+            )
+        finally:
+            await turn_context.__aexit__(None, None, None)
+
+    owner = asyncio.create_task(execute_and_release())
     try:
         return await asyncio.shield(owner)
     except asyncio.CancelledError:

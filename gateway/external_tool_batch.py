@@ -29,6 +29,20 @@ class RouteOwnedAgentPin:
     turn_lease_token: Any
 
 
+@dataclass(frozen=True)
+class DurableRouteOwnedAgentBinding:
+    """Exact idle-safe route/agent identity, independent of any active turn."""
+
+    runner: Any
+    session_key: str
+    source: Any
+    agent: Any
+    session_entry: Any
+    session_id: str
+    routing_generation: int
+    session_state: Any
+
+
 @dataclass(eq=False)
 class RouteExecutionPermit:
     """Opaque, consume-once authority for one canonical admission."""
@@ -53,6 +67,11 @@ def _current_run_generation(state: Any) -> int:
     return state.persistent.run_generation
 
 
+def _routing_generation(store: Any, session_key: str) -> int:
+    generations = getattr(store, "_route_structural_generations", None)
+    return generations.get(session_key, 0) if generations else 0
+
+
 @contextmanager
 def _locked_route_authority(
     runner: Any, session_key: str
@@ -71,6 +90,103 @@ def _locked_route_authority(
                 return
             with state.turn_authority_lock:
                 yield entry, cached, state
+
+
+def pin_durable_route_owned_agent(
+    runner: Any, session_key: str, *, source: Any
+) -> DurableRouteOwnedAgentBinding:
+    """Pin cached route authority without requiring an active turn."""
+
+    with _locked_route_authority(runner, session_key) as (entry, cached, state):
+        if (
+            entry is None
+            or not isinstance(cached, tuple)
+            or not cached
+            or state is None
+            or getattr(cached[0], "session_id", None) != entry.session_id
+        ):
+            raise ExternalToolBatchRouteChanged("route has no exact durable owned agent")
+        return DurableRouteOwnedAgentBinding(
+            runner=runner,
+            session_key=session_key,
+            source=source,
+            agent=cached[0],
+            session_entry=entry,
+            session_id=entry.session_id,
+            routing_generation=_routing_generation(runner.session_store, session_key),
+            session_state=state,
+        )
+
+
+def revalidate_durable_route_owned_agent(
+    runner: Any, binding: DurableRouteOwnedAgentBinding
+) -> None:
+    """Reject structural rotation while ignoring ordinary completed turns."""
+
+    if runner is not binding.runner:
+        raise ExternalToolBatchRouteChanged("runner identity changed")
+    with _locked_route_authority(runner, binding.session_key) as (entry, cached, state):
+        if (
+            entry is not binding.session_entry
+            or entry is None
+            or entry.session_id != binding.session_id
+            or _routing_generation(runner.session_store, binding.session_key)
+            != binding.routing_generation
+            or not isinstance(cached, tuple)
+            or not cached
+            or cached[0] is not binding.agent
+            or getattr(binding.agent, "session_id", None) != binding.session_id
+            or state is not binding.session_state
+        ):
+            raise ExternalToolBatchRouteChanged("durable route authority changed")
+
+
+def install_durable_route_owned_agent_turn(
+    runner: Any,
+    binding: DurableRouteOwnedAgentBinding,
+    *,
+    generation: int,
+    active_session_lease: Any,
+    turn_lease_token: Any,
+    started_ts: float,
+) -> RouteOwnedAgentPin:
+    """Atomically revalidate an idle binding and install one owned turn."""
+
+    if runner is not binding.runner:
+        raise ExternalToolBatchRouteChanged("runner identity changed")
+    with _locked_route_authority(runner, binding.session_key) as (entry, cached, state):
+        if (
+            entry is not binding.session_entry
+            or entry is None
+            or entry.session_id != binding.session_id
+            or _routing_generation(runner.session_store, binding.session_key)
+            != binding.routing_generation
+            or not isinstance(cached, tuple)
+            or not cached
+            or cached[0] is not binding.agent
+            or getattr(binding.agent, "session_id", None) != binding.session_id
+            or state is not binding.session_state
+            or _current_run_generation(state) != generation
+            or state.turn.agent is not None
+            or state.turn.lease is not None
+            or state.turn.lease_token is not None
+        ):
+            raise ExternalToolBatchRouteChanged("durable route authority changed")
+        state.turn.agent = binding.agent
+        state.turn.lease = active_session_lease
+        state.turn.started_ts = started_ts
+        state.turn.lease_token = turn_lease_token
+        state.turn.lease_generation = generation
+        return RouteOwnedAgentPin(
+            runner=runner,
+            session_key=binding.session_key,
+            agent=binding.agent,
+            session_entry=binding.session_entry,
+            session_id=binding.session_id,
+            generation=generation,
+            active_session_lease=active_session_lease,
+            turn_lease_token=turn_lease_token,
+        )
 
 
 def pin_route_owned_agent(runner: Any, session_key: str) -> RouteOwnedAgentPin:

@@ -104,6 +104,144 @@ def _install_canonical_executor(
     )
 
 
+class _FakeTurnRegistry:
+    def __init__(self):
+        self.token = object()
+        self.acquisitions = []
+        self.releases = []
+
+    async def acquire(self, session_id, *, owner_key, generation, timeout):
+        self.acquisitions.append((session_id, owner_key, generation, timeout))
+        return self.token
+
+    def release(self, token):
+        self.releases.append(token)
+        return True
+
+
+class _BlockingTurnRegistry(_FakeTurnRegistry):
+    def __init__(self):
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release_acquire = asyncio.Event()
+
+    async def acquire(self, session_id, *, owner_key, generation, timeout):
+        self.acquisitions.append((session_id, owner_key, generation, timeout))
+        self.entered.set()
+        await self.release_acquire.wait()
+        return self.token
+
+
+@pytest.mark.asyncio
+async def test_execute_from_idle_acquires_and_releases_canonical_turn_state():
+    source = _source()
+    runner, entry = _execution_runner(source)
+    agent = _install_permit_tool(runner, source)
+    canonical = _install_canonical_executor(runner, source, {"call-1": "durable"})
+    attachment = await _committed_execution_attachment(runner, source)
+    permit = _mint(attachment, 1)
+    state = runner._session_states[entry.session_key]
+    state.turn.lease_token = None
+    state.turn.lease_generation = None
+    state.turn.clear()
+    slot_releases = []
+    slot = SimpleNamespace(release=lambda: slot_releases.append(True))
+    runner._claim_active_session_slot = lambda route, claimed_source: (
+        (slot, None)
+        if route == entry.session_key and claimed_source is source
+        else (None, "bad")
+    )
+    runner._turn_leases = _FakeTurnRegistry()
+    runner._persist_active_agents = lambda: None
+
+    result = await attachment.execute_tool_batch((permit,))
+
+    assert result[0]["output"] == "durable"
+    assert canonical.effects == ["call-1"]
+    assert runner._turn_leases.acquisitions[0][:2] == (
+        entry.session_id,
+        entry.session_key,
+    )
+    assert runner._turn_leases.releases == [runner._turn_leases.token]
+    assert slot_releases == [True]
+    assert state.turn.agent is None
+    assert state.turn.lease is None
+    assert state.turn.lease_token is None
+    assert state.turn.lease_generation is None
+    assert agent is runner._agent_cache[entry.session_key][0]
+
+
+@pytest.mark.asyncio
+async def test_external_batch_waits_for_live_turn_without_overwriting_turn_state():
+    source = _source()
+    runner, entry = _execution_runner(source)
+    agent = _install_permit_tool(runner, source)
+    canonical = _install_canonical_executor(runner, source, {"call-1": "serialized"})
+    attachment = await _committed_execution_attachment(runner, source)
+    permit = _mint(attachment, 1)
+    state = runner._session_states[entry.session_key]
+    original_lease = state.turn.lease
+    original_token = state.turn.lease_token
+    registry = _BlockingTurnRegistry()
+    runner._turn_leases = registry
+
+    pending = asyncio.create_task(attachment.execute_tool_batch((permit,)))
+    await asyncio.wait_for(registry.entered.wait(), 2)
+
+    assert state.turn.agent is agent
+    assert state.turn.lease is original_lease
+    assert state.turn.lease_token is original_token
+    assert canonical.effects == []
+
+    state.turn.lease_token = None
+    state.turn.lease_generation = None
+    state.turn.clear()
+    registry.release_acquire.set()
+
+    assert (await asyncio.wait_for(pending, 2))[0]["output"] == "serialized"
+    assert canonical.effects == ["call-1"]
+    assert state.turn.agent is None
+    assert state.turn.lease_token is None
+
+
+@pytest.mark.asyncio
+async def test_agent_rotation_while_turn_acquisition_waits_consumes_nothing():
+    from gateway.external_tool_batch import ExternalToolBatchRouteChanged
+    from gateway.realtime_voice_invocation import _record_for_realtime_tool_call_permit
+
+    source = _source()
+    runner, entry = _execution_runner(source)
+    _install_permit_tool(runner, source)
+    canonical = _install_canonical_executor(runner, source, {"call-1": "must-not-run"})
+    attachment = await _committed_execution_attachment(runner, source)
+    permit = _mint(attachment, 1)
+    permit_record = _record_for_realtime_tool_call_permit(attachment, permit)
+    state = runner._session_states[entry.session_key]
+    registry = _BlockingTurnRegistry()
+    runner._turn_leases = registry
+
+    pending = asyncio.create_task(attachment.execute_tool_batch((permit,)))
+    await asyncio.wait_for(registry.entered.wait(), 2)
+    replacement = SimpleNamespace(session_id=entry.session_id)
+    runner._agent_cache[entry.session_key] = (
+        replacement,
+        "replacement",
+        0,
+        entry.session_id,
+    )
+    state.turn.lease_token = None
+    state.turn.lease_generation = None
+    state.turn.clear()
+    registry.release_acquire.set()
+
+    with pytest.raises(ExternalToolBatchRouteChanged):
+        await asyncio.wait_for(pending, 2)
+    assert permit_record.consumed is False
+    assert canonical.effects == []
+    assert registry.releases == [registry.token]
+    assert state.turn.agent is None
+
+
 @pytest.mark.asyncio
 async def test_execute_tool_batch_returns_exact_durable_outputs_and_opaque_receipts(
     monkeypatch,

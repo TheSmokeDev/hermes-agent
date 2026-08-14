@@ -14,6 +14,8 @@ from gateway.external_tool_batch import (
     mint_route_execution_permit,
     pin_route_owned_agent,
     revalidate_route_owned_agent,
+    pin_durable_route_owned_agent,
+    revalidate_durable_route_owned_agent,
     gateway_approval_context,
 )
 from agent.external_tool_batch import ExternalToolBatchEnvelope
@@ -49,6 +51,25 @@ def _runner():
         _session_states={key: state},
     )
     return runner, key, agent, entry, state
+
+
+def test_durable_route_agent_binding_survives_idle_turn_clear_and_generation_increment():
+    runner, key, agent, entry, state = _runner()
+    source = object()
+    runner.session_store._route_structural_generations = {key: 3}
+    state.turn.clear()
+
+    binding = pin_durable_route_owned_agent(runner, key, source=source)
+
+    assert binding.agent is agent
+    assert binding.session_entry is entry
+    assert binding.session_state is state
+    assert binding.routing_generation == 3
+    assert binding.source is source
+    revalidate_durable_route_owned_agent(runner, binding)
+
+    state.persistent.run_generation += 1
+    revalidate_durable_route_owned_agent(runner, binding)
 
 
 def test_route_pin_rejects_recreated_field_equivalent_authority():

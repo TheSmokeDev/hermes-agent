@@ -78,6 +78,7 @@ def _runner(source: SessionSource, *, execution_authority: bool = False):
     )
     runner.session_store = MagicMock()
     runner.session_store._routing_generation = 7
+    runner.session_store._route_structural_generations = {entry.session_key: 7}
     runner.session_store._generate_session_key.return_value = entry.session_key
     runner.session_store.get_exact_session_entry.return_value = entry
     runner.session_store.get_exact_session_entry_snapshot.return_value = (entry, 7)
@@ -121,6 +122,35 @@ def _runner(source: SessionSource, *, execution_authority: bool = False):
     runner._set_session_env = lambda _context: None
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    if execution_authority:
+        class FixtureTurnRegistry:
+            def __init__(self):
+                self.tokens = []
+
+            async def acquire(self, *_args, **_kwargs):
+                token = object()
+                self.tokens.append(token)
+                if state.turn.agent is not None:
+                    state.turn.lease_token = None
+                    state.turn.lease_generation = None
+                    state.turn.clear()
+                return token
+
+            def release(self, token):
+                self.tokens.remove(token)
+                return True
+
+        class FixtureActiveLease:
+            def release(self):
+                return None
+
+        runner._turn_leases = FixtureTurnRegistry()
+        runner._claim_active_session_slot = lambda _route, _source: (
+            (None, None)
+            if state.turn.agent is not None
+            else (FixtureActiveLease(), None)
+        )
+        runner._persist_active_agents = lambda: None
     _register_gateway_runner(runner)
     return runner, entry
 
@@ -247,6 +277,41 @@ async def test_contextual_invocation_mints_one_opaque_execution_attachment():
 
 
 @pytest.mark.asyncio
+async def test_contextual_join_captures_full_execution_attachment_from_idle_cached_agent():
+    from gateway.realtime_voice_invocation import (
+        _record_for_realtime_execution_attachment,
+    )
+
+    source = _source()
+    runner, entry = _execution_runner(source)
+    state = runner._session_states[entry.session_key]
+    cached_agent = runner._agent_cache[entry.session_key][0]
+    state.turn.clear()
+    state.turn.lease_token = None
+    state.turn.lease_generation = None
+    captured = []
+
+    await _invoke(
+        runner,
+        source,
+        lambda _args, invocation: captured.append(
+            invocation.capture_realtime_execution_attachment()
+        ),
+    )
+
+    assert captured[0].closed is False
+    record = _record_for_realtime_execution_attachment(captured[0], runner)
+    assert record.route_pin.agent is cached_agent
+    assert state.turn.agent is None
+    assert state.turn.lease is None
+    assert state.turn.lease_token is None
+
+    state.persistent.run_generation += 1
+    assert captured[0].closed is False
+    assert _record_for_realtime_execution_attachment(captured[0], runner) is record
+
+
+@pytest.mark.asyncio
 async def test_close_during_handler_revokes_provisional_execution_attachment():
     from gateway.realtime_voice_invocation import (
         RealtimeVoiceInvocationError,
@@ -368,9 +433,7 @@ def test_plugin_load_and_noncontextual_handlers_have_no_execution_capture():
         "entry_recreation",
         "session_identity",
         "agent_lookalike",
-        "run_generation",
-        "lease",
-        "lease_token",
+        "state_recreation",
     ],
 )
 async def test_execution_capture_rejects_route_drift_before_mint(mutation):
@@ -412,13 +475,10 @@ async def test_execution_capture_rejects_route_drift_before_mint(mutation):
                 entry.session_id,
             )
             state.turn.agent = replacement
-        elif mutation == "run_generation":
-            state.persistent.run_generation += 1
-            state.turn.lease_generation += 1
-        elif mutation == "lease":
-            state.turn.lease = object()
+        elif mutation == "state_recreation":
+            runner._session_states[entry.session_key] = SessionState()
         else:
-            state.turn.lease_token = object()
+            raise AssertionError(mutation)
         created.append(invocation.capture_realtime_execution_attachment())
 
     with pytest.raises(RealtimeVoiceInvocationError, match="changed before capture"):
@@ -455,13 +515,12 @@ async def test_execution_attachment_retains_exact_private_pin_and_revalidates_li
     assert record.binding.profile is None
     assert record.binding.routing_key == entry.session_key
     assert record.binding.durable_session_id == entry.session_id
-    assert record.route_pin.agent is state.turn.agent
+    assert record.route_pin.agent is runner._agent_cache[entry.session_key][0]
     assert record.route_pin.session_entry is entry
-    assert record.route_pin.generation == 11
-    assert record.route_pin.active_session_lease is state.turn.lease
-    assert record.route_pin.turn_lease_token is state.turn.lease_token
+    assert record.route_pin.routing_generation == 7
+    assert record.route_pin.session_state is state
 
-    state.turn.lease = object()
+    runner._session_states[entry.session_key] = SessionState()
     with pytest.raises(RealtimeVoiceInvocationError, match="authority changed"):
         _record_for_realtime_execution_attachment(captured[0], runner)
 
@@ -1500,7 +1559,7 @@ async def test_tool_definitions_require_commit_allow_child_threads_and_fail_afte
 
 
 @pytest.mark.asyncio
-async def test_tool_definitions_rotation_wins_before_projection_can_return(
+async def test_tool_definitions_survive_unrelated_run_generation_during_projection(
     monkeypatch,
 ):
     import gateway.realtime_voice_invocation as invocation_module
@@ -1514,7 +1573,7 @@ async def test_tool_definitions_rotation_wins_before_projection_can_return(
             "type": "function",
             "function": {
                 "name": "stale_tool",
-                "description": "Must not escape after rotation wins.",
+                "description": "Remains available across ordinary completed turns.",
                 "parameters": {"type": "object", "properties": {}},
             },
         }
@@ -1539,10 +1598,13 @@ async def test_tool_definitions_rotation_wins_before_projection_can_return(
         state.persistent.run_generation += 1
     permit_projection.set()
 
-    with pytest.raises(
-        invocation_module.RealtimeVoiceInvocationError, match="authority changed"
-    ):
-        await pending
+    assert await pending == [
+        {
+            "name": "stale_tool",
+            "description": "Remains available across ordinary completed turns.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1765,7 +1827,7 @@ async def test_tool_call_permit_duplicate_identity_positions_and_attachment_scop
 
 
 @pytest.mark.asyncio
-async def test_tool_call_permit_duplicate_close_and_rotation_barriers(monkeypatch):
+async def test_tool_call_permit_duplicate_close_and_generation_barriers(monkeypatch):
     import gateway.realtime_voice_invocation as invocation_module
 
     source = _source()
@@ -1871,10 +1933,7 @@ async def test_tool_call_permit_duplicate_close_and_rotation_barriers(monkeypatc
     with state.turn_authority_lock:
         state.persistent.run_generation += 1
     release.set()
-    with pytest.raises(
-        invocation_module.RealtimeVoiceInvocationError, match="authority changed"
-    ):
-        await pending_rotation
+    assert type(await pending_rotation).__name__ == "RealtimeToolCallPermit"
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -8655,6 +8656,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
             return None, None
+
+    @asynccontextmanager
+    async def _acquire_external_tool_batch_turn(self, binding):
+        """Acquire one canonical host turn for an idle external tool batch."""
+
+        from gateway.external_tool_batch import (
+            ExternalToolBatchRouteChanged,
+            install_durable_route_owned_agent_turn,
+            revalidate_durable_route_owned_agent,
+        )
+
+        route = binding.session_key
+        source = binding.source
+        revalidate_durable_route_owned_agent(self, binding)
+        state = self._peek_session_state(route)
+        if state is not binding.session_state:
+            raise ExternalToolBatchRouteChanged("durable route authority changed")
+        with state.turn_authority_lock:
+            locally_running = state.turn.agent is not None
+
+        active_lease, limit_message = self._claim_active_session_slot(route, source)
+        if limit_message is not None:
+            raise ExternalToolBatchRouteChanged(
+                "canonical provider tool batch session capacity unavailable"
+            )
+
+        registry = getattr(self, "_turn_leases", None)
+        if registry is None:
+            if active_lease is not None:
+                active_lease.release()
+            raise ExternalToolBatchRouteChanged("canonical turn registry unavailable")
+
+        token = None
+        generation = None
+        installed = False
+        try:
+            if locally_running:
+                # Do not invalidate or overwrite the live TurnState. The durable
+                # session lease is the serializer; claim our generation only
+                # after the current owner has released it.
+                with state.turn_authority_lock:
+                    wait_generation = state.persistent.run_generation
+                token = await registry.acquire(
+                    binding.session_id,
+                    owner_key=route,
+                    generation=wait_generation,
+                    timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+                )
+                generation = self._begin_session_run_generation(route)
+                if active_lease is None:
+                    active_lease, limit_message = self._claim_active_session_slot(
+                        route, source
+                    )
+                    if limit_message is not None:
+                        raise ExternalToolBatchRouteChanged(
+                            "canonical provider tool batch session capacity unavailable"
+                        )
+            else:
+                generation = self._begin_session_run_generation(route)
+                token = await registry.acquire(
+                    binding.session_id,
+                    owner_key=route,
+                    generation=generation,
+                    timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
+                )
+
+            pin = install_durable_route_owned_agent_turn(
+                self,
+                binding,
+                generation=generation,
+                active_session_lease=active_lease,
+                turn_lease_token=token,
+                started_ts=time.time(),
+            )
+            installed = True
+            self._persist_active_agents()
+            try:
+                yield pin
+            finally:
+                # Match production ordering: session turn lease first, then
+                # running/active-slot state. Both helpers are identity guarded.
+                self._release_turn_lease(route, generation)
+                self._release_running_agent_state(
+                    route, run_generation=generation
+                )
+        finally:
+            if not installed:
+                if token is not None:
+                    try:
+                        registry.release(token)
+                    except Exception:
+                        logger.debug("Failed to release external turn lease", exc_info=True)
+                if active_lease is not None:
+                    try:
+                        active_lease.release()
+                    except Exception:
+                        logger.debug("Failed to release external active slot", exc_info=True)
 
     @staticmethod
     def _agent_has_active_subagents(running_agent: Any) -> bool:
