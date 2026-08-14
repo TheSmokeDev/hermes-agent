@@ -4,7 +4,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { $approvalRequests, clearApprovalRequest } from './prompts'
+import { $approvalRequests, clearApprovalRequest, clearApprovalRequestIfCurrent } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -240,7 +240,9 @@ export async function respondToApprovalAction(
     return
   }
 
-  if (!requestId && $approvalRequests.get()[sessionId ?? '']?.requestId) {
+  const originalRequest = $approvalRequests.get()[sessionId ?? '']
+
+  if (!requestId && originalRequest?.requestId) {
     return
   }
 
@@ -250,7 +252,12 @@ export async function respondToApprovalAction(
       choice,
       session_id: sessionId ?? undefined
     })
-    clearApprovalRequest(sessionId, requestId)
+
+    if (requestId) {
+      clearApprovalRequest(sessionId, requestId)
+    } else if (originalRequest) {
+      clearApprovalRequestIfCurrent(sessionId, originalRequest)
+    }
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

@@ -107,6 +107,26 @@ describe('PendingToolApproval', () => {
     expect($approvalRequest.get()?.requestId).toBe('approval-b')
   })
 
+  it('does not clear a newer request when an id-less response completes', async () => {
+    let resolveResponse!: () => void
+    const request = vi.fn().mockImplementation(() => new Promise<void>(resolve => (resolveResponse = resolve)))
+    $gateway.set({ request } as unknown as HermesGateway)
+    $activeSessionId.set('sess-1')
+    setApprovalRequest({ command: 'echo a', description: 'A', sessionId: 'sess-1' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    const approvalB = { command: 'echo b', description: 'B', sessionId: 'sess-1' }
+    await act(async () => {
+      setApprovalRequest(approvalB)
+      resolveResponse()
+      await Promise.resolve()
+    })
+
+    expect($approvalRequest.get()).toBe(approvalB)
+  })
+
   it('does not submit a stale bar after a newer request replaces it', async () => {
     const request = mockGateway()
     const approvalA = { command: 'echo a', description: 'A', requestId: 'approval-a', sessionId: 'sess-1' }

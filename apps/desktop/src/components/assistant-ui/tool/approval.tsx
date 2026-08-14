@@ -23,6 +23,7 @@ import { notifyError } from '@/store/notifications'
 import {
   type ApprovalRequest,
   clearApprovalRequest,
+  clearApprovalRequestIfCurrent,
   registerApprovalInlineAnchor,
   sessionApprovalInlineVisible,
   sessionApprovalRequest
@@ -149,7 +150,12 @@ export const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | '
           session_id: request.sessionId ?? undefined
         })
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
-        clearApprovalRequest(request.sessionId, request.requestId)
+
+        if (request.requestId) {
+          clearApprovalRequest(request.sessionId, request.requestId)
+        } else {
+          clearApprovalRequestIfCurrent(request.sessionId, request)
+        }
       } catch (error) {
         notifyError(error, copy.sendFailed)
         setSubmitting(null)

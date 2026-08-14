@@ -100,6 +100,14 @@ export const $approvalRequests = approval.$all
 export const setApprovalRequest = approval.set
 export const clearApprovalRequest = approval.clear
 
+/** Clear an id-less approval only while the session still holds the exact
+ * request object that began the asynchronous response. */
+export function clearApprovalRequestIfCurrent(sessionId: string | null, expected: ApprovalRequest): void {
+  if (approval.$all.get()[keyFor(sessionId)] === expected) {
+    approval.clear(sessionId)
+  }
+}
+
 /** The prompt request for one specific session — the tile counterpart of the
  *  active-session `$*Request` views (same map, fixed key). */
 export const sessionApprovalRequest = (sessionId: string | null) =>

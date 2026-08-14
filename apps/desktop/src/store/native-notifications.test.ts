@@ -294,6 +294,23 @@ describe('respondToApprovalAction', () => {
     expect($approvalRequest.get()?.requestId).toBe('approval-b')
   })
 
+  it('does not clear a newer prompt when an id-less native response completes', async () => {
+    let resolveResponse!: () => void
+    request.mockImplementationOnce(() => new Promise<void>(resolve => (resolveResponse = resolve)))
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'echo a', description: 'A', sessionId: 'bg' })
+
+    const response = respondToApprovalAction('bg', 'approve')
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    const approvalB = { command: 'echo b', description: 'B', sessionId: 'bg' }
+    setApprovalRequest(approvalB)
+    resolveResponse()
+    await response
+
+    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect($approvalRequest.get()).toBe(approvalB)
+  })
+
   it('fails closed when a legacy action lacks the current exact requestId', async () => {
     setActiveSessionId('bg')
     setApprovalRequest({ command: 'echo b', description: 'B', requestId: 'approval-b', sessionId: 'bg' })
