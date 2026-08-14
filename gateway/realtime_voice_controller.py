@@ -853,6 +853,11 @@ class GatewayRealtimeVoiceController:
                         )
                     )
                     state.event_tail_task = deferred
+                    deferred.add_done_callback(
+                        lambda task, response=state: self._clear_native_event_tail(
+                            response, task
+                        )
+                    )
                     return
                 if type(event) in (OutputAudio, OutputTranscript):
                     if state.item_id is None:
@@ -1030,6 +1035,16 @@ class GatewayRealtimeVoiceController:
             task.result()
         except BaseException:
             pass
+
+    @staticmethod
+    def _clear_native_event_tail(
+        state: _NativeResponseState, task: asyncio.Task[Any]
+    ) -> None:
+        # A task cancelled before first execution never enters its coroutine
+        # finally block. This callback runs on the owning event loop; exact
+        # identity prevents an older task from clearing a newer tail.
+        if state.event_tail_task is task:
+            state.event_tail_task = None
 
     def _create_native_task(self, awaitable: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(awaitable)

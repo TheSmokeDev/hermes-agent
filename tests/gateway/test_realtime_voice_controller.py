@@ -2922,6 +2922,64 @@ async def test_real_native_pcm_capacity_blocked_write_interrupts_and_stays_liste
     await controller.close(reason="test")
 
 
+@pytest.mark.parametrize("trigger", ["interrupt", "speech-start"])
+@pytest.mark.asyncio
+async def test_cancelled_unstarted_native_event_tail_clears_identity(binding, trigger):
+    from plugins.platforms.discord.voice_mixer import VoiceMixer
+
+    session = _Session()
+    assert register_provider(_Provider(session))
+    host = _RealLeaseHost(VoiceMixer(native_frame_capacity=1))
+    controller = GatewayRealtimeVoiceController(host)
+    await controller.open("fake", RealtimeVoiceSetup(), binding)
+    await session.incoming.put(
+        InputTranscript(
+            item_id="input",
+            turn_id="input-turn",
+            text="question",
+            final=True,
+            role=TranscriptRole.OPERATOR,
+            provenance=TranscriptProvenance.OPERATOR_INPUT,
+        )
+    )
+    await session.response_started.wait()
+    await controller._handle_event(ResponseStarted("response", "host-turn"), 1)
+    lease = host.leases[0]
+    payload = struct.pack("<960h", *range(960))
+    writing = asyncio.create_task(
+        controller._handle_event(
+            OutputAudio(payload, "item", "host-turn", "response"), 1
+        )
+    )
+    for _ in range(20):
+        if lease._space_waiters:
+            break
+        await _next_loop_turn()
+    assert lease._space_waiters
+
+    await controller._handle_event(
+        OutputAudio(b"\x02\x00", "item", "host-turn", "response"), 1
+    )
+    await controller._handle_event(
+        OutputAudio(b"\x03\x00", "item", "host-turn", "response"), 1
+    )
+    state = controller._native_response
+    assert state is not None
+    newest_tail = state.event_tail_task
+    assert newest_tail is not None
+
+    if trigger == "interrupt":
+        await controller.interrupt()
+    else:
+        await controller._handle_event(InputSpeechStarted("speech-item", 123), 1)
+    await writing
+    await _next_loop_turn()
+
+    assert newest_tail.cancelled()
+    assert state.event_tail_task is None
+    await controller.close(reason="test")
+
+
 @pytest.mark.asyncio
 async def test_real_native_pcm_serializes_audio_deltas_under_backpressure(binding):
     from plugins.platforms.discord.voice_mixer import VoiceMixer
