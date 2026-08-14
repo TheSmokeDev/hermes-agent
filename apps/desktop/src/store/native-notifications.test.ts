@@ -11,7 +11,7 @@ import {
   setNativeNotifyKind
 } from './native-notifications'
 import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
-import { $approvalRequest, setApprovalRequest } from './prompts'
+import { $approvalRequest, clearAllPrompts, setApprovalRequest } from './prompts'
 import { $activeSessionId, setActiveSessionId } from './session'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -46,6 +46,7 @@ beforeEach(() => {
   setActiveSessionId(null)
   setWindowState({ focused: false, hidden: true })
   __resetNativeNotifyBaselineForTests()
+  clearAllPrompts()
 })
 
 afterEach(() => {
@@ -139,6 +140,17 @@ describe('dispatchNativeNotification preferences', () => {
     expect(notify).toHaveBeenCalledWith(
       expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
     )
+  })
+
+  it('forwards the exact approval requestId to the native bridge', () => {
+    dispatchNativeNotification({
+      kind: 'approval',
+      requestId: 'approval-a',
+      sessionId: freshSession(),
+      title: 'approve'
+    })
+
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'approval-a' }))
   })
 })
 
@@ -261,5 +273,34 @@ describe('respondToApprovalAction', () => {
     $gateway.set(null)
     await respondToApprovalAction('bg', 'approve')
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('responds to the notification requestId and cannot clear a newer prompt', async () => {
+    let resolveResponse!: () => void
+    request.mockImplementationOnce(() => new Promise<void>(resolve => (resolveResponse = resolve)))
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'echo a', description: 'A', requestId: 'approval-a', sessionId: 'bg' })
+
+    const response = respondToApprovalAction('bg', 'approve', 'approval-a')
+    setApprovalRequest({ command: 'echo b', description: 'B', requestId: 'approval-b', sessionId: 'bg' })
+    resolveResponse()
+    await response
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_request_id: 'approval-a',
+      choice: 'once',
+      session_id: 'bg'
+    })
+    expect($approvalRequest.get()?.requestId).toBe('approval-b')
+  })
+
+  it('fails closed when a legacy action lacks the current exact requestId', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'echo b', description: 'B', requestId: 'approval-b', sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()?.requestId).toBe('approval-b')
   })
 })

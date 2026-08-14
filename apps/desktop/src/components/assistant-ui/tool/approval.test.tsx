@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
@@ -6,7 +6,7 @@ import { $gateway } from '@/store/gateway'
 import { $approvalRequest, clearAllPrompts, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
 
-import { PendingApprovalFallback, PendingToolApproval } from './approval'
+import { ApprovalBar, PendingApprovalFallback, PendingToolApproval } from './approval'
 import type { ToolPart } from './fallback-model'
 
 // Radix's DropdownMenu touches pointer-capture + scrollIntoView, which jsdom
@@ -86,6 +86,43 @@ describe('PendingToolApproval', () => {
       expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('does not clear a newer request when the earlier response completes', async () => {
+    let resolveResponse!: () => void
+    const request = vi.fn().mockImplementation(() => new Promise<void>(resolve => (resolveResponse = resolve)))
+    $gateway.set({ request } as unknown as HermesGateway)
+    $activeSessionId.set('sess-1')
+    setApprovalRequest({ command: 'echo a', description: 'A', requestId: 'approval-a', sessionId: 'sess-1' })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      setApprovalRequest({ command: 'echo b', description: 'B', requestId: 'approval-b', sessionId: 'sess-1' })
+      resolveResponse()
+      await Promise.resolve()
+    })
+
+    expect($approvalRequest.get()?.requestId).toBe('approval-b')
+  })
+
+  it('does not submit a stale bar after a newer request replaces it', async () => {
+    const request = mockGateway()
+    const approvalA = { command: 'echo a', description: 'A', requestId: 'approval-a', sessionId: 'sess-1' }
+    $activeSessionId.set('sess-1')
+    setApprovalRequest(approvalA)
+    render(<ApprovalBar request={approvalA} surface="inline" />)
+    const staleRun = screen.getByRole('button', { name: /Run/ })
+
+    await act(() => {
+      setApprovalRequest({ command: 'echo b', description: 'B', requestId: 'approval-b', sessionId: 'sess-1' })
+    })
+    fireEvent.click(staleRun)
+
+    await Promise.resolve()
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()?.requestId).toBe('approval-b')
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {
