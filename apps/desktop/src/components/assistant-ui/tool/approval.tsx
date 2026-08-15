@@ -23,6 +23,7 @@ import { notifyError } from '@/store/notifications'
 import {
   type ApprovalRequest,
   clearApprovalRequest,
+  clearApprovalRequestIfCurrent,
   registerApprovalInlineAnchor,
   sessionApprovalInlineVisible,
   sessionApprovalRequest
@@ -102,7 +103,7 @@ export const PendingApprovalFallback: FC = () => {
 
 const isMac = typeof navigator !== 'undefined' && /Mac|iP(hone|ad|od)/.test(navigator.platform)
 
-const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline' }> = ({ request, surface }) => {
+export const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline' }> = ({ request, surface }) => {
   const { t } = useI18n()
   const copy = t.assistant.approval
   const gateway = useStore($gateway)
@@ -126,10 +127,11 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
 
   const respond = useCallback(
     async (choice: ApprovalChoice) => {
-      // Another bar (or the keyboard path) may have already resolved this
-      // approval; the map is the single source of truth, so bail if this
-      // session's request is gone.
-      if (busy || !sessionApprovalRequest(request.sessionId).get()) {
+      // Another bar (or the keyboard path) may have resolved or replaced this
+      // approval. Match the exact request, not just the session slot.
+      const current = sessionApprovalRequest(request.sessionId).get()
+
+      if (busy || !current || (request.requestId ? current.requestId !== request.requestId : current !== request)) {
         return
       }
 
@@ -143,17 +145,23 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
 
       try {
         await gateway.request<{ resolved?: boolean }>('approval.respond', {
+          ...(request.requestId ? { approval_request_id: request.requestId } : {}),
           choice,
           session_id: request.sessionId ?? undefined
         })
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
-        clearApprovalRequest(request.sessionId)
+
+        if (request.requestId) {
+          clearApprovalRequest(request.sessionId, request.requestId)
+        } else {
+          clearApprovalRequestIfCurrent(request.sessionId, request)
+        }
       } catch (error) {
         notifyError(error, copy.sendFailed)
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.

@@ -4,7 +4,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { $approvalRequests, clearApprovalRequest, clearApprovalRequestIfCurrent } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -154,6 +154,8 @@ export interface NativeNotificationInput {
   title: string
   body?: string
   sessionId?: null | string
+  /** Exact backend approval request represented by this notification. */
+  requestId?: string
   /**
    * Not tied to a chat session (e.g. pet generation). Fires whenever the user
    * is away, bypassing the session-match gate that completion kinds normally
@@ -193,6 +195,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     actions: input.actions,
     body: input.body,
     kind: input.kind,
+    requestId: input.requestId,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     tag: input.tag,
@@ -217,9 +220,14 @@ export function dispatchPluginNativeNotification(pluginId: string, input: Plugin
   dispatchNativeNotification({ ...input, global: true, kind: 'plugin', tag: pluginId })
 }
 
-// Resolve a pending approval from a notification button, mirroring the in-app
-// Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+// Resolve the exact approval represented by a notification button. Legacy
+// notifications without an id remain usable only when no newer exact request
+// is parked for that session; they must never borrow that newer request's id.
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  requestId?: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -232,9 +240,24 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
     return
   }
 
+  const originalRequest = $approvalRequests.get()[sessionId ?? '']
+
+  if (!requestId && originalRequest?.requestId) {
+    return
+  }
+
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    await gateway.request('approval.respond', {
+      ...(requestId ? { approval_request_id: requestId } : {}),
+      choice,
+      session_id: sessionId ?? undefined
+    })
+
+    if (requestId) {
+      clearApprovalRequest(sessionId, requestId)
+    } else if (originalRequest) {
+      clearApprovalRequestIfCurrent(sessionId, originalRequest)
+    }
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

@@ -600,6 +600,34 @@ class TestProtectedInstructionFiles:
         finally:
             A.reset_current_session_key(token)
 
+    def test_gateway_protected_write_routes_to_exact_current_same_key_owner(self, tmp_path):
+        import tools.approval as A
+
+        session_key = "protected-files-overlap"
+        token = A.set_current_session_key(session_key)
+        notices = []
+
+        def outer_notify(approval_data):
+            notices.append("outer")
+            A.resolve_gateway_approval(session_key, "once")
+
+        def inner_notify(_approval_data):
+            notices.append("inner")
+
+        outer = A.register_gateway_notify(session_key, outer_notify)
+        inner = A.register_gateway_notify(session_key, inner_notify)
+        owner_token = A.set_gateway_notify_owner(outer)
+        try:
+            res = self._write(tmp_path / "AGENTS.md", "owner approved")
+            assert not res.get("error"), res
+            assert notices == ["outer"]
+            assert A._gateway_notify_for_owner(session_key, inner) is inner_notify
+        finally:
+            A.reset_gateway_notify_owner(owner_token)
+            A.unregister_gateway_notify(session_key, inner)
+            A.unregister_gateway_notify(session_key, outer)
+            A.reset_current_session_key(token)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

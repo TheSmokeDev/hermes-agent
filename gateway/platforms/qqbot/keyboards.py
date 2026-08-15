@@ -158,7 +158,7 @@ class InlineKeyboard:
 
 # ── INTERACTION_CREATE parsing ───────────────────────────────────────
 
-def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
+def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str] | tuple[str, str, str]]:
     """Parse approval ``button_data`` into ``(session_key, decision)``.
 
     :param button_data: Raw ``data.resolved.button_data`` from
@@ -168,7 +168,10 @@ def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
     m = _APPROVAL_DATA_RE.match(button_data or "")
     if not m:
         return None
-    return m.group(1), m.group(2)
+    route, sep, request_id = m.group(1).partition("|")
+    if sep:
+        return route, m.group(2), request_id
+    return route, m.group(2)
 
 
 def parse_update_prompt_button_data(button_data: str) -> Optional[str]:
@@ -201,7 +204,9 @@ def _make_callback_button(
     )
 
 
-def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -> InlineKeyboard:
+def build_approval_keyboard(
+    session_key: str, *, allow_permanent: bool = True, request_id: str | None = None
+) -> InlineKeyboard:
     """Build the approval keyboard, hiding persistent scope when unavailable.
 
     Layout: ``[✅ 允许一次] [⭐ 始终允许] [❌ 拒绝]`` — all three share
@@ -210,22 +215,23 @@ def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -
     :param session_key: Embedded into ``button_data`` so the decision
         routes back to the right pending approval.
     """
+    wire_route = f"{session_key}|{request_id}" if request_id else session_key
     buttons = [
         _make_callback_button(
             btn_id="allow", label="✅ 允许一次", visited_label="已允许",
-            data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-once",
+            data=f"{APPROVAL_BUTTON_PREFIX}{wire_route}:allow-once",
             style=1, group_id="approval",
         )
     ]
     if allow_permanent:
         buttons.append(_make_callback_button(
             btn_id="always", label="⭐ 始终允许", visited_label="已始终允许",
-            data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-always",
+            data=f"{APPROVAL_BUTTON_PREFIX}{wire_route}:allow-always",
             style=1, group_id="approval",
         ))
     buttons.append(_make_callback_button(
         btn_id="deny", label="❌ 拒绝", visited_label="已拒绝",
-        data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:deny",
+        data=f"{APPROVAL_BUTTON_PREFIX}{wire_route}:deny",
         style=0, group_id="approval",
     ))
     return InlineKeyboard(content=KeyboardContent(rows=[KeyboardRow(buttons=buttons)]))
@@ -276,6 +282,7 @@ class ApprovalRequest:
     """
     session_key: str
     title: str
+    request_id: str | None = None
     description: str = ""
     command_preview: str = ""
     cwd: str = ""
@@ -368,7 +375,7 @@ class ApprovalSender:
         :returns: ``True`` on success, ``False`` on failure.
         """
         text = build_approval_text(req)
-        keyboard = build_approval_keyboard(req.session_key)
+        keyboard = build_approval_keyboard(req.session_key, request_id=req.request_id)
 
         logger.info(
             "[%s] Sending approval request to %s:%s (session=%.20s…)",

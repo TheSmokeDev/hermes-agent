@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 
 import agent.realtime_voice_provider as realtime_voice_provider
 from agent.realtime_voice_provider import (
+    InputSpeechStarted,
     InputTranscript,
     Interruption,
     OutputAudio,
     OutputTranscript,
     RealtimeCapability,
     RealtimeAudioFormat,
+    RealtimeInputAudioFormat,
+    RealtimeOutputAudioFormat,
+    RealtimeResponseRequest,
     ResponseCompleted,
     ResponseStarted,
     SessionClosed,
@@ -44,6 +49,25 @@ def test_setup_copies_and_freezes_provider_options() -> None:
     tags.add("mutated")
 
     assert setup.provider_options == {"region": "local", "tags": frozenset({"local"})}
+
+
+def test_setup_preserves_legacy_sixth_positional_provider_options() -> None:
+    options = {"region": "local", "nested": ["value"]}
+
+    setup = RealtimeVoiceSetup(
+        "model",
+        "voice",
+        "instructions",
+        (),
+        RealtimeAudioFormat("audio/pcm", 24_000, 1),
+        options,
+    )
+    options["nested"].append("mutated")
+
+    assert setup.provider_options == {"region": "local", "nested": ("value",)}
+    assert setup.input_audio is None
+    assert setup.output_audio is None
+    assert setup.automatic_response is False
 
 
 def test_opaque_mappings_reject_values_that_cannot_be_frozen() -> None:
@@ -126,6 +150,88 @@ def test_audio_format_requires_positive_non_bool_integer_primitives(
         RealtimeAudioFormat(**values)
 
 
+def test_setup_distinguishes_exact_input_and_output_audio_from_legacy_audio() -> None:
+    legacy = RealtimeAudioFormat("audio/pcm", 24_000, 1)
+    input_audio = RealtimeInputAudioFormat(
+        "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+    )
+    output_audio = RealtimeOutputAudioFormat(
+        "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+    )
+
+    setup = RealtimeVoiceSetup(
+        audio=legacy,
+        input_audio=input_audio,
+        output_audio=output_audio,
+    )
+
+    assert setup.audio is legacy
+    assert setup.input_audio is input_audio
+    assert setup.output_audio is output_audio
+    assert setup.automatic_response is False
+    with pytest.raises(ValueError, match="sample_width_bytes"):
+        RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", 4, "little"
+        )
+    with pytest.raises(ValueError, match="endianness"):
+        RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", 2, "big"
+        )
+
+
+def test_exact_audio_formats_reject_numeric_lookalikes_and_pcm_contradictions() -> None:
+    class IntLookalike(int):
+        pass
+
+    with pytest.raises(TypeError, match="sample_rate_hz"):
+        RealtimeInputAudioFormat("audio/pcm", IntLookalike(24_000), 1)
+    with pytest.raises(TypeError, match="sample_width_bytes"):
+        RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", IntLookalike(2), "little"
+        )
+    with pytest.raises(ValueError, match="mime_type"):
+        RealtimeOutputAudioFormat(
+            "audio/wav", 24_000, 1, "pcm_s16le", 2, "little"
+        )
+
+
+def test_exact_audio_formats_require_every_exact_noncoercive_dimension() -> None:
+    class StrLookalike(str):
+        pass
+
+    class IntLookalike(int):
+        pass
+
+    valid = {
+        "mime_type": "audio/opus",
+        "sample_rate_hz": 24_000,
+        "channels": 1,
+        "sample_encoding": "opus",
+        "sample_width_bytes": 2,
+        "endianness": "little",
+    }
+    invalid_dimensions = (
+        ("sample_encoding", None),
+        ("sample_encoding", StrLookalike("pcm_s16le")),
+        ("sample_width_bytes", None),
+        ("sample_width_bytes", "2"),
+        ("sample_width_bytes", IntLookalike(2)),
+        ("endianness", None),
+        ("endianness", StrLookalike("little")),
+        ("sample_rate_hz", "24000"),
+        ("sample_rate_hz", IntLookalike(24_000)),
+        ("channels", "1"),
+        ("channels", IntLookalike(1)),
+    )
+
+    for format_type in (RealtimeInputAudioFormat, RealtimeOutputAudioFormat):
+        for field_name, invalid in invalid_dimensions:
+            values = dict(valid)
+            values[field_name] = invalid
+            with pytest.raises((TypeError, ValueError), match=field_name):
+                format_type(**values)
+
+
 @pytest.mark.parametrize("instructions", [1, b"text", object()])
 def test_setup_instructions_must_be_none_or_string(instructions) -> None:
     with pytest.raises(TypeError, match="instructions"):
@@ -166,7 +272,74 @@ def test_capabilities_are_explicit_and_immutable() -> None:
         "input_transcription",
         "output_transcription",
         "continuation",
+        "explicit_response",
+        "response_cancellation",
     }
+
+
+def test_response_request_is_immutable_and_causally_bound_to_canonical_text() -> None:
+    text = " Canonical assistant reply. "
+    output_format = RealtimeOutputAudioFormat(
+        mime_type="audio/pcm",
+        sample_encoding="pcm_s16le",
+        sample_width_bytes=2,
+        endianness="little",
+        sample_rate_hz=24_000,
+        channels=1,
+    )
+
+    request = RealtimeResponseRequest(
+        durable_session_id="durable-session",
+        assistant_message_id=17,
+        turn_marker="turn-marker",
+        canonical_text=text,
+        content_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        output_audio_format=output_format,
+        allow_tools=False,
+    )
+
+    assert request.output_audio_format is output_format
+    assert request.allow_tools is False
+    with pytest.raises(AttributeError):
+        request.turn_marker = "changed"
+
+
+def test_response_request_rejects_noncanonical_causal_identity_and_digest() -> None:
+    text = "Canonical reply"
+    values = {
+        "durable_session_id": "durable",
+        "assistant_message_id": 1,
+        "turn_marker": "turn",
+        "canonical_text": text,
+        "content_digest": hashlib.sha256(text.encode()).hexdigest(),
+        "output_audio_format": RealtimeOutputAudioFormat(
+            mime_type="audio/pcm",
+            sample_encoding="pcm_s16le",
+            sample_width_bytes=2,
+            endianness="little",
+            sample_rate_hz=24_000,
+            channels=1,
+        ),
+        "allow_tools": False,
+    }
+
+    invalid_values = (
+        ("durable_session_id", " padded"),
+        ("assistant_message_id", True),
+        ("assistant_message_id", 0),
+        ("turn_marker", ""),
+        ("canonical_text", " \t"),
+        ("canonical_text", "\ud800"),
+        ("content_digest", "A" * 64),
+        ("content_digest", "0" * 64),
+        ("allow_tools", True),
+        ("allow_tools", 0),
+    )
+    for field_name, invalid in invalid_values:
+        candidate = dict(values)
+        candidate[field_name] = invalid
+        with pytest.raises((TypeError, ValueError), match=field_name):
+            RealtimeResponseRequest(**candidate)
 
 
 def test_shared_event_vocabulary_is_typed_and_provider_data_is_opaque() -> None:
@@ -176,6 +349,7 @@ def test_shared_event_vocabulary_is_typed_and_provider_data_is_opaque() -> None:
         SessionReady(session_id="session", provider_data=provider_data),
         SessionClosed(reason="normal"),
         SessionFailure(code="transport", message="lost"),
+        InputSpeechStarted(item_id="input", audio_start_ms=17),
         InputTranscript(
             item_id="input",
             turn_id="turn",
@@ -208,7 +382,7 @@ def test_shared_event_vocabulary_is_typed_and_provider_data_is_opaque() -> None:
     provider_data["native"]["values"].append("changed")
     tags.add("mutated")
 
-    assert len(events) == 13
+    assert len(events) == 14
     assert events[0].session_id == "session"
     assert events[0].provider_data == {
         "native": {"values": ("value",), "tags": frozenset({"tag"})}
@@ -241,6 +415,33 @@ def test_shared_events_reject_blank_or_malformed_identifiers(session_id: str) ->
 def test_shared_events_reject_oversized_identifiers() -> None:
     with pytest.raises(ValueError, match="session_id"):
         SessionReady(session_id="x" * (MAX_IDENTIFIER_LENGTH + 1))
+
+
+def test_input_speech_started_is_passive_frozen_and_exactly_validated() -> None:
+    event = InputSpeechStarted(item_id="input", audio_start_ms=17)
+
+    assert event.item_id == "input"
+    assert event.audio_start_ms == 17
+    with pytest.raises(AttributeError):
+        event.audio_start_ms = 18
+
+    class StrLookalike(str):
+        pass
+
+    class IntLookalike(int):
+        pass
+
+    for invalid in ("", " padded", "padded ", "x" * (MAX_IDENTIFIER_LENGTH + 1)):
+        with pytest.raises(ValueError, match="item_id"):
+            InputSpeechStarted(item_id=invalid, audio_start_ms=0)
+    for invalid in (StrLookalike("input"), 1, True):
+        with pytest.raises(TypeError, match="item_id"):
+            InputSpeechStarted(item_id=invalid, audio_start_ms=0)
+    for invalid in (True, IntLookalike(1), "1", 1.0, None):
+        with pytest.raises(TypeError, match="audio_start_ms"):
+            InputSpeechStarted(item_id="input", audio_start_ms=invalid)
+    with pytest.raises(ValueError, match="audio_start_ms"):
+        InputSpeechStarted(item_id="input", audio_start_ms=-1)
 
 
 @pytest.mark.parametrize(
@@ -370,6 +571,8 @@ class _Session(RealtimeVoiceSession):
         self.submitted = []
         self.continuations = []
         self.event_values = []
+        self.response_requests = []
+        self.cancelled_responses = []
 
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -386,6 +589,12 @@ class _Session(RealtimeVoiceSession):
 
     async def _continue_response(self, batch_id: str) -> None:
         self.continuations.append(batch_id)
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+
+    async def _cancel_response(self, response_id: str) -> None:
+        self.cancelled_responses.append(response_id)
 
     async def _close(self) -> None:
         await asyncio.sleep(0)
@@ -424,6 +633,245 @@ class _FailingContinuationSession(_Session):
         raise RuntimeError("continuation write failed")
 
 
+class _FailingResponseSession(_Session):
+    def __init__(self) -> None:
+        super().__init__({RealtimeCapability.EXPLICIT_RESPONSE})
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        raise RuntimeError("native response write failed")
+
+
+class _ImmediateFailingResponseSession(_FailingResponseSession):
+    async def _close(self) -> None:
+        self.closed_count += 1
+
+
+class _ImmediateFailingCancellationSession(_Session):
+    def __init__(self) -> None:
+        super().__init__({RealtimeCapability.RESPONSE_CANCELLATION})
+
+    async def _cancel_response(self, response_id: str) -> None:
+        self.cancelled_responses.append(response_id)
+        raise RuntimeError("native cancellation write failed")
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+
+
+class _FailingCancellationCloseJoinsOperationSession(_Session):
+    def __init__(self) -> None:
+        super().__init__({RealtimeCapability.RESPONSE_CANCELLATION})
+        self.events_entered = asyncio.Event()
+        self.release_events = asyncio.Event()
+        self.close_entered = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def _cancel_response(self, response_id: str) -> None:
+        self.cancelled_responses.append(response_id)
+        raise RuntimeError("native cancellation write failed")
+
+    def _events(self):
+        async def stream():
+            self.events_entered.set()
+            await self.release_events.wait()
+            if False:
+                yield RealtimeVoiceEvent()
+
+        return stream()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.close_entered.set()
+        self.release_events.set()
+        operation = self._response_cancellation_tasks.get("response")
+        if operation is not None:
+            await asyncio.shield(operation)
+        self.cleanup_completed.set()
+        if self.closed_count == 1:
+            raise RuntimeError("close after cancellation failure failed")
+
+
+class _ControlledResponseSession(_Session):
+    def __init__(self, outcome: BaseException | None = None) -> None:
+        super().__init__({RealtimeCapability.EXPLICIT_RESPONSE})
+        self.response_entered = asyncio.Event()
+        self.release_response = asyncio.Event()
+        self.events_entered = asyncio.Event()
+        self.release_events = asyncio.Event()
+        self.response_outcome = outcome
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        self.response_entered.set()
+        await self.release_response.wait()
+        if self.response_outcome is not None:
+            raise self.response_outcome
+
+    def _events(self):
+        async def stream():
+            self.events_entered.set()
+            await self.release_events.wait()
+            raise asyncio.CancelledError
+            if False:
+                yield RealtimeVoiceEvent()
+
+        return stream()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_events.set()
+
+
+class _FailingResponseCloseJoinsOperationSession(_ControlledResponseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_entered = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        raise RuntimeError("native response write failed")
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.close_entered.set()
+        self.release_events.set()
+        operation = next(iter(self._response_send_tasks.values()), None)
+        if operation is not None:
+            await asyncio.shield(operation)
+        self.cleanup_completed.set()
+
+
+class _ControlledCancellationSession(_Session):
+    def __init__(self, outcome: BaseException | None = None) -> None:
+        super().__init__({RealtimeCapability.RESPONSE_CANCELLATION})
+        self.cancellation_entered = asyncio.Event()
+        self.release_cancellation = asyncio.Event()
+        self.events_entered = asyncio.Event()
+        self.release_events = asyncio.Event()
+        self.cancellation_outcome = outcome
+
+    async def _cancel_response(self, response_id: str) -> None:
+        self.cancelled_responses.append(response_id)
+        self.cancellation_entered.set()
+        await self.release_cancellation.wait()
+        if self.cancellation_outcome is not None:
+            raise self.cancellation_outcome
+
+    def _events(self):
+        async def stream():
+            self.events_entered.set()
+            await self.release_events.wait()
+            raise asyncio.CancelledError
+            if False:
+                yield RealtimeVoiceEvent()
+
+        return stream()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_events.set()
+
+
+class _CloseCancelsCancellationSession(_ControlledCancellationSession):
+    def __init__(self) -> None:
+        super().__init__(asyncio.CancelledError())
+        self.cancellation_exited = asyncio.Event()
+
+    async def _cancel_response(self, response_id: str) -> None:
+        try:
+            await super()._cancel_response(response_id)
+        finally:
+            self.cancellation_exited.set()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_cancellation.set()
+        await self.cancellation_exited.wait()
+        self.release_events.set()
+
+
+class _CloseCancelsResponseSession(_ControlledResponseSession):
+    def __init__(self) -> None:
+        super().__init__(asyncio.CancelledError())
+        self.response_exited = asyncio.Event()
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        try:
+            await super()._start_response(request)
+        finally:
+            self.response_exited.set()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_response.set()
+        await self.response_exited.wait()
+        self.release_events.set()
+
+
+class _FailedCloseCancelsResponseSession(_ControlledResponseSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.response_released = asyncio.Event()
+        self.surface_response_cancel = asyncio.Event()
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        self.response_entered.set()
+        await self.release_response.wait()
+        self.response_released.set()
+        await self.surface_response_cancel.wait()
+        raise asyncio.CancelledError
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_response.set()
+        await self.response_released.wait()
+        if self.closed_count == 1:
+            raise RuntimeError("original close failure")
+
+
+class _FailedCloseCancelsBothSession(_Session):
+    def __init__(self) -> None:
+        super().__init__(
+            {
+                RealtimeCapability.EXPLICIT_RESPONSE,
+                RealtimeCapability.RESPONSE_CANCELLATION,
+            }
+        )
+        self.response_entered = asyncio.Event()
+        self.cancellation_entered = asyncio.Event()
+        self.release_operations = asyncio.Event()
+        self.surface_cancellations = asyncio.Event()
+        self.operations_released = 0
+        self.both_released = asyncio.Event()
+
+    async def _blocked_cancel(self) -> None:
+        await self.release_operations.wait()
+        self.operations_released += 1
+        if self.operations_released == 2:
+            self.both_released.set()
+        await self.surface_cancellations.wait()
+        raise asyncio.CancelledError
+
+    async def _start_response(self, request: RealtimeResponseRequest) -> None:
+        self.response_requests.append(request)
+        self.response_entered.set()
+        await self._blocked_cancel()
+
+    async def _cancel_response(self, response_id: str) -> None:
+        self.cancelled_responses.append(response_id)
+        self.cancellation_entered.set()
+        await self._blocked_cancel()
+
+    async def _close(self) -> None:
+        self.closed_count += 1
+        self.release_operations.set()
+        await self.both_released.wait()
+        raise RuntimeError("original close failure")
+
+
 class _NoOptionalHooksSession(RealtimeVoiceSession):
     async def send_audio(self, audio: bytes, *, mime_type: str | None = None) -> None:
         return None
@@ -440,6 +888,418 @@ class _NoOptionalHooksSession(RealtimeVoiceSession):
 
     async def _close(self) -> None:
         return None
+
+
+def _response_request(
+    *, assistant_message_id: int = 1, canonical_text: str = "Canonical reply"
+) -> RealtimeResponseRequest:
+    return RealtimeResponseRequest(
+        durable_session_id="durable",
+        assistant_message_id=assistant_message_id,
+        turn_marker=f"turn-{assistant_message_id}",
+        canonical_text=canonical_text,
+        content_digest=hashlib.sha256(canonical_text.encode()).hexdigest(),
+        output_audio_format=RealtimeOutputAudioFormat(
+            "audio/pcm", 24_000, 1, "pcm_s16le", 2, "little"
+        ),
+        allow_tools=False,
+    )
+
+
+def _faithful_eager_task_factory(loop, coro, **_kwargs):
+    """Python 3.11 probe for coroutines that finish during task construction."""
+    try:
+        coro.send(None)
+    except StopIteration as exc:
+        completed = loop.create_future()
+        completed.set_result(exc.value)
+        return completed
+    except BaseException as exc:
+        completed = loop.create_future()
+        completed.set_exception(exc)
+        return completed
+    return asyncio.Task(coro, loop=loop)
+
+
+_EAGER_TASK_FACTORIES = [_faithful_eager_task_factory]
+if hasattr(asyncio, "eager_task_factory"):
+    _EAGER_TASK_FACTORIES.append(asyncio.eager_task_factory)
+
+
+@pytest.mark.asyncio
+async def test_start_response_is_capability_gated_exact_typed_and_replay_safe() -> None:
+    request = _response_request()
+    unsupported = _Session()
+    with pytest.raises(UnsupportedRealtimeCapability) as exc_info:
+        await unsupported.start_response(request)
+    assert exc_info.value.capability is RealtimeCapability.EXPLICIT_RESPONSE
+    assert unsupported.response_requests == []
+
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    with pytest.raises(TypeError, match="RealtimeResponseRequest"):
+        await session.start_response(object())
+    await session.start_response(request)
+    assert session.response_requests == [request]
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(request)
+    assert session.response_requests == [request]
+
+    closed = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    await closed.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await closed.start_response(_response_request(assistant_message_id=2))
+    assert closed.response_requests == []
+
+
+@pytest.mark.asyncio
+async def test_start_response_replay_history_fails_closed_at_exact_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        realtime_voice_provider, "MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES", 2
+    )
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    oldest = _response_request(assistant_message_id=1)
+    newest = _response_request(assistant_message_id=2)
+    overflow = _response_request(assistant_message_id=3)
+
+    await session.start_response(oldest)
+    await session.start_response(newest)
+
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(oldest)
+    with pytest.raises(ValueError, match="replay tracking limit"):
+        await session.start_response(overflow)
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(oldest)
+
+    assert session.response_requests == [oldest, newest]
+
+
+@pytest.mark.asyncio
+async def test_accepted_response_history_retains_only_compact_replay_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        realtime_voice_provider, "MAX_ACCEPTED_EXPLICIT_RESPONSE_SEND_TOMBSTONES", 2
+    )
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    large_text = "x" * realtime_voice_provider.MAX_CANONICAL_RESPONSE_TEXT_BYTES
+    oldest = _response_request(assistant_message_id=1, canonical_text=large_text)
+    newest = _response_request(assistant_message_id=2, canonical_text=large_text)
+
+    await session.start_response(oldest)
+    await session.start_response(newest)
+
+    assert session._in_flight_response_sends == set()
+    assert session._response_send_tasks == {}
+    assert len(session._accepted_response_send_tombstones) == 2
+    for key, value in session._accepted_response_send_tombstones.items():
+        assert not isinstance(key, RealtimeResponseRequest)
+        assert not isinstance(value, RealtimeResponseRequest)
+        assert not hasattr(key, "canonical_text")
+        assert large_text not in repr((key, value))
+        assert len(repr((key, value))) < 2_048
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(oldest)
+
+    assert not hasattr(session, "_active_response_requests")
+    assert not hasattr(session, "_completed_response_requests")
+
+
+@pytest.mark.asyncio
+async def test_start_response_failure_is_terminal_and_host_visible() -> None:
+    session = _FailingResponseSession()
+    request = _response_request()
+
+    with pytest.raises(RuntimeError, match="native response write failed"):
+        await session.start_response(request)
+
+    assert session.closed_count == 1
+    events = [event async for event in session.events()]
+    assert len(events) == 1
+    assert isinstance(events[0], SessionFailure)
+    assert events[0].code == "explicit_response_failed"
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.start_response(_response_request(assistant_message_id=2))
+    assert session.response_requests == [request]
+
+
+@pytest.mark.asyncio
+async def test_response_failure_does_not_deadlock_close_joining_operation() -> None:
+    session = _FailingResponseCloseJoinsOperationSession()
+    sending = asyncio.create_task(session.start_response(_response_request()))
+    await session.close_entered.wait()
+
+    try:
+        done, _ = await asyncio.wait({sending}, timeout=0.1)
+        assert done == {sending}
+        with pytest.raises(RuntimeError, match="native response write failed"):
+            sending.result()
+        await asyncio.wait_for(session.cleanup_completed.wait(), timeout=0.1)
+        assert session.closed_count == 1
+        assert session._response_send_tasks == {}
+        assert session._in_flight_response_sends == set()
+    finally:
+        if session._close_task is not None and not session._close_task.done():
+            session._close_task.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_send_failure_converges_when_close_cancels_provider_events() -> None:
+    session = _ControlledResponseSession(RuntimeError("native response write failed"))
+    events = session.events()
+    receiving = asyncio.create_task(anext(events))
+    await session.events_entered.wait()
+    sending = asyncio.create_task(session.start_response(_response_request()))
+    await session.response_entered.wait()
+
+    session.release_response.set()
+
+    with pytest.raises(RuntimeError, match="native response write failed"):
+        await sending
+    failure = await receiving
+    assert isinstance(failure, SessionFailure)
+    assert failure.code == "explicit_response_failed"
+    with pytest.raises(StopAsyncIteration):
+        await anext(events)
+
+
+@pytest.mark.asyncio
+async def test_external_event_consumer_cancellation_is_not_reclassified_as_failure() -> None:
+    session = _ControlledResponseSession()
+    receiving = asyncio.create_task(anext(session.events()))
+    await session.events_entered.wait()
+
+    receiving.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await receiving
+    assert session._terminal_failure is None
+    assert session._terminal_failure_delivered is False
+
+
+@pytest.mark.asyncio
+async def test_intentional_close_does_not_reclassify_provider_cancelled_send() -> None:
+    session = _CloseCancelsResponseSession()
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        receiving = asyncio.create_task(anext(session.events()))
+        await session.events_entered.wait()
+        sending = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+
+        await session.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        with pytest.raises(asyncio.CancelledError):
+            await receiving
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session._closed
+    assert session.closed_count == 1
+    assert session._terminal_failure is None
+    assert session._terminal_failure_delivered is False
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
+
+
+@pytest.mark.asyncio
+async def test_failed_close_intent_stays_pinned_until_overlapping_send_exits() -> None:
+    session = _FailedCloseCancelsResponseSession()
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        sending = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+
+        with pytest.raises(RuntimeError, match="original close failure"):
+            await session.close()
+        assert session.closed_count == 1
+        assert session._terminal_failure is None
+
+        session.surface_response_cancel.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session.closed_count == 1
+    assert session._terminal_failure is None
+    assert session._close_task is None
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._intentional_close_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
+
+
+@pytest.mark.asyncio
+async def test_spontaneous_provider_cancelled_send_remains_terminal_failure() -> None:
+    session = _ControlledResponseSession(asyncio.CancelledError())
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        receiving = asyncio.create_task(anext(session.events()))
+        await session.events_entered.wait()
+        sending = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+
+        session.release_response.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        failure = await receiving
+        assert isinstance(failure, SessionFailure)
+        assert failure.code == "explicit_response_failed"
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session._closed
+    assert session.closed_count == 1
+    assert session._terminal_failure is failure
+    assert session._terminal_failure_delivered is True
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_response_waiter_does_not_cancel_accepted_send() -> None:
+    session = _ControlledResponseSession()
+    request = _response_request()
+    waiter = asyncio.create_task(session.start_response(request))
+    await session.response_entered.wait()
+
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not session._closed
+    assert session._terminal_failure is None
+    assert len(session._in_flight_response_sends) == 1
+    identity = next(iter(session._in_flight_response_sends))
+    assert not isinstance(identity, RealtimeResponseRequest)
+    assert not hasattr(identity, "canonical_text")
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.start_response(request)
+
+    send_task = session._response_send_tasks[identity]
+    session.release_response.set()
+    await asyncio.wait({send_task})
+
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert list(session._accepted_response_send_tombstones) == [identity]
+    assert session.closed_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_response_waiter_late_failure_is_retained_and_observed() -> None:
+    session = _ControlledResponseSession(RuntimeError("late native write failure"))
+    request = _response_request()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    try:
+        receiving = asyncio.create_task(anext(session.events()))
+        await session.events_entered.wait()
+        waiter = asyncio.create_task(session.start_response(request))
+        await session.response_entered.wait()
+        identity = next(iter(session._in_flight_response_sends))
+        send_task = session._response_send_tasks[identity]
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        session.release_response.set()
+
+        failure = await receiving
+        assert isinstance(failure, SessionFailure)
+        assert failure.code == "explicit_response_failed"
+        await asyncio.wait({send_task})
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert session.closed_count == 1
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._accepted_response_send_tombstones == {}
+    assert orphaned == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_factory", _EAGER_TASK_FACTORIES)
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+async def test_eager_explicit_response_send_cleans_all_keyed_state(
+    task_factory, fails
+) -> None:
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    session = (
+        _ImmediateFailingResponseSession()
+        if fails
+        else _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    )
+    request = _response_request(canonical_text="compact replay text")
+    try:
+        loop.set_task_factory(task_factory)
+        if fails:
+            with pytest.raises(RuntimeError, match="native response write failed"):
+                await session.start_response(request)
+        else:
+            await session.start_response(request)
+    finally:
+        loop.set_task_factory(previous_factory)
+
+    assert session._response_send_tasks == {}
+    assert session._in_flight_response_sends == set()
+    assert session._intentional_close_response_sends == set()
+    if fails:
+        assert session._accepted_response_send_tombstones == {}
+        assert session._terminal_failure is not None
+    else:
+        assert len(session._accepted_response_send_tombstones) == 1
+        identity = next(iter(session._accepted_response_send_tombstones))
+        assert not isinstance(identity, RealtimeResponseRequest)
+        assert not hasattr(identity, "canonical_text")
+
+
+@pytest.mark.asyncio
+async def test_old_send_done_callback_cannot_clear_identity_replacement() -> None:
+    session = _Session({RealtimeCapability.EXPLICIT_RESPONSE})
+    identity = realtime_voice_provider._ResponseSendIdentity.from_request(
+        _response_request()
+    )
+    old = asyncio.get_running_loop().create_future()
+    replacement = asyncio.get_running_loop().create_future()
+    old.set_result(None)
+    session._response_send_tasks[identity] = replacement
+
+    session._observe_response_send(identity, old)
+
+    assert session._response_send_tasks[identity] is replacement
+    replacement.cancel()
 
 
 @pytest.mark.asyncio
@@ -803,6 +1663,7 @@ async def test_optional_operations_fail_with_typed_capability_error() -> None:
         (session.resume_session("session"), RealtimeCapability.SESSION_RESUMPTION),
         (session.update_context("instructions"), RealtimeCapability.DYNAMIC_CONTEXT),
         (session.continue_response("batch"), RealtimeCapability.CONTINUATION),
+        (session.cancel_response("response"), RealtimeCapability.RESPONSE_CANCELLATION),
     ]
 
     for operation, capability in operations:
@@ -814,6 +1675,7 @@ async def test_optional_operations_fail_with_typed_capability_error() -> None:
 @pytest.mark.parametrize(
     "capability",
     [
+        RealtimeCapability.EXPLICIT_RESPONSE,
         RealtimeCapability.EXPLICIT_INTERRUPTION,
         RealtimeCapability.OUTPUT_TRUNCATION,
         RealtimeCapability.INPUT_COMMIT_EVENTS,
@@ -821,6 +1683,7 @@ async def test_optional_operations_fail_with_typed_capability_error() -> None:
         RealtimeCapability.DYNAMIC_CONTEXT,
         RealtimeCapability.SESSION_RESUMPTION,
         RealtimeCapability.CONTINUATION,
+        RealtimeCapability.RESPONSE_CANCELLATION,
     ],
 )
 def test_operational_capability_requires_subclass_hook_override(capability) -> None:
@@ -839,6 +1702,236 @@ def test_passive_capabilities_do_not_require_hooks() -> None:
     )
 
     assert RealtimeCapability.TOOL_CALLING in session.capabilities
+
+
+@pytest.mark.asyncio
+async def test_cancel_response_validates_exact_id_capability_and_terminal_state() -> None:
+    class StrLookalike(str):
+        pass
+
+    unsupported = _Session()
+    with pytest.raises(UnsupportedRealtimeCapability) as exc_info:
+        await unsupported.cancel_response("response")
+    assert exc_info.value.capability is RealtimeCapability.RESPONSE_CANCELLATION
+    assert unsupported.cancelled_responses == []
+
+    session = _Session({RealtimeCapability.RESPONSE_CANCELLATION})
+    for invalid in (StrLookalike("response"), 1, True):
+        with pytest.raises(TypeError, match="response_id"):
+            await session.cancel_response(invalid)
+    for invalid in ("", " padded", "padded ", "x" * (MAX_IDENTIFIER_LENGTH + 1)):
+        with pytest.raises(ValueError, match="response_id"):
+            await session.cancel_response(invalid)
+    assert session.cancelled_responses == []
+
+    await session.cancel_response("response")
+    assert session.cancelled_responses == ["response"]
+
+    closed = _Session({RealtimeCapability.RESPONSE_CANCELLATION})
+    await closed.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await closed.cancel_response("other")
+    assert closed.cancelled_responses == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_response_rejects_duplicate_before_capacity_and_provider_io(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        realtime_voice_provider, "MAX_ACCEPTED_RESPONSE_CANCELLATION_TOMBSTONES", 1
+    )
+    session = _ControlledCancellationSession()
+    first = asyncio.create_task(session.cancel_response("response-a"))
+    await session.cancellation_entered.wait()
+
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.cancel_response("response-a")
+    session.release_cancellation.set()
+    await first
+    with pytest.raises(ValueError, match="already accepted/sent"):
+        await session.cancel_response("response-a")
+    with pytest.raises(ValueError, match="replay tracking limit"):
+        await session.cancel_response("response-b")
+
+    assert session.cancelled_responses == ["response-a"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cancellation_waiter_late_success_is_tombstoned() -> None:
+    session = _ControlledCancellationSession()
+    waiter = asyncio.create_task(session.cancel_response("response"))
+    await session.cancellation_entered.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    task = session._response_cancellation_tasks["response"]
+    session.release_cancellation.set()
+    await asyncio.wait({task})
+
+    assert list(session._accepted_response_cancellation_tombstones) == ["response"]
+    assert session._response_cancellation_tasks == {}
+    assert session._in_flight_response_cancellations == set()
+    assert session._terminal_failure is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cancellation_waiter_late_failure_is_terminal_once() -> None:
+    session = _ControlledCancellationSession(RuntimeError("late cancel write failure"))
+    receiving = asyncio.create_task(anext(session.events()))
+    await session.events_entered.wait()
+    waiter = asyncio.create_task(session.cancel_response("response"))
+    await session.cancellation_entered.wait()
+    task = session._response_cancellation_tasks["response"]
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    session.release_cancellation.set()
+    failure = await receiving
+    await asyncio.wait({task})
+
+    assert isinstance(failure, SessionFailure)
+    assert failure.code == "cancellation_failed"
+    assert session.closed_count == 1
+    assert session._terminal_failure is failure
+    assert session._response_cancellation_tasks == {}
+    assert session._in_flight_response_cancellations == set()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_failure_does_not_deadlock_close_joining_operation() -> None:
+    session = _FailingCancellationCloseJoinsOperationSession()
+    loop = asyncio.get_running_loop()
+    orphaned = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: orphaned.append(context))
+    receiving = asyncio.create_task(anext(session.events()))
+    await session.events_entered.wait()
+    cancelling = asyncio.create_task(session.cancel_response("response"))
+    await session.close_entered.wait()
+
+    try:
+        done, _ = await asyncio.wait({cancelling}, timeout=0.1)
+        assert done == {cancelling}
+        with pytest.raises(RuntimeError, match="native cancellation write failed"):
+            cancelling.result()
+        await asyncio.wait_for(session.cleanup_completed.wait(), timeout=0.1)
+        await session.close()
+        failure = await receiving
+        assert isinstance(failure, SessionFailure)
+        assert failure.code == "cancellation_failed"
+        assert [event async for event in session.events()] == []
+        assert session.cleanup_completed.is_set()
+        assert session.closed_count == 2
+        assert session._closed
+        assert session._response_cancellation_tasks == {}
+        assert session._in_flight_response_cancellations == set()
+        assert session._detached_close_tasks == set()
+        assert orphaned == []
+    finally:
+        loop.set_exception_handler(previous_handler)
+        if session._close_task is not None and not session._close_task.done():
+            session._close_task.cancel()
+        await asyncio.gather(cancelling, receiving, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_spontaneous_and_intentional_cancellation_cancelled_error_differ() -> None:
+    spontaneous = _ControlledCancellationSession(asyncio.CancelledError())
+    sending = asyncio.create_task(spontaneous.cancel_response("response"))
+    await spontaneous.cancellation_entered.wait()
+    spontaneous.release_cancellation.set()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    assert spontaneous._terminal_failure is not None
+    assert spontaneous._terminal_failure.code == "cancellation_failed"
+    assert spontaneous.closed_count == 1
+
+    intentional = _CloseCancelsCancellationSession()
+    sending = asyncio.create_task(intentional.cancel_response("response"))
+    await intentional.cancellation_entered.wait()
+    await intentional.close()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    assert intentional._terminal_failure is None
+    assert intentional.closed_count == 1
+    assert intentional._intentional_close_response_cancellations == set()
+
+
+@pytest.mark.asyncio
+async def test_failed_close_pins_explicit_send_and_cancellation_intent() -> None:
+    session = _FailedCloseCancelsBothSession()
+    sending = asyncio.create_task(session.start_response(_response_request()))
+    cancelling = asyncio.create_task(session.cancel_response("response"))
+    await session.response_entered.wait()
+    await session.cancellation_entered.wait()
+
+    with pytest.raises(RuntimeError, match="original close failure"):
+        await session.close()
+    assert session.closed_count == 1
+    assert session._intentional_close_response_sends
+    assert session._intentional_close_response_cancellations == {"response"}
+
+    session.surface_cancellations.set()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    with pytest.raises(asyncio.CancelledError):
+        await cancelling
+
+    assert session._terminal_failure is None
+    assert session.closed_count == 1
+    assert session._intentional_close_response_sends == set()
+    assert session._intentional_close_response_cancellations == set()
+    assert session._response_send_tasks == {}
+    assert session._response_cancellation_tasks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_factory", _EAGER_TASK_FACTORIES)
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+async def test_eager_response_cancellation_cleans_all_keyed_state(
+    task_factory, fails
+) -> None:
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    session = (
+        _ImmediateFailingCancellationSession()
+        if fails
+        else _Session({RealtimeCapability.RESPONSE_CANCELLATION})
+    )
+    try:
+        loop.set_task_factory(task_factory)
+        if fails:
+            with pytest.raises(RuntimeError, match="native cancellation write failed"):
+                await session.cancel_response("response")
+        else:
+            await session.cancel_response("response")
+    finally:
+        loop.set_task_factory(previous_factory)
+
+    assert session._response_cancellation_tasks == {}
+    assert session._in_flight_response_cancellations == set()
+    assert session._intentional_close_response_cancellations == set()
+    assert list(session._accepted_response_cancellation_tombstones) == (
+        [] if fails else ["response"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_old_cancellation_done_callback_cannot_clear_replacement() -> None:
+    session = _Session({RealtimeCapability.RESPONSE_CANCELLATION})
+    loop = asyncio.get_running_loop()
+    old = loop.create_future()
+    replacement = loop.create_future()
+    old.set_result(None)
+    session._response_cancellation_tasks["response"] = replacement
+
+    session._observe_response_cancellation("response", old)
+
+    assert session._response_cancellation_tasks["response"] is replacement
+    replacement.cancel()
 
 
 @pytest.mark.asyncio

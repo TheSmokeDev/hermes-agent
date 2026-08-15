@@ -2231,6 +2231,17 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                _display_metadata = msg.get("display_metadata")
+                from agent.external_tool_batch import get_external_tool_batch_marker
+                _batch_marker = get_external_tool_batch_marker()
+                if _batch_marker and role == "tool":
+                    _display_metadata = (
+                        dict(_display_metadata)
+                        if isinstance(_display_metadata, dict)
+                        else {}
+                    )
+                    _display_metadata["external_tool_batch_marker"] = _batch_marker
+                    msg["display_metadata"] = _display_metadata
                 _batch_rows.append({
                     "role": role,
                     "content": content,
@@ -2269,7 +2280,7 @@ class AIAgent:
                         )
                         else msg.get("display_kind")
                     ),
-                    "display_metadata": msg.get("display_metadata"),
+                    "display_metadata": _display_metadata,
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8

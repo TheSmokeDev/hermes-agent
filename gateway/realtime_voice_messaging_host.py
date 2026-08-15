@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import inspect
 import uuid
 import weakref
 from dataclasses import dataclass
 from typing import Any
 
 from agent.realtime_voice_admission import RealtimeSessionBinding, RealtimeUtterance
+from agent.realtime_voice_provider import (
+    MAX_CANONICAL_RESPONSE_TEXT_BYTES,
+    RealtimeOutputAudioFormat,
+)
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -31,6 +37,62 @@ class RealtimeVoiceFinalizationReceipt:
     turn_marker: str
     user_message_id: int
     assistant_message_id: int
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class NativeRealtimeOutputReservation:
+    durable_session_id: str
+    assistant_message_id: int
+    turn_marker: str
+    content_digest: str
+    output_audio_format: RealtimeOutputAudioFormat
+    selection_generation: int
+    guild_id: int
+    connection_generation: int
+    mixer_generation: int
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
+class NativeRealtimeOutputRequest:
+    """Immediate text handoff; only its compact reservation is host-retained."""
+
+    reservation: NativeRealtimeOutputReservation
+    canonical_text: str
+
+    @property
+    def content_digest(self) -> str:
+        return self.reservation.content_digest
+
+    @property
+    def output_audio_format(self) -> RealtimeOutputAudioFormat:
+        return self.reservation.output_audio_format
+
+
+@dataclass(slots=True)
+class _AcquisitionRecord:
+    reservation: NativeRealtimeOutputReservation
+    issuance: _NativeOutputIssuance
+    transport_generation: int
+    adapter: object
+    task: asyncio.Task[object] | None = None
+    lease: object | None = None
+    failure: BaseException | None = None
+    close_started: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeOutputIssuance:
+    reservation: NativeRealtimeOutputReservation
+    durable_session_id: str
+    assistant_message_id: int
+    turn_marker: str
+    content_digest: str
+    output_audio_format: RealtimeOutputAudioFormat
+    output_audio_format_values: tuple[str, int, int, str, int, str]
+    selection_generation: int
+    guild_id: int
+    connection_generation: int
+    mixer_generation: int
 
 
 class _Permit:
@@ -61,6 +123,33 @@ class _CanonicalClaim:
 _ACCEPTED_TASKS: set[asyncio.Task[Any]] = set()
 _CLAIM_ATTR = "_hermes_realtime_voice_canonical_claim"
 _MARKER_KEY = "realtime_voice_turn_marker"
+# SessionDB returns a materialized list.  Bound durable-session scans before
+# touching rows so malformed substitutes cannot force unbounded work.
+_MAX_CANONICAL_ROWS = 100_000
+
+
+def _scan_exact_finalization_rows(
+    rows: object, user_message_id: int, assistant_message_id: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if type(rows) is not list:
+        raise RealtimeVoiceIngressError("canonical rows must be an exact bounded list")
+    if len(rows) > _MAX_CANONICAL_ROWS:
+        raise RealtimeVoiceIngressError("canonical row scan capacity exhausted")
+    user = assistant = None
+    for row in rows:
+        if type(row) is not dict or type(row.get("id")) is not int:
+            continue
+        if row["id"] == user_message_id:
+            if user is not None:
+                raise RealtimeVoiceIngressError("exact durable finalization rows were not found")
+            user = row
+        if row["id"] == assistant_message_id:
+            if assistant is not None:
+                raise RealtimeVoiceIngressError("exact durable finalization rows were not found")
+            assistant = row
+    if user is None or assistant is None:
+        raise RealtimeVoiceIngressError("exact durable finalization rows were not found")
+    return user, assistant
 
 
 def _retain_accepted_task(task: asyncio.Task[Any]) -> None:
@@ -109,7 +198,17 @@ def _is_terminal_assistant_row(row: object) -> bool:
 class GatewayRealtimeVoiceMessagingHost:
     """Consume-once authorizer and canonical same-session ingress."""
 
-    def __init__(self, factory: object, runner: object) -> None:
+    # Consumed tombstones deliberately never evict: after 1024 native turns,
+    # the attachment fails closed rather than reopening replay authority.
+    _LEDGER_CAPACITY = 1024
+
+    def __init__(
+        self,
+        factory: object,
+        runner: object,
+        *,
+        output_audio_format: RealtimeOutputAudioFormat | None = None,
+    ) -> None:
         from gateway.realtime_voice_invocation import (
             _validate_realtime_voice_attachment_factory,
         )
@@ -118,10 +217,17 @@ class GatewayRealtimeVoiceMessagingHost:
         self._runner_ref = weakref.ref(runner)
         self._authority = _validate_realtime_voice_attachment_factory(factory, runner)
         self._permits: dict[_Permit, _PermitRecord] = {}
-        self._finalizations: weakref.WeakSet[RealtimeVoiceFinalizationReceipt] = (
-            weakref.WeakSet()
-        )
+        self._finalizations: set[RealtimeVoiceFinalizationReceipt] = set()
+        self._output_audio_format = output_audio_format
+        self._consumed_finalizations: set[RealtimeVoiceFinalizationReceipt] = set()
+        self._reservations: set[NativeRealtimeOutputReservation] = set()
+        self._requests: weakref.WeakKeyDictionary[
+            NativeRealtimeOutputRequest, _NativeOutputIssuance
+        ] = weakref.WeakKeyDictionary()
+        self._acquisitions: dict[NativeRealtimeOutputReservation, _AcquisitionRecord] = {}
+        self._closed = False
         self._lock = asyncio.Lock()
+        self._attachment_close_task: asyncio.Task[None] | None = None
 
     def _runner(self) -> object:
         runner = self._runner_ref()
@@ -178,6 +284,8 @@ class GatewayRealtimeVoiceMessagingHost:
         after_message_id = _max_message_id(db, binding.durable_session_id)
         permit = _Permit()
         async with self._lock:
+            if self._closed:
+                return None
             self._permits[permit] = _PermitRecord(binding, utterance, after_message_id)
         return permit
 
@@ -269,13 +377,478 @@ class GatewayRealtimeVoiceMessagingHost:
 
     async def close_attachment(self, binding: RealtimeSessionBinding | None) -> None:
         async with self._lock:
-            self._permits.clear()
+            close_task = self._attachment_close_task
+            if close_task is None:
+                self._closed = True
+                self._permits.clear()
+                self._reservations.clear()
+                self._requests.clear()
+                records = tuple(self._acquisitions.items())
+                close_task = asyncio.create_task(
+                    self._finish_attachment_close(records)
+                )
+                self._attachment_close_task = close_task
+                _retain_accepted_task(close_task)
+        await asyncio.shield(close_task)
+
+    async def _finish_attachment_close(
+        self,
+        records: tuple[tuple[object, _AcquisitionRecord], ...],
+    ) -> None:
+        first_failure: BaseException | None = None
+        for reservation, record in records:
+            try:
+                task = record.task
+                if task is not None and not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except RealtimeVoiceIngressError:
+                        pass
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+                elif task is not None:
+                    try:
+                        task.result()
+                    except RealtimeVoiceIngressError:
+                        pass
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+                if record.lease is not None and not record.close_started:
+                    try:
+                        await self._close_acquisition_lease(record)
+                    except BaseException as exc:
+                        if first_failure is None:
+                            first_failure = exc
+            finally:
+                async with self._lock:
+                    if self._acquisitions.get(reservation) is record:
+                        self._acquisitions.pop(reservation, None)
+        if first_failure is not None:
+            raise first_failure
+
+    async def _close_acquisition_lease(self, record: _AcquisitionRecord) -> None:
+        if record.close_started or record.lease is None:
+            return
+        record.close_started = True
+        close = getattr(record.lease, "close", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+
+    async def _retire_closed_acquisition(
+        self, reservation: NativeRealtimeOutputReservation, record: _AcquisitionRecord
+    ) -> None:
+        async with self._lock:
+            if self._closed and self._acquisitions.get(reservation) is record:
+                self._acquisitions.pop(reservation, None)
+
+    def _native_adapter_state(self) -> tuple[object, int, int, int]:
+        from gateway.realtime_voice_invocation import (
+            _record_for_realtime_voice_attachment_factory,
+        )
+
+        record = _record_for_realtime_voice_attachment_factory(
+            self._factory, self._runner()
+        )
+        adapter = record.adapter_ref()
+        if adapter is None or self._runner().adapters.get(Platform.DISCORD) is not adapter:
+            raise RealtimeVoiceIngressError("captured Discord adapter is no longer current")
+        scope_id = self._authority.scope_id
+        if (
+            type(scope_id) is not str
+            or not scope_id.isascii()
+            or not scope_id.isdecimal()
+            or scope_id.startswith("0")
+        ):
+            raise RealtimeVoiceIngressError("Discord guild ID is not canonical")
+        guild_id = int(scope_id)
+        clients = getattr(adapter, "_voice_clients", None)
+        connection_generations = getattr(adapter, "_voice_connection_generations", None)
+        mixer_generations = getattr(adapter, "_voice_mixer_generations", None)
+        mixers = getattr(adapter, "_voice_mixers", None)
+        if not all(type(state) is dict for state in (
+            clients, connection_generations, mixer_generations, mixers
+        )):
+            raise RealtimeVoiceIngressError("Discord native playback state is unavailable")
+        client = clients.get(guild_id)
+        if client is None or not callable(getattr(client, "is_connected", None)) or not client.is_connected():
+            raise RealtimeVoiceIngressError("Discord voice client is not connected")
+        connection_generation = connection_generations.get(guild_id)
+        mixer_generation = mixer_generations.get(guild_id)
+        if (
+            type(connection_generation) is not int
+            or connection_generation <= 0
+            or type(mixer_generation) is not int
+            or mixer_generation <= 0
+        ):
+            raise RealtimeVoiceIngressError("Discord voice generations are invalid")
+        mixer = mixers.get(guild_id)
+        if mixer is not None:
+            owner_is = getattr(adapter, "_voice_mixer_owner_is", None)
+            if not callable(owner_is) or not owner_is(
+                guild_id, client, mixer, mixer_generation
+            ):
+                raise RealtimeVoiceIngressError("Discord voice mixer ownership is stale")
+        return adapter, guild_id, connection_generation, mixer_generation
+
+    async def reserve_native_output(
+        self,
+        binding: RealtimeSessionBinding,
+        receipt: object,
+    ) -> NativeRealtimeOutputRequest:
+        self._validate_binding(binding)
+        if type(receipt) is not RealtimeVoiceFinalizationReceipt:
+            raise RealtimeVoiceIngressError("finalization receipt was not minted by this host")
+        self._validate_native_identifier(receipt.durable_session_id, "durable_session_id")
+        self._validate_native_identifier(receipt.turn_marker, "turn_marker")
+        if (
+            type(receipt.user_message_id) is not int
+            or receipt.user_message_id <= 0
+            or type(receipt.assistant_message_id) is not int
+            or receipt.assistant_message_id <= receipt.user_message_id
+        ):
+            raise RealtimeVoiceIngressError("finalization receipt row IDs are invalid")
+        async with self._lock:
+            self._validate_binding(binding)
+            if self._closed:
+                raise RealtimeVoiceIngressError("native output host is closed")
+            if receipt in self._consumed_finalizations:
+                raise RealtimeVoiceIngressError("finalization receipt was already consumed")
+            if (
+                receipt not in self._finalizations
+            ):
+                raise RealtimeVoiceIngressError("finalization receipt was not minted by this host")
+            if len(self._consumed_finalizations) >= self._LEDGER_CAPACITY:
+                raise RealtimeVoiceIngressError("native output reservation capacity exhausted")
+            self._consumed_finalizations.add(receipt)
+            self._finalizations.remove(receipt)
+
+        output_format = self._output_audio_format
+        if (
+            type(output_format) is not RealtimeOutputAudioFormat
+            or output_format.mime_type != "audio/pcm"
+            or output_format.sample_encoding != "pcm_s16le"
+            or output_format.sample_width_bytes != 2
+            or output_format.sample_rate_hz != 24000
+            or output_format.channels != 1
+            or output_format.endianness != "little"
+        ):
+            raise RealtimeVoiceIngressError("native output audio format is unavailable")
+        rows = _sync_db(self._runner()).get_messages(
+            receipt.durable_session_id, include_inactive=True
+        )
+        if receipt.durable_session_id != binding.durable_session_id:
+            raise RealtimeVoiceIngressError("finalization durable session changed")
+        user, assistant = _scan_exact_finalization_rows(
+            rows, receipt.user_message_id, receipt.assistant_message_id
+        )
+        metadata = user.get("display_metadata")
+        if (
+            user.get("role") != "user"
+            or type(metadata) is not dict
+            or metadata.get(_MARKER_KEY) != receipt.turn_marker
+        ):
+            raise RealtimeVoiceIngressError("canonical realtime marker read-back changed")
+        tool_calls = assistant.get("tool_calls")
+        text = assistant.get("content")
+        if (
+            assistant.get("role") != "assistant"
+            or type(text) is not str
+            or len(text) > MAX_CANONICAL_RESPONSE_TEXT_BYTES
+            or not text.strip()
+            or not (tool_calls is None or (type(tool_calls) is list and not tool_calls))
+        ):
+            raise RealtimeVoiceIngressError("canonical assistant row is malformed")
+        try:
+            canonical_bytes = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RealtimeVoiceIngressError("canonical assistant text is not UTF-8") from exc
+        if len(canonical_bytes) > MAX_CANONICAL_RESPONSE_TEXT_BYTES:
+            raise RealtimeVoiceIngressError("canonical assistant text exceeds byte limit")
+        adapter, guild_id, connection_generation, mixer_generation = (
+            self._native_adapter_state()
+        )
+        reservation = NativeRealtimeOutputReservation(
+            receipt.durable_session_id,
+            receipt.assistant_message_id,
+            receipt.turn_marker,
+            hashlib.sha256(canonical_bytes).hexdigest(),
+            output_format,
+            binding.selection_generation,
+            guild_id,
+            connection_generation,
+            mixer_generation,
+        )
+        async with self._lock:
+            if self._closed:
+                raise RealtimeVoiceIngressError("native output host is closed")
+            current_adapter, current_guild, current_connection, current_mixer = (
+                self._native_adapter_state()
+            )
+            if (
+                current_adapter is not adapter
+                or current_guild != guild_id
+                or current_connection != connection_generation
+                or current_mixer != mixer_generation
+            ):
+                raise RealtimeVoiceIngressError("native playback adapter authority changed")
+            if len(self._reservations) >= self._LEDGER_CAPACITY:
+                raise RealtimeVoiceIngressError("native output reservation capacity exhausted")
+            self._reservations.add(reservation)
+            request = NativeRealtimeOutputRequest(reservation, text)
+            self._requests[request] = _NativeOutputIssuance(
+                reservation=reservation,
+                durable_session_id=reservation.durable_session_id,
+                assistant_message_id=reservation.assistant_message_id,
+                turn_marker=reservation.turn_marker,
+                content_digest=reservation.content_digest,
+                output_audio_format=reservation.output_audio_format,
+                output_audio_format_values=(
+                    reservation.output_audio_format.mime_type,
+                    reservation.output_audio_format.sample_rate_hz,
+                    reservation.output_audio_format.channels,
+                    reservation.output_audio_format.sample_encoding,
+                    reservation.output_audio_format.sample_width_bytes,
+                    reservation.output_audio_format.endianness,
+                ),
+                selection_generation=reservation.selection_generation,
+                guild_id=reservation.guild_id,
+                connection_generation=reservation.connection_generation,
+                mixer_generation=reservation.mixer_generation,
+            )
+        return request
+
+    def validate_native_output_request(
+        self, request: object
+    ) -> NativeRealtimeOutputRequest:
+        if type(request) is not NativeRealtimeOutputRequest:
+            raise RealtimeVoiceIngressError("native output request is forged or stale")
+        issuance = self._requests.get(request)
+        if type(issuance) is not _NativeOutputIssuance:
+            raise RealtimeVoiceIngressError("native output request is forged or stale")
+        reservation = request.reservation
+        text = request.canonical_text
+        if (
+            type(reservation) is not NativeRealtimeOutputReservation
+            or reservation is not issuance.reservation
+            or reservation not in self._reservations
+            or type(text) is not str
+            or len(text) > MAX_CANONICAL_RESPONSE_TEXT_BYTES
+            or not text.strip()
+            or type(reservation.durable_session_id) is not str
+            or reservation.durable_session_id != issuance.durable_session_id
+            or type(reservation.assistant_message_id) is not int
+            or reservation.assistant_message_id != issuance.assistant_message_id
+            or type(reservation.turn_marker) is not str
+            or reservation.turn_marker != issuance.turn_marker
+            or type(reservation.content_digest) is not str
+            or reservation.content_digest != issuance.content_digest
+            or reservation.output_audio_format is not issuance.output_audio_format
+            or type(reservation.output_audio_format) is not RealtimeOutputAudioFormat
+            or (
+                reservation.output_audio_format.mime_type,
+                reservation.output_audio_format.sample_rate_hz,
+                reservation.output_audio_format.channels,
+                reservation.output_audio_format.sample_encoding,
+                reservation.output_audio_format.sample_width_bytes,
+                reservation.output_audio_format.endianness,
+            )
+            != issuance.output_audio_format_values
+            or type(reservation.selection_generation) is not int
+            or reservation.selection_generation != issuance.selection_generation
+            or type(reservation.guild_id) is not int
+            or reservation.guild_id != issuance.guild_id
+            or type(reservation.connection_generation) is not int
+            or reservation.connection_generation != issuance.connection_generation
+            or type(reservation.mixer_generation) is not int
+            or reservation.mixer_generation != issuance.mixer_generation
+        ):
+            raise RealtimeVoiceIngressError("native output request is forged or stale")
+        try:
+            canonical_bytes = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RealtimeVoiceIngressError("native output request is forged or stale") from exc
+        if (
+            len(canonical_bytes) > MAX_CANONICAL_RESPONSE_TEXT_BYTES
+            or hashlib.sha256(canonical_bytes).hexdigest() != issuance.content_digest
+        ):
+            raise RealtimeVoiceIngressError("native output request is forged or stale")
+        return request
+
+    @staticmethod
+    def _validate_native_identifier(value: object, name: str) -> str:
+        if type(value) is not str or not value or len(value) > 256:
+            raise RealtimeVoiceIngressError(f"{name} must be a bounded exact identifier")
+        if value.strip() != value:
+            raise RealtimeVoiceIngressError(f"{name} must be a bounded exact identifier")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RealtimeVoiceIngressError(
+                f"{name} must be a bounded exact identifier"
+            ) from exc
+        if len(encoded) > 256:
+            raise RealtimeVoiceIngressError(f"{name} must be a bounded exact identifier")
+        return value
+
+    async def acquire_native_playback(
+        self,
+        request: object,
+        *,
+        lease_id: object,
+        response_id: object,
+        transport_generation: object,
+    ) -> object:
+        lease_id = self._validate_native_identifier(lease_id, "lease_id")
+        response_id = self._validate_native_identifier(response_id, "response_id")
+        request = self.validate_native_output_request(request)
+        reservation = request.reservation
+        if type(transport_generation) is not int or transport_generation <= 0:
+            raise RealtimeVoiceIngressError("native playback transport generation is invalid")
+        async with self._lock:
+            request = self.validate_native_output_request(request)
+            issuance = self._requests[request]
+            reservation = issuance.reservation
+            if self._closed or reservation not in self._reservations:
+                raise RealtimeVoiceIngressError("native output reservation is forged or stale")
+            if reservation in self._acquisitions:
+                raise RealtimeVoiceIngressError("native output reservation was already acquired")
+            if len(self._acquisitions) >= self._LEDGER_CAPACITY:
+                raise RealtimeVoiceIngressError("native playback acquisition capacity exhausted")
+            adapter, guild_id, connection_generation, mixer_generation = (
+                self._native_adapter_state()
+            )
+            if (
+                guild_id != issuance.guild_id
+                or connection_generation != issuance.connection_generation
+                or mixer_generation != issuance.mixer_generation
+            ):
+                raise RealtimeVoiceIngressError("native playback adapter authority changed")
+            record = _AcquisitionRecord(
+                reservation, issuance, transport_generation, adapter
+            )
+            self._acquisitions[reservation] = record
+
+            async def acquire_owned() -> object:
+                try:
+                    lease = await adapter.acquire_native_playback_lease(
+                        guild_id,
+                        lease_id,
+                        response_id,
+                        issuance.turn_marker,
+                        connection_generation,
+                        mixer_generation,
+                        input_format="pcm_s16le",
+                        sample_rate=24000,
+                        channels=1,
+                    )
+                    record.lease = lease
+                    try:
+                        current_adapter, current_guild, current_connection, current_mixer = (
+                            self._native_adapter_state()
+                        )
+                        stale = (
+                            self._closed
+                            or self._acquisitions.get(reservation) is not record
+                            or current_adapter is not adapter
+                            or current_guild != guild_id
+                            or current_connection != connection_generation
+                            or current_mixer != mixer_generation
+                        )
+                    except BaseException:
+                        stale = True
+                    if stale:
+                        await self._close_acquisition_lease(record)
+                        raise RealtimeVoiceIngressError(
+                            "native playback authority changed during acquisition"
+                        )
+                    return lease
+                except BaseException as exc:
+                    record.failure = exc
+                    raise
+
+            task = asyncio.create_task(acquire_owned())
+            record.task = task
+            _retain_accepted_task(task)
+
+            def retire_if_closed(_completed: asyncio.Task[object]) -> None:
+                cleanup = asyncio.create_task(
+                    self._retire_closed_acquisition(reservation, record)
+                )
+                _retain_accepted_task(cleanup)
+
+            task.add_done_callback(retire_if_closed)
+        return await asyncio.shield(task)
+
+    def validate_native_playback_receipt(
+        self, reservation: object, lease: object, receipt: object
+    ) -> object:
+        if type(reservation) is NativeRealtimeOutputRequest:
+            reservation = self.validate_native_output_request(reservation).reservation
+        if type(reservation) is not NativeRealtimeOutputReservation:
+            raise RealtimeVoiceIngressError("native output reservation is forged or stale")
+        record = self._acquisitions.get(reservation)
+        if (
+            self._closed
+            or reservation not in self._reservations
+            or type(record) is not _AcquisitionRecord
+            or record.reservation is not reservation
+            or type(record.issuance) is not _NativeOutputIssuance
+            or record.lease is not lease
+            or type(record.transport_generation) is not int
+            or record.transport_generation <= 0
+        ):
+            raise RealtimeVoiceIngressError("native output reservation is forged or stale")
+        adapter, guild_id, connection_generation, mixer_generation = (
+            self._native_adapter_state()
+        )
+        if (
+            adapter is not record.adapter
+            or guild_id != record.issuance.guild_id
+            or connection_generation != record.issuance.connection_generation
+            or mixer_generation != record.issuance.mixer_generation
+        ):
+            raise RealtimeVoiceIngressError("native playback adapter authority changed")
+        validator = getattr(adapter, "validate_native_playback_receipt", None)
+        if not callable(validator):
+            raise RealtimeVoiceIngressError("native playback receipt validator unavailable")
+        return validator(guild_id, lease, receipt)
+
+    async def retire_native_output(
+        self, request: object, lease: object, receipt: object
+    ) -> object:
+        authenticated = self.validate_native_output_request(request)
+        reservation = authenticated.reservation
+        validated = self.validate_native_playback_receipt(reservation, lease, receipt)
+        if validated is not receipt:
+            raise RealtimeVoiceIngressError("native playback receipt is forged or stale")
+        async with self._lock:
+            record = self._acquisitions.get(reservation)
+            if record is None or record.lease is not lease:
+                raise RealtimeVoiceIngressError("native output reservation is forged or stale")
+            self._requests.pop(authenticated, None)
+            self._reservations.discard(reservation)
+            self._acquisitions.pop(reservation, None)
+        return receipt
 
     def validate_finalization(self, receipt: object) -> bool:
         return (
             type(receipt) is RealtimeVoiceFinalizationReceipt
             and receipt in self._finalizations
         )
+
+    async def _mint_finalization(
+        self, receipt: RealtimeVoiceFinalizationReceipt
+    ) -> None:
+        async with self._lock:
+            # Accepted canonical work may finish after close; closed hosts still
+            # reject reservation of the resulting receipt.
+            if len(self._finalizations) >= self._LEDGER_CAPACITY:
+                raise RealtimeVoiceIngressError("finalization capacity exhausted")
+            self._finalizations.add(receipt)
 
     def _captured_entry(self) -> object:
         from gateway.realtime_voice_invocation import (
@@ -413,7 +986,9 @@ async def _open_attachment(
         provider_session_id=provider_session_id,
         selection_generation=record.routing_generation,
     )
-    host = GatewayRealtimeVoiceMessagingHost(factory, runner)
+    host = GatewayRealtimeVoiceMessagingHost(
+        factory, runner, output_audio_format=setup.output_audio
+    )
     controller = GatewayRealtimeVoiceController(host)
     await controller.open(
         provider_name,
@@ -429,13 +1004,17 @@ async def _open_attachment(
 
 
 def _claim_for(runner: object, event: object) -> _CanonicalClaim | None:
-    claim = getattr(event, _CLAIM_ATTR, None)
+    claim = inspect.getattr_static(event, _CLAIM_ATTR, None)
     if claim is None:
         return None
     if type(claim) is not _CanonicalClaim or claim.host._runner_ref() is not runner:
         raise RealtimeVoiceIngressError("invalid canonical realtime claim")
     claim.host._validate_binding(claim.binding)
     return claim
+
+
+def _is_native_realtime_event(runner: object, event: object) -> bool:
+    return _claim_for(runner, event) is not None
 
 
 def _rewrite_realtime_voice_event(runner: object, event: object, text: str) -> object:
@@ -620,13 +1199,14 @@ async def _finalize_realtime_voice_event(
         user_message_id=user["id"],
         assistant_message_id=assistant["id"],
     )
+    await claim.host._mint_finalization(receipt)
     claim.receipt = receipt
-    claim.host._finalizations.add(receipt)
     return receipt
 
 
 __all__ = [
     "GatewayRealtimeVoiceMessagingHost",
+    "NativeRealtimeOutputReservation",
     "RealtimeVoiceFinalizationReceipt",
     "RealtimeVoiceIngressError",
 ]

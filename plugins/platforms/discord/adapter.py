@@ -1058,6 +1058,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        self._voice_mixer_owners: Dict[int, tuple] = {}
+        self._voice_connection_generations: Dict[int, int] = {}
+        self._voice_mixer_generations: Dict[int, int] = {}
+        self._native_playback_leases: Dict[int, tuple] = {}
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Track threads where the bot has participated so follow-up messages
@@ -4064,6 +4068,12 @@ class DiscordAdapter(BasePlatformAdapter):
         except ImportError:
             from .voice_mixer import VoiceMixer
 
+        self._ensure_native_playback_state()
+        old_mixer = self._voice_mixers.get(guild_id)
+        if old_mixer is not None:
+            self._invalidate_native_playback(guild_id)
+        connection_generation = self._voice_connection_generations.setdefault(guild_id, 1)
+        mixer_generation = self._voice_mixer_generations.setdefault(guild_id, 1)
         mixer = VoiceMixer(
             ambient_gain=float(self._voice_fx_cfg.get("ambient_gain", 0.18)),
             duck_gain=float(self._voice_fx_cfg.get("duck_gain", 0.06)),
@@ -4073,15 +4083,212 @@ class DiscordAdapter(BasePlatformAdapter):
         if ambient:
             mixer.set_ambient(ambient)
 
+        loop = asyncio.get_running_loop()
+
         def _after(error):
-            if error:
-                logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
+            loop.call_soon_threadsafe(
+                self._native_mixer_failed, guild_id, vc, mixer,
+                connection_generation, mixer_generation, error,
+            )
 
         if vc.is_playing():
             vc.stop()
         vc.play(mixer, after=_after)
-        self._voice_mixers[guild_id] = mixer
+        self._register_voice_mixer(guild_id, vc, mixer, mixer_generation)
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
+
+    def _ensure_native_playback_state(self) -> None:
+        """Initialize state omitted by lightweight ``object.__new__`` fixtures."""
+        if not hasattr(self, "_voice_connection_generations"):
+            self._voice_connection_generations = {}
+        if not hasattr(self, "_voice_mixer_generations"):
+            self._voice_mixer_generations = {}
+        if not hasattr(self, "_voice_mixer_owners"):
+            self._voice_mixer_owners = {}
+        if not hasattr(self, "_native_playback_leases"):
+            self._native_playback_leases = {}
+
+    def _register_voice_mixer(self, guild_id, vc, mixer, mixer_generation) -> None:
+        self._ensure_native_playback_state()
+        self._voice_mixers[guild_id] = mixer
+        self._voice_mixer_owners[guild_id] = (vc, mixer, mixer_generation)
+
+    def _voice_mixer_owner_is(self, guild_id, vc, mixer, mixer_generation) -> bool:
+        owner = self._voice_mixer_owners.get(guild_id)
+        return (
+            owner is not None
+            and owner[0] is vc
+            and owner[1] is mixer
+            and owner[2] == mixer_generation
+        )
+
+    def _native_mixer_failed(self, guild_id, vc, mixer, connection_generation,
+                             mixer_generation, error) -> None:
+        """Fence one exact player callback without touching a replacement."""
+        self._ensure_native_playback_state()
+        current = self._native_playback_leases.get(guild_id)
+        if (
+            self._voice_clients.get(guild_id) is not vc
+            or self._voice_mixers.get(guild_id) is not mixer
+            or not self._voice_mixer_owner_is(
+                guild_id, vc, mixer, mixer_generation,
+            )
+            or self._voice_connection_generations.get(guild_id) != connection_generation
+            or self._voice_mixer_generations.get(guild_id) != mixer_generation
+        ):
+            return
+        if error:
+            logger.error("Voice mixer stream error (guild=%d): %s", guild_id, error)
+        self._voice_mixers.pop(guild_id, None)
+        self._voice_mixer_owners.pop(guild_id, None)
+        self._voice_mixer_generations[guild_id] = mixer_generation + 1
+        if current is not None and current[1] is mixer:
+            self._native_playback_leases.pop(guild_id, None)
+        mixer.cleanup()
+
+    def _invalidate_native_playback(self, guild_id, *, connection_lost=False) -> None:
+        """Synchronously fence and wake the exact mixer/lease owned by a guild."""
+        self._ensure_native_playback_state()
+        mixer = self._voice_mixers.pop(guild_id, None)
+        owner = self._voice_mixer_owners.pop(guild_id, None)
+        self._native_playback_leases.pop(guild_id, None)
+        if mixer is not None:
+            mixer.cleanup()
+        if owner is not None and owner[1] is not mixer:
+            owner[1].cleanup()
+        if guild_id in self._voice_mixer_generations or mixer is not None:
+            self._voice_mixer_generations[guild_id] = (
+                self._voice_mixer_generations.get(guild_id, 0) + 1
+            )
+        if connection_lost and (
+            guild_id in self._voice_connection_generations
+            or guild_id in self._voice_clients
+        ):
+            self._voice_connection_generations[guild_id] = (
+                self._voice_connection_generations.get(guild_id, 0) + 1
+            )
+
+    async def acquire_native_playback_lease(
+        self, guild_id, lease_id, response_id, turn_marker,
+        connection_generation, mixer_generation, *, input_format,
+        sample_rate, channels,
+    ):
+        """Acquire the native PCM lane from the exact current Discord voice bus."""
+        if type(guild_id) is not int or guild_id <= 0:
+            raise TypeError("guild_id must be a positive exact int")
+        if type(connection_generation) is not int or connection_generation <= 0:
+            raise TypeError("connection_generation must be a positive exact int")
+        if type(mixer_generation) is not int or mixer_generation <= 0:
+            raise TypeError("mixer_generation must be a positive exact int")
+        if type(input_format) is not str or input_format != "pcm_s16le":
+            raise ValueError("input_format must be exact pcm_s16le")
+        if type(sample_rate) is not int or sample_rate != 24000:
+            raise ValueError("sample_rate must be exact 24000")
+        if type(channels) is not int or channels != 1:
+            raise ValueError("channels must be exact mono")
+        self._ensure_native_playback_state()
+        lock = self._voice_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            vc = self._voice_clients.get(guild_id)
+            if vc is None or not vc.is_connected():
+                raise RuntimeError("Discord voice client is not connected")
+            owned = self._native_playback_leases.get(guild_id)
+            if owned is not None and owned[0] is not vc:
+                self._invalidate_native_playback(guild_id, connection_lost=True)
+                raise RuntimeError("stale Discord voice client replacement")
+            if owned is not None and self._voice_mixers.get(guild_id) is not owned[1]:
+                self._native_playback_leases.pop(guild_id, None)
+                old_owner = self._voice_mixer_owners.get(guild_id)
+                if old_owner is not None and old_owner[0] is owned[0] and old_owner[1] is owned[1]:
+                    self._voice_mixer_owners.pop(guild_id, None)
+                owned[1].cleanup()
+                self._voice_mixer_generations[guild_id] = (
+                    self._voice_mixer_generations.get(guild_id, 0) + 1
+                )
+                raise RuntimeError("stale Discord voice mixer replacement")
+            current_connection_generation = self._voice_connection_generations.setdefault(guild_id, 1)
+            if connection_generation != current_connection_generation:
+                raise RuntimeError("stale Discord voice connection generation")
+            mixer = self._voice_mixers.get(guild_id)
+            owner = self._voice_mixer_owners.get(guild_id)
+            if mixer is not None and owner is None:
+                raise RuntimeError("Discord voice playback bus ownership is unknown")
+            if owner is not None and (
+                owner[0] is not vc
+                or owner[1] is not mixer
+                or owner[2] != self._voice_mixer_generations.get(guild_id, 1)
+            ):
+                if self._voice_mixers.get(guild_id) is owner[1]:
+                    self._voice_mixers.pop(guild_id, None)
+                if self._voice_mixer_owners.get(guild_id) is owner:
+                    self._voice_mixer_owners.pop(guild_id, None)
+                self._native_playback_leases.pop(guild_id, None)
+                owner[1].cleanup()
+                self._voice_mixer_generations[guild_id] = (
+                    self._voice_mixer_generations.get(guild_id, 0) + 1
+                )
+                if owner[0] is not vc:
+                    self._voice_connection_generations[guild_id] = (
+                        self._voice_connection_generations.get(guild_id, 0) + 1
+                    )
+                raise RuntimeError("stale Discord voice mixer ownership")
+            if mixer is None:
+                if vc.is_playing():
+                    raise RuntimeError("Discord voice playback bus is busy")
+                try:
+                    from voice_mixer import VoiceMixer
+                except ImportError:
+                    from .voice_mixer import VoiceMixer
+                current_mixer_generation = self._voice_mixer_generations.setdefault(guild_id, 1)
+                if mixer_generation != current_mixer_generation:
+                    raise RuntimeError("stale Discord voice mixer generation")
+                mixer = VoiceMixer()
+                loop = asyncio.get_running_loop()
+
+                def _after(error):
+                    loop.call_soon_threadsafe(
+                        self._native_mixer_failed, guild_id, vc, mixer,
+                        current_connection_generation, current_mixer_generation, error,
+                    )
+
+                vc.play(mixer, after=_after)
+                self._register_voice_mixer(
+                    guild_id, vc, mixer, current_mixer_generation,
+                )
+            else:
+                current_mixer_generation = self._voice_mixer_generations.setdefault(guild_id, 1)
+                if mixer_generation != current_mixer_generation:
+                    raise RuntimeError("stale Discord voice mixer generation")
+            lease = mixer.acquire_native_playback(
+                lease_id, response_id, turn_marker, current_mixer_generation,
+            )
+            self._native_playback_leases[guild_id] = (
+                vc, mixer, current_connection_generation, current_mixer_generation, lease,
+            )
+            return lease
+
+    def validate_native_playback_receipt(self, guild_id, lease, receipt):
+        """Validate a mixer-minted receipt against the exact current adapter lease."""
+        if type(guild_id) is not int or guild_id <= 0:
+            raise TypeError("guild_id must be a positive exact int")
+        self._ensure_native_playback_state()
+        current = self._native_playback_leases.get(guild_id)
+        if current is None:
+            raise ValueError("native playback lease is not current")
+        vc, mixer, connection_generation, mixer_generation, current_lease = current
+        if (
+            current_lease is not lease
+            or self._voice_clients.get(guild_id) is not vc
+            or self._voice_mixers.get(guild_id) is not mixer
+            or not self._voice_mixer_owner_is(
+                guild_id, vc, mixer, mixer_generation,
+            )
+            or self._voice_connection_generations.get(guild_id) != connection_generation
+            or self._voice_mixer_generations.get(guild_id) != mixer_generation
+            or lease.generation != mixer_generation
+        ):
+            raise ValueError("native playback authority is stale")
+        return mixer.validate_native_receipt(receipt, lease)
 
     def _lead_silence_bytes(self) -> bytes:
         """PCM silence prepended to speech clips on the mixer path.
@@ -4190,8 +4397,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._reset_voice_timeout(guild_id)
                 return True
 
+            old_vc = self._voice_clients.get(guild_id)
+            if old_vc is not None:
+                self._invalidate_native_playback(guild_id, connection_lost=True)
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
+            self._ensure_native_playback_state()
+            self._voice_connection_generations.setdefault(guild_id, 1)
+            self._voice_mixer_generations.setdefault(guild_id, 1)
             self._reset_voice_timeout(guild_id)
 
             # Store text-channel binding for automatic/programmatic joins
@@ -4243,7 +4456,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
-                self._voice_mixers.pop(guild_id, None)
+                self._invalidate_native_playback(guild_id, connection_lost=True)
 
             vc = self._voice_clients.pop(guild_id, None)
             if vc and vc.is_connected():
@@ -7230,6 +7443,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             view = ExecApprovalView(
                 session_key=session_key,
+                request_id=(metadata or {}).get("_approval_request_id"),
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
                 require_admin=require_admin,
@@ -8498,6 +8712,7 @@ def _define_discord_view_classes() -> None:
             self,
             session_key: str,
             allowed_user_ids: set,
+            request_id: Optional[str] = None,
             allowed_role_ids: Optional[set] = None,
             require_admin: bool = False,
             admin_user_ids: Optional[set] = None,
@@ -8507,6 +8722,7 @@ def _define_discord_view_classes() -> None:
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            self.request_id = request_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             # Opt-in admin gate for exec approval (default off → user-scope,
@@ -8580,7 +8796,9 @@ def _define_discord_view_classes() -> None:
             # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                count = resolve_gateway_approval(
+                    self.session_key, choice, request_id=self.request_id
+                )
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,

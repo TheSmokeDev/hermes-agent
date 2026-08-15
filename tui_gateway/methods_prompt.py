@@ -1021,6 +1021,9 @@ def _(rid, params: dict) -> dict:
                     session["session_key"],
                     params.get("choice", "deny"),
                     resolve_all=params.get("all", False),
+                    # approval.request payloads carry this opaque host ID;
+                    # legacy TUI clients may omit it and retain FIFO behavior.
+                    request_id=params.get("approval_request_id"),
                 )
             },
         )

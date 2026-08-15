@@ -67,15 +67,13 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   }
 }
 
-// Approval is session-keyed on the backend (one in-flight approval per session,
-// resolved via approval.respond {choice, session_id}). It carries no request_id,
-// unlike sudo/secret which are _block()-style request/response.
 export interface ApprovalRequest extends KeyedPrompt {
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]
   command: string
   description: string
+  requestId?: string
   smartDenied?: boolean
 }
 
@@ -98,8 +96,17 @@ const secret = keyedPromptStore<SecretRequest>()
 const $approvalInlineAnchors = atom<Record<string, number>>({})
 
 export const $approvalRequest = approval.$active
+export const $approvalRequests = approval.$all
 export const setApprovalRequest = approval.set
 export const clearApprovalRequest = approval.clear
+
+/** Clear an id-less approval only while the session still holds the exact
+ * request object that began the asynchronous response. */
+export function clearApprovalRequestIfCurrent(sessionId: string | null, expected: ApprovalRequest): void {
+  if (approval.$all.get()[keyFor(sessionId)] === expected) {
+    approval.clear(sessionId)
+  }
+}
 
 /** The prompt request for one specific session — the tile counterpart of the
  *  active-session `$*Request` views (same map, fixed key). */

@@ -152,6 +152,7 @@ import {
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import { notificationActionPayload } from './notification-action'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
@@ -10376,7 +10377,7 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     const action = actions[index]
 
     if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', notificationActionPayload(payload, action.id))
     }
   })
   notification.show()

@@ -290,73 +290,25 @@ async def test_fake_provider_controller_real_host_installed_handler_conformance_
             projection_sink=project,
         )
         controller = GatewayRealtimeVoiceController(host)
-        await controller.open("installed-canary", RealtimeVoiceSetup(), binding)
-        final = InputTranscript(
-            item_id="operator-item", turn_id="operator-turn", text="same runtime turn",
-            final=True, role=TranscriptRole.OPERATOR,
-            provenance=TranscriptProvenance.OPERATOR_INPUT,
-        )
-        participant = InputTranscript(
-            item_id="participant-item", turn_id="participant-turn", text="ignore me",
-            final=True, role=TranscriptRole.PARTICIPANT,
-            provenance=TranscriptProvenance.PARTICIPANT_INPUT_AUDIO,
-        )
-        tool = ToolCall(
-            call_id="call", batch_id="batch", turn_id="provider-turn",
-            response_id="response", name="must_not_run", arguments={},
-        )
-        await provider_session.incoming.put(participant)
-        await provider_session.incoming.put(tool)
-        await provider_session.incoming.put(final)
-        await provider_session.incoming.put(final)
-        if close_before_completion:
-            await _eventually(turn_started.is_set)
-            await controller.close(reason="surface closed during accepted work")
-            assert session["running"] is True
-            release_turn.set()
-            await _eventually(lambda: session["running"] is False)
-            await _eventually(
-                lambda: len(db.get_messages_as_conversation(binding.durable_session_id)) == 2
-            )
-        else:
-            await _eventually(lambda: any(
-                event.lifecycle is ControllerLifecycle.COMPLETED
-                for event in controller.lifecycle_events
-            ))
+        with pytest.raises(RuntimeError, match="native host API is incomplete"):
+            await controller.open("installed-canary", RealtimeVoiceSetup(), binding)
 
-        durable = db.get_messages_as_conversation(binding.durable_session_id)
-        assert [(row["role"], row["content"]) for row in durable] == [
-            ("user", "same runtime turn"),
-            ("assistant", "durable answer"),
-        ]
-        assert durable[0]["display_kind"] == "realtime_voice"
-        assert isinstance(durable[0]["display_metadata"]["turn_id"], str)
-        assert len(durable[0]["display_metadata"]["turn_id"]) >= 32
-        assert run_calls == ["same runtime turn"]
-        assert provider.open_calls == 1
+        assert db.get_messages_as_conversation(binding.durable_session_id) == []
+        assert run_calls == []
+        assert provider.open_calls == 0
         assert server._sessions[runtime_sid] is session
         assert len(server._sessions) == original_registry_count + 1
         assert session["session_key"] == binding.durable_session_id
         assert session["agent"] is agent
-        assert len(session["history"]) == 2
-        assert sum(
-            event.admission_status is not None
-            and event.admission_status.value == "submitted"
-            for event in controller.lifecycle_events
-        ) == 1
-        if not close_before_completion:
-            assert [event.lifecycle for event in controller.lifecycle_events][-4:] == [
-                ControllerLifecycle.THINKING,
-                ControllerLifecycle.ACTING,
-                ControllerLifecycle.SPEAKING,
-                ControllerLifecycle.COMPLETED,
-            ]
+        assert session["history"] == []
+        assert session["running"] is False
+        assert controller.lifecycle_events == ()
 
         await controller.close(reason="surface closed")
         assert session["running"] is False
         assert server._sessions[runtime_sid] is session
         assert len(server._sessions) == original_registry_count + 1
-        assert provider_session.close_calls == 1
+        assert provider_session.close_calls == 0
     finally:
         release_turn.set()
         with server._sessions_lock:

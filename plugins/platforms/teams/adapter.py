@@ -1130,7 +1130,9 @@ class TeamsAdapter(BasePlatformAdapter):
                 ),
             )
 
-        resolve_gateway_approval(session_key, choice)
+        resolve_gateway_approval(
+            session_key, choice, request_id=data.get("request_id")
+        )
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1174,6 +1176,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # Truncated for button data payload — just enough to reconstruct the card body.
         btn_data_base = {
             "session_key": session_key,
+            "request_id": (metadata or {}).get("_approval_request_id"),
             "cmd": command[:200] + "..." if len(command) > 200 else command,
             "desc": description,
         }

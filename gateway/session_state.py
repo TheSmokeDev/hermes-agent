@@ -38,6 +38,7 @@ from __future__ import annotations
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+import threading
 
 # Presence-sensitive sentinel: /fast stores "priority" or None (explicit
 # normal), so key PRESENCE — not value truthiness — decides whether the
@@ -176,6 +177,11 @@ class SessionState:
     turn: TurnState = field(default_factory=TurnState)
     conversation: ConversationState = field(default_factory=ConversationState)
     persistent: PersistentState = field(default_factory=PersistentState)
+    # Linearization boundary for live TurnState authority.  This is deliberately
+    # narrower than gateway cache/store locks and is never held across tools.
+    turn_authority_lock: Any = field(
+        default_factory=threading.RLock, repr=False, compare=False
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -333,20 +339,23 @@ class TurnLeaseTokenView(MutableMapping):
     def __setitem__(self, key: Any, value: Any) -> None:
         session_key, generation = self._split(key)
         state = self._runner._session_state(session_key)
-        state.turn.lease_token = value
-        state.turn.lease_generation = generation
+        with state.turn_authority_lock:
+            state.turn.lease_token = value
+            state.turn.lease_generation = generation
 
     def __delitem__(self, key: Any) -> None:
         session_key, generation = self._split(key)
         state = self._sessions().get(session_key)
-        if (
-            state is None
-            or state.turn.lease_token is None
-            or state.turn.lease_generation != generation
-        ):
+        if state is None:
             raise KeyError(key)
-        state.turn.lease_token = None
-        state.turn.lease_generation = None
+        with state.turn_authority_lock:
+            if (
+                state.turn.lease_token is None
+                or state.turn.lease_generation != generation
+            ):
+                raise KeyError(key)
+            state.turn.lease_token = None
+            state.turn.lease_generation = None
 
     def __iter__(self) -> Iterator[Tuple[str, Any]]:
         for key, state in list(self._sessions().items()):

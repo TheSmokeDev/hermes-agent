@@ -42,7 +42,11 @@ The mixer NEVER touches the inbound receive path: it only produces the bot's
 the mixer's output cannot echo back into transcription.
 """
 
+import asyncio
+from collections import deque
+from dataclasses import dataclass
 import logging
+import struct
 import threading
 from typing import TYPE_CHECKING, List, Optional
 
@@ -80,6 +84,218 @@ SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_LENGTH_MS // 1000   # 960
 FRAME_SIZE = SAMPLES_PER_FRAME * CHANNELS * SAMPLE_WIDTH    # 3840 bytes
 BYTES_PER_MS = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH // 1000  # 192
 SILENCE_FRAME = b"\x00" * FRAME_SIZE
+NATIVE_ID_MAX_CHARS = 512  # Compact bound compatible with provider-generated IDs.
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class NativePlaybackReceipt:
+    lease_id: str
+    response_id: str
+    turn_marker: str
+    generation: int
+    accepted_provider_bytes: int
+    lease_frames: int
+    interrupted: bool
+
+
+class NativePCMLease:
+    """One identity-bound native PCM stream owned by a VoiceMixer."""
+
+    def __init__(self, mixer, lease_id, response_id, turn_marker, generation, loop):
+        self._mixer = mixer
+        self.lease_id = lease_id
+        self.response_id = response_id
+        self.turn_marker = turn_marker
+        self.generation = generation
+        self._loop = loop
+        self._closed = False
+        self._terminal = False
+        self._interrupted = False
+        self._carry = b""
+        self._last_sample = None
+        self._converted = bytearray()
+        self._converted_provider_bytes = 0
+        self._frames = deque()
+        self._accepted = 0
+        self._frame_count = 0
+        self._space_waiters = deque()
+        self._drained = loop.create_future()
+        self._write_lock = asyncio.Lock()
+        self._terminal_lock = asyncio.Lock()
+        self._close_task = None
+        self._write_reserved = False
+        self.max_write_bytes = (mixer._native_frame_capacity + 1) * 960
+        self._receipt = None
+
+    @staticmethod
+    def _midpoint(left, right):
+        total = left + right
+        return total // 2 if total >= 0 else -((-total) // 2)
+
+    async def write_pcm(self, data):
+        if type(data) is not bytes:
+            raise TypeError("PCM data must be exact bytes")
+        if len(data) > self.max_write_bytes:
+            raise ValueError("PCM write exceeds bounded per-call capacity")
+        with self._mixer._lock:
+            if self._write_reserved:
+                raise RuntimeError("native playback write already in flight")
+            if self._terminal or self._closed:
+                raise RuntimeError("native playback lease is terminal")
+            self._write_reserved = True
+        task = self._loop.create_task(self._write_pcm(bytes(data)))
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                with self._mixer._lock:
+                    self._write_reserved = False
+            else:
+                task.add_done_callback(self._release_write_reservation)
+
+    def _release_write_reservation(self, task):
+        task.exception() if not task.cancelled() else None
+        with self._mixer._lock:
+            self._write_reserved = False
+
+    async def _write_pcm(self, data):
+        async with self._write_lock:
+            if self._terminal or self._closed:
+                raise RuntimeError("native playback lease is terminal")
+            raw = self._carry + data
+            carry_bytes = len(self._carry)
+            self._carry = raw[-1:] if len(raw) % 2 else b""
+            usable = raw[:-1] if self._carry else raw
+            provider_bytes = len(usable) - carry_bytes
+            for index, (sample,) in enumerate(struct.iter_unpack("<h", usable)):
+                if self._last_sample is None:
+                    first = sample
+                else:
+                    first = self._midpoint(self._last_sample, sample)
+                self._converted.extend(struct.pack("<hhhh", first, first, sample, sample))
+                self._converted_provider_bytes += min(2, max(0, provider_bytes - index * 2))
+                self._last_sample = sample
+                await self._enqueue_complete_frames()
+            if self._carry:
+                self._converted_provider_bytes += 1
+
+    async def _enqueue_complete_frames(self):
+        while len(self._converted) >= FRAME_SIZE:
+            await self._wait_for_space()
+            with self._mixer._lock:
+                if self._terminal and self._interrupted:
+                    raise RuntimeError("native playback lease was interrupted")
+                self._frames.append(bytes(self._converted[:FRAME_SIZE]))
+                del self._converted[:FRAME_SIZE]
+                accepted = min(960, self._converted_provider_bytes)
+                self._converted_provider_bytes -= accepted
+                self._accepted += accepted
+                self._frame_count += 1
+
+    async def _wait_for_space(self):
+        while True:
+            with self._mixer._lock:
+                outstanding = len(self._frames) + (self._mixer._native_prior_lease is self)
+                if outstanding < self._mixer._native_frame_capacity:
+                    return
+                waiter = self._loop.create_future()
+                self._space_waiters.append(waiter)
+            await waiter
+
+    async def finish_and_wait(self, timeout):
+        async with self._write_lock:
+            if self._carry:
+                raise ValueError("odd total provider PCM byte count")
+            if not self._terminal:
+                self._last_sample = None
+                if self._converted:
+                    self._converted.extend(b"\x00" * (FRAME_SIZE - len(self._converted)))
+                await self._enqueue_complete_frames()
+                self._terminal = True
+                self._maybe_complete()
+        return await asyncio.wait_for(asyncio.shield(self._drained), timeout)
+
+    async def interrupt_and_wait(self, timeout):
+        with self._mixer._lock:
+            self._terminal = True
+            self._interrupted = True
+            self._carry = b""
+            self._last_sample = None
+            self._converted.clear()
+            self._converted_provider_bytes = 0
+            self._frames.clear()
+            self._wake_space_locked()
+        self._maybe_complete()
+        return await asyncio.wait_for(asyncio.shield(self._drained), timeout)
+
+    def _wake_space_locked(self):
+        while self._space_waiters:
+            waiter = self._space_waiters.popleft()
+            self._loop.call_soon_threadsafe(_set_future_result, waiter, None)
+
+    def _ack_prior_frame(self):
+        with self._mixer._lock:
+            self._wake_space_locked()
+        self._maybe_complete()
+
+    def _take_frame_locked(self):
+        if not self._frames:
+            return None
+        frame = self._frames.popleft()
+        return frame
+
+    def _maybe_complete(self):
+        with self._mixer._lock:
+            done = (
+                self._terminal
+                and not self._frames
+                and self._mixer._native_prior_lease is not self
+            )
+        if done:
+            with self._mixer._lock:
+                if self._receipt is None:
+                    self._receipt = NativePlaybackReceipt(
+                        self.lease_id, self.response_id, self.turn_marker, self.generation,
+                        self._accepted, self._frame_count, self._interrupted,
+                    )
+                receipt = self._receipt
+            self._loop.call_soon_threadsafe(_set_future_result, self._drained, receipt)
+
+    def _validate_receipt(self, receipt):
+        if receipt is not self._receipt:
+            raise ValueError("receipt was not minted by this lease")
+        return receipt
+
+    async def close(self):
+        async with self._terminal_lock:
+            if self._closed:
+                return
+            if self._close_task is None:
+                self._close_task = self._loop.create_task(self._close())
+            task = self._close_task
+        await asyncio.shield(task)
+
+    async def _close(self):
+        with self._mixer._lock:
+            self._terminal = True
+            self._interrupted = True
+            self._carry = b""
+            self._last_sample = None
+            self._converted.clear()
+            self._converted_provider_bytes = 0
+            self._frames.clear()
+            if self._mixer._native_prior_lease is self:
+                self._mixer._native_prior_lease = None
+            self._wake_space_locked()
+        self._maybe_complete()
+        await asyncio.shield(self._drained)
+        self._mixer._close_native_lease(self)
+        self._closed = True
+
+
+def _set_future_result(future, value):
+    if not future.done():
+        future.set_result(value)
 
 
 class MixerChild:
@@ -124,8 +340,8 @@ class MixerChild:
     def finished(self) -> bool:
         return self._finished
 
-    def read_frame(self) -> "Optional[np.ndarray]":
-        """Return the next 20 ms frame as an int16 ndarray, or None if done."""
+    def read_frame(self) -> Optional[list[float]]:
+        """Return the next frame as signed samples, or None if done."""
         if self._finished:
             return None
         if self._pos >= len(self._pcm):
@@ -135,13 +351,12 @@ class MixerChild:
                 self._finished = True
                 return None
 
-        np = _require_numpy()
         chunk = self._pcm[self._pos:self._pos + FRAME_SIZE]
         self._pos += FRAME_SIZE
         if len(chunk) < FRAME_SIZE:
             chunk = chunk + b"\x00" * (FRAME_SIZE - len(chunk))
 
-        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        samples = list(struct.unpack("<1920h", chunk))
 
         gain = self.gain
         if self.fade_frames and self._fade_done < self.fade_frames:
@@ -149,7 +364,7 @@ class MixerChild:
             gain *= self._fade_done / self.fade_frames
 
         if gain != 1.0:
-            samples = samples * gain
+            samples = [sample * gain for sample in samples]
         return samples
 
 
@@ -173,7 +388,10 @@ class VoiceMixer(discord.AudioSource):
         duck_gain: float = 0.06,
         speech_gain: float = 1.0,
         duck_release_ms: int = 400,
+        native_frame_capacity: int = 8,
     ):
+        if type(native_frame_capacity) is not int or native_frame_capacity <= 0:
+            raise ValueError("native_frame_capacity must be a positive exact int")
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
         self._speech: List[MixerChild] = []
@@ -188,6 +406,46 @@ class VoiceMixer(discord.AudioSource):
         # Tracks whether speech is currently active, for external callers that
         # want to avoid double-ducking or know when a reply is mid-flight.
         self._speech_active = False
+        self._native_frame_capacity = native_frame_capacity
+        self._native_lease = None
+        self._native_prior_lease = None
+
+    def acquire_native_playback(self, lease_id, response_id, turn_marker, generation):
+        """Acquire the mixer's single host-owned native playback lane."""
+        identifiers = (lease_id, response_id, turn_marker)
+        if any(type(value) is not str for value in identifiers):
+            raise TypeError("native playback identifiers must be exact strings")
+        if any(len(value) > NATIVE_ID_MAX_CHARS for value in identifiers):
+            raise ValueError(f"native playback identifiers exceed {NATIVE_ID_MAX_CHARS} characters")
+        identifiers = tuple(value.strip() for value in identifiers)
+        if any(not value for value in identifiers):
+            raise ValueError("native playback identifiers must be nonblank")
+        if type(generation) is not int or generation <= 0:
+            raise TypeError("generation must be a positive exact int")
+        lease_id, response_id, turn_marker = identifiers
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:
+            raise RuntimeError("native playback acquisition requires a running loop") from exc
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("voice mixer is closed")
+            if self._native_lease is not None:
+                raise RuntimeError("native playback lease already active")
+            lease = NativePCMLease(self, lease_id, response_id, turn_marker, generation, loop)
+            self._native_lease = lease
+            return lease
+
+    def _close_native_lease(self, lease):
+        with self._lock:
+            if self._native_lease is lease:
+                self._native_lease = None
+
+    def validate_native_receipt(self, receipt, lease):
+        with self._lock:
+            if self._native_lease is not lease:
+                raise ValueError("lease is not active on this mixer")
+        return lease._validate_receipt(receipt)
 
     # ------------------------------------------------------------------
     # Ambient (idle / "thinking") bed
@@ -256,12 +514,25 @@ class VoiceMixer(discord.AudioSource):
         return b"" because that would stop the single underlying stream and we
         want the mixer to run continuously for the lifetime of the connection.
         """
+        prior = None
+        with self._lock:
+            if self._native_prior_lease is not None:
+                prior = self._native_prior_lease
+                self._native_prior_lease = None
+        if prior is not None:
+            prior._ack_prior_frame()
+
         with self._lock:
             if self._closed:
                 return SILENCE_FRAME
 
-            np = _require_numpy()
-            acc: "Optional[np.ndarray]" = None
+            native = None
+            if self._native_lease is not None:
+                native = self._native_lease._take_frame_locked()
+                if native is not None:
+                    self._native_prior_lease = self._native_lease
+
+            acc: Optional[list[float]] = None
 
             # Speech children (drop exhausted ones; release duck when last ends)
             if self._speech:
@@ -270,7 +541,7 @@ class VoiceMixer(discord.AudioSource):
                     frame = child.read_frame()
                     if frame is None:
                         continue
-                    acc = frame if acc is None else acc + frame
+                    acc = frame if acc is None else [a + b for a, b in zip(acc, frame)]
                     still_live.append(child)
                 self._speech = still_live
                 if not self._speech and self._speech_active:
@@ -289,19 +560,40 @@ class VoiceMixer(discord.AudioSource):
                     self._ambient.gain = self._ambient_gain
                 amb = self._ambient.read_frame()
                 if amb is not None:
-                    acc = amb if acc is None else acc + amb
+                    acc = amb if acc is None else [a + b for a, b in zip(acc, amb)]
 
             if acc is None:
-                return SILENCE_FRAME
+                return native if native is not None else SILENCE_FRAME
 
-            np.clip(acc, -32768, 32767, out=acc)
-            return acc.astype(np.int16).tobytes()
+            mixed_samples = [max(-32768, min(32767, int(sample))) for sample in acc]
+            if native is None:
+                return struct.pack("<1920h", *mixed_samples)
+            native_samples = struct.unpack("<1920h", native)
+            return struct.pack(
+                "<1920h",
+                *(max(-32768, min(32767, a + b)) for a, b in zip(native_samples, mixed_samples)),
+            )
 
     def cleanup(self) -> None:  # called by discord.py when playback stops
+        lease = None
         with self._lock:
             self._closed = True
             self._ambient = None
             self._speech.clear()
+            lease = self._native_lease
+            self._native_lease = None
+            self._native_prior_lease = None
+            if lease is not None:
+                lease._terminal = True
+                lease._interrupted = True
+                lease._carry = b""
+                lease._last_sample = None
+                lease._converted.clear()
+                lease._converted_provider_bytes = 0
+                lease._frames.clear()
+                lease._wake_space_locked()
+        if lease is not None:
+            lease._maybe_complete()
 
 
 # ----------------------------------------------------------------------
