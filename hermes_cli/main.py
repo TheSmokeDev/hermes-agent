@@ -13764,6 +13764,20 @@ def main():
     realtime_parser.add_argument("--model", help="Provider model id (default: the provider's default)")
     realtime_parser.add_argument("--voice", help="Provider voice id (default: the provider's default)")
     realtime_parser.add_argument(
+        "--turn-detection",
+        choices=("provider_native", "server_vad", "semantic_vad"),
+        default="provider_native",
+        help=(
+            "How input turns end: provider_native (default), server_vad, or "
+            "semantic_vad; the selected provider must advertise support"
+        ),
+    )
+    realtime_parser.add_argument(
+        "--semantic-eagerness",
+        choices=("auto", "low", "medium", "high"),
+        help="Semantic VAD response eagerness; valid only with --turn-detection semantic_vad",
+    )
+    realtime_parser.add_argument(
         "--toolset",
         help="Toolset exposed to the voice model as function tools (default: hermes-cli)",
     )

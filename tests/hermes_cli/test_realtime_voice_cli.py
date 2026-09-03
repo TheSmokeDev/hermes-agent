@@ -15,6 +15,8 @@ from agent.realtime_voice_provider import (
     OutputTranscript,
     RealtimeAudioFormat,
     RealtimeCapability,
+    RealtimeSemanticEagerness,
+    RealtimeTurnDetectionMode,
     RealtimeVoiceProvider,
     RealtimeVoiceSession,
     ResponseCompleted,
@@ -113,10 +115,18 @@ class FakeSession(RealtimeVoiceSession):
 class FakeProvider(RealtimeVoiceProvider):
     capabilities = frozenset({RealtimeCapability.TOOL_CALLING})
 
-    def __init__(self, script=(), *, available=True, name="fake") -> None:
+    def __init__(
+        self,
+        script=(),
+        *,
+        available=True,
+        name="fake",
+        turn_detection_modes=frozenset({RealtimeTurnDetectionMode.PROVIDER_NATIVE}),
+    ) -> None:
         self._script = script
         self._available = available
         self._name = name
+        self.supported_turn_detection_modes = turn_detection_modes
         self.setups = []
         self.session: FakeSession | None = None
 
@@ -329,6 +339,77 @@ async def test_run_session_streams_mic_audio_playback_and_transcripts(out, monke
     assert "Hermes: It is noon." in out
     assert out[-1] == "realtime: session closed (hangup)"
 
+@pytest.mark.asyncio
+async def test_run_session_passes_supported_semantic_turn_detection(out) -> None:
+    provider = FakeProvider(
+        [SessionClosed()],
+        turn_detection_modes=frozenset({
+            RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+            RealtimeTurnDetectionMode.SEMANTIC_VAD,
+        }),
+    )
+    realtime_voice_registry.register_provider(provider)
+
+    code = await run_session(
+        provider_name="fake",
+        turn_detection_mode=RealtimeTurnDetectionMode.SEMANTIC_VAD,
+        semantic_eagerness=RealtimeSemanticEagerness.HIGH,
+        audio_factory=lambda: FakeAudio(),
+        out=out.append,
+        tools_enabled=False,
+    )
+
+    assert code == 0
+    assert provider.setups[0].turn_detection.mode is RealtimeTurnDetectionMode.SEMANTIC_VAD
+    assert (
+        provider.setups[0].turn_detection.semantic_eagerness
+        is RealtimeSemanticEagerness.HIGH
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_session_rejects_unsupported_mode_before_audio_or_network(out) -> None:
+    provider = FakeProvider()
+    realtime_voice_registry.register_provider(provider)
+    audio_opened = False
+
+    def audio_factory():
+        nonlocal audio_opened
+        audio_opened = True
+        return FakeAudio()
+
+    code = await run_session(
+        provider_name="fake",
+        turn_detection_mode=RealtimeTurnDetectionMode.SEMANTIC_VAD,
+        audio_factory=audio_factory,
+        out=out.append,
+    )
+
+    assert code == 2
+    assert audio_opened is False
+    assert provider.setups == []
+    assert out == [
+        "realtime: configuration error: provider 'fake' does not support turn detection "
+        "mode 'semantic_vad' (supported: provider_native)"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_session_rejects_eagerness_without_semantic_mode_before_audio(out) -> None:
+    provider = FakeProvider()
+    realtime_voice_registry.register_provider(provider)
+
+    code = await run_session(
+        provider_name="fake",
+        semantic_eagerness=RealtimeSemanticEagerness.LOW,
+        audio_factory=lambda: pytest.fail("audio must not be opened"),
+        out=out.append,
+    )
+
+    assert code == 2
+    assert provider.setups == []
+    assert out[0].startswith("realtime: configuration error:")
+
 
 @pytest.mark.asyncio
 async def test_run_session_without_tools_opens_a_toolless_session(out, monkeypatch) -> None:
@@ -417,6 +498,7 @@ def test_cmd_realtime_list_prints_providers(capsys) -> None:
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].startswith("fake") and "ready" in lines[0]
     assert lines[1].startswith("other") and "needs setup" in lines[1]
+    assert "turn detection: provider_native" in lines[0]
 
 
 def test_cmd_realtime_list_with_no_providers(capsys) -> None:
@@ -440,6 +522,8 @@ def test_cmd_realtime_passes_flags_and_normalizes_provider(monkeypatch) -> None:
         toolset=None,
         no_tools=True,
         tool_timeout=12.5,
+        turn_detection="semantic_vad",
+        semantic_eagerness="high",
     )
 
     assert cmd_realtime(args) == 0
@@ -450,6 +534,8 @@ def test_cmd_realtime_passes_flags_and_normalizes_provider(monkeypatch) -> None:
         "toolset": "hermes-cli",
         "tools_enabled": False,
         "tool_timeout_s": 12.5,
+        "turn_detection_mode": RealtimeTurnDetectionMode.SEMANTIC_VAD,
+        "semantic_eagerness": RealtimeSemanticEagerness.HIGH,
     }
 
 

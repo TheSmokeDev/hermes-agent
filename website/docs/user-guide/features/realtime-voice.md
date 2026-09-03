@@ -32,7 +32,7 @@ hermes realtime --list
 ```
 
 ```text
-openai           ready        OpenAI Realtime (default model gpt-realtime-2.1)
+openai           ready        OpenAI Realtime (default model gpt-realtime-2.1; turn detection: provider_native, semantic_vad, server_vad)
 ```
 
 ## Usage
@@ -45,10 +45,32 @@ hermes realtime --toolset hermes-cli     # which Hermes toolset the model may ca
 hermes realtime --no-tools               # conversation only
 hermes realtime --tool-timeout 20        # per-call tool timeout in seconds (default 60)
 hermes realtime --provider gemini        # any provider a plugin registered
+hermes realtime --turn-detection server_vad
+hermes realtime --turn-detection semantic_vad --semantic-eagerness high
 ```
 
 Speak when you see `realtime: connected`. Transcripts print as `You:` and `Hermes:`
 lines; tool calls print as `→ tool: <name>`. **Ctrl+C** hangs up.
+
+### Turn detection
+
+The default is `--turn-detection provider_native`, so an invocation without endpointing
+flags keeps each provider's existing turn-taking behavior. `server_vad` asks for
+audio-level server voice activity detection. `semantic_vad` asks the provider to use
+speech meaning as well as silence to decide when you have finished; its optional
+`--semantic-eagerness auto|low|medium|high` setting defaults to `auto`.
+
+These modes are provider capabilities, not universal features. Use `hermes realtime
+--list` to see the modes each installed provider advertises. Hermes refuses an
+unsupported selection before opening audio devices or making an authentication or
+network request. `--semantic-eagerness` is a configuration error unless
+`--turn-detection semantic_vad` is also selected.
+
+To compare endpointing modes, keep the provider, model, microphone, network, prompt,
+and spoken phrase fixed. Run multiple trials per mode and measure from the end of your
+speech to the first response audio; report the median and a tail percentile such as
+p95. Also record premature cutoffs and false continuations: lower measured latency is
+not an improvement if the provider regularly interrupts pauses inside a sentence.
 
 :::tip Use headphones
 The microphone stays open while the assistant speaks — that is what makes interrupting
@@ -57,7 +79,7 @@ work. With open speakers the model can hear itself and cut its own answer short.
 
 ### Interrupting
 
-Start talking over the assistant. The provider's server-side turn detection reports the
+Start talking over the assistant. The provider's turn detection reports the
 interruption; Hermes stops playback immediately, cancels the in-flight response, tells the
 provider exactly how many milliseconds of the answer you actually heard (so the model's
 memory of what it said matches yours), and cancels any tool calls still running for that

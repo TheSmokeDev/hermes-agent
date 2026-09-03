@@ -463,6 +463,48 @@ class RealtimeToolResult:
 # -- setup -------------------------------------------------------------------
 
 
+class RealtimeTurnDetectionMode(StrEnum):
+    """Provider-neutral ways to decide when an operator's turn has ended."""
+
+    PROVIDER_NATIVE = "provider_native"
+    SERVER_VAD = "server_vad"
+    SEMANTIC_VAD = "semantic_vad"
+
+
+class RealtimeSemanticEagerness(StrEnum):
+    """How readily semantic endpointing should conclude an operator turn."""
+
+    AUTO = "auto"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeTurnDetection:
+    """Immutable turn-end policy shared by every realtime provider."""
+
+    mode: RealtimeTurnDetectionMode = RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    semantic_eagerness: RealtimeSemanticEagerness | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, RealtimeTurnDetectionMode):
+            raise TypeError("mode must be RealtimeTurnDetectionMode")
+        if self.semantic_eagerness is not None and not isinstance(
+            self.semantic_eagerness, RealtimeSemanticEagerness
+        ):
+            raise TypeError(
+                "semantic_eagerness must be None or RealtimeSemanticEagerness"
+            )
+        if (
+            self.mode is not RealtimeTurnDetectionMode.SEMANTIC_VAD
+            and self.semantic_eagerness is not None
+        ):
+            raise ValueError(
+                "semantic_eagerness is valid only for semantic_vad turn detection"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class RealtimeAudioFormat:
     """Raw PCM description. Samples are always 16-bit little-endian signed."""
@@ -521,6 +563,7 @@ class RealtimeVoiceSetup:
     output_audio: RealtimeAudioFormat | None = None
     automatic_response: bool = True
     provider_options: Mapping[str, Any] = field(default_factory=dict)
+    turn_detection: RealtimeTurnDetection = RealtimeTurnDetection()
 
     def __post_init__(self) -> None:
         _validate_identifier(self.model, "model", optional=True)
@@ -530,6 +573,8 @@ class RealtimeVoiceSetup:
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, RealtimeAudioFormat):
                 raise TypeError(f"{field_name} must be None or RealtimeAudioFormat")
+        if not isinstance(self.turn_detection, RealtimeTurnDetection):
+            raise TypeError("turn_detection must be RealtimeTurnDetection")
         if not isinstance(self.automatic_response, bool):
             raise TypeError("automatic_response must be bool")
         provider_options = _freeze_mapping(self.provider_options, "provider_options")
@@ -839,6 +884,9 @@ class RealtimeVoiceProvider(abc.ABC):
 
     api_version: int = REALTIME_VOICE_PROVIDER_API_VERSION
     capabilities: frozenset[RealtimeCapability] = frozenset()
+    supported_turn_detection_modes: frozenset[RealtimeTurnDetectionMode] = frozenset({
+        RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    })
 
     @property
     @abc.abstractmethod
@@ -883,6 +931,16 @@ class RealtimeVoiceProvider(abc.ABC):
             {"name": self.display_name, "badge": "", "tag": "", "env_vars": ()}
         )
 
+    def validate_setup(self, setup: RealtimeVoiceSetup) -> None:
+        """Reject setup choices unsupported by this provider before opening it."""
+        if not isinstance(setup, RealtimeVoiceSetup):
+            raise TypeError("setup must be RealtimeVoiceSetup")
+        if setup.turn_detection.mode not in self.supported_turn_detection_modes:
+            raise ValueError(
+                f"unsupported turn detection mode: {setup.turn_detection.mode.value}"
+            )
+
+
     @abc.abstractmethod
     async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
         """Open a connected session from the complete shared typed setup."""
@@ -900,7 +958,10 @@ __all__ = [
     "OutputTranscript",
     "RealtimeAudioFormat",
     "RealtimeCapability",
+    "RealtimeSemanticEagerness",
     "RealtimeTool",
+    "RealtimeTurnDetection",
+    "RealtimeTurnDetectionMode",
     "RealtimeToolResult",
     "RealtimeVoiceEvent",
     "RealtimeVoiceProvider",

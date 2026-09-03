@@ -39,6 +39,8 @@ from agent.realtime_voice_provider import (
     RealtimeVoiceProvider,
     RealtimeVoiceSession,
     RealtimeVoiceSetup,
+    RealtimeSemanticEagerness,
+    RealtimeTurnDetectionMode,
     ResponseCompleted,
     ResponseStarted,
     SessionClosed,
@@ -95,6 +97,14 @@ CAPABILITIES = frozenset(
         RealtimeCapability.DYNAMIC_CONTEXT,
     }
 )
+SUPPORTED_TURN_DETECTION_MODES = frozenset(
+    {
+        RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+        RealtimeTurnDetectionMode.SERVER_VAD,
+        RealtimeTurnDetectionMode.SEMANTIC_VAD,
+    }
+)
+
 
 #: ``connector(url, headers)`` returns a connected socket exposing
 #: ``send(str)``, ``close()``, and async iteration over inbound frames —
@@ -143,12 +153,25 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def build_session_update(setup: RealtimeVoiceSetup, *, voice: str) -> dict[str, Any]:
-    """The GA ``session.update`` for one setup: server VAD, barge-in, transcripts.
+def _turn_detection_wire(setup: RealtimeVoiceSetup) -> dict[str, Any]:
+    turn_detection = setup.turn_detection
+    if turn_detection.mode is RealtimeTurnDetectionMode.SEMANTIC_VAD:
+        eagerness = turn_detection.semantic_eagerness or RealtimeSemanticEagerness.AUTO
+        return {
+            "type": "semantic_vad",
+            "eagerness": eagerness.value,
+            "create_response": setup.automatic_response,
+            "interrupt_response": True,
+        }
+    return {
+        "type": "server_vad",
+        "create_response": setup.automatic_response,
+        "interrupt_response": True,
+    }
 
-    The model rides the connection URL and cannot change afterwards, so it
-    is deliberately absent here.
-    """
+
+def build_session_update(setup: RealtimeVoiceSetup, *, voice: str) -> dict[str, Any]:
+    """Build the public GA ``session.update`` for one setup."""
     session: dict[str, Any] = {
         "type": "realtime",
         "instructions": setup.instructions,
@@ -156,11 +179,7 @@ def build_session_update(setup: RealtimeVoiceSetup, *, voice: str) -> dict[str, 
             "input": {
                 "format": {"type": "audio/pcm", "rate": PCM16_24K.sample_rate_hz},
                 "noise_reduction": {"type": "near_field"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "create_response": setup.automatic_response,
-                    "interrupt_response": True,
-                },
+                "turn_detection": _turn_detection_wire(setup),
                 "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
             },
             "output": {
@@ -468,6 +487,7 @@ def _close_reason(exc: Any) -> str:
 
 class OpenAIRealtimeProvider(RealtimeVoiceProvider):
     capabilities = CAPABILITIES
+    supported_turn_detection_modes = SUPPORTED_TURN_DETECTION_MODES
 
     def __init__(self, *, connector: WebSocketConnector | None = None) -> None:
         self._connector = connector or _default_connector
@@ -508,6 +528,7 @@ class OpenAIRealtimeProvider(RealtimeVoiceProvider):
         }
 
     async def open_session(self, setup: RealtimeVoiceSetup) -> RealtimeVoiceSession:
+        self.validate_setup(setup)
         for label, requested in (("input", setup.input_audio), ("output", setup.output_audio)):
             if requested is not None and requested != PCM16_24K:
                 raise ValueError(
@@ -544,6 +565,7 @@ __all__ = [
     "DEFAULT_VOICE",
     "PROVIDER_NAME",
     "REALTIME_WS_URL",
+    "SUPPORTED_TURN_DETECTION_MODES",
     "OpenAIRealtimeProvider",
     "OpenAIRealtimeSession",
     "build_session_update",
