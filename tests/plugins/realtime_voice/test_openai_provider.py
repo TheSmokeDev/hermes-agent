@@ -27,6 +27,9 @@ from agent.realtime_voice_provider import (
     OutputTranscript,
     RealtimeAudioFormat,
     RealtimeCapability,
+    RealtimeSemanticEagerness,
+    RealtimeTurnDetection,
+    RealtimeTurnDetectionMode,
     RealtimeTool,
     RealtimeToolResult,
     ResponseCompleted,
@@ -41,6 +44,7 @@ from plugins.realtime_voice.openai.provider import (
     DEFAULT_MODEL,
     DEFAULT_VOICE,
     REALTIME_WS_URL,
+    SUPPORTED_TURN_DETECTION_MODES,
     OpenAIRealtimeProvider,
     OpenAIRealtimeSession,
     build_session_update,
@@ -123,6 +127,17 @@ class TestProviderMetadata:
         assert RealtimeCapability.SESSION_RESUMPTION not in provider.capabilities
         assert [voice["id"] for voice in provider.list_voices()][:2] == ["marin", "cedar"]
         assert provider.get_setup_schema()["env_vars"][0]["key"] == "OPENAI_API_KEY"
+        assert (
+            provider.supported_turn_detection_modes
+            == SUPPORTED_TURN_DETECTION_MODES
+            == frozenset(
+                {
+                    RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+                    RealtimeTurnDetectionMode.SERVER_VAD,
+                    RealtimeTurnDetectionMode.SEMANTIC_VAD,
+                }
+            )
+        )
 
     def test_availability_follows_the_audio_key(self, provider, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -229,6 +244,82 @@ class TestOpenSession:
         assert session_payload["audio"]["output"]["voice"] == DEFAULT_VOICE
         assert "tools" not in session_payload
         assert session_payload["audio"]["input"]["turn_detection"]["create_response"] is True
+
+    @pytest.mark.parametrize(
+        ("eagerness", "wire_eagerness"),
+        [
+            (None, "auto"),
+            (RealtimeSemanticEagerness.AUTO, "auto"),
+            (RealtimeSemanticEagerness.LOW, "low"),
+            (RealtimeSemanticEagerness.MEDIUM, "medium"),
+            (RealtimeSemanticEagerness.HIGH, "high"),
+        ],
+    )
+    def test_semantic_vad_session_wire_maps_eagerness_exactly(
+        self, eagerness, wire_eagerness
+    ):
+        setup = openai_plugin.provider.RealtimeVoiceSetup(
+            automatic_response=False,
+            turn_detection=RealtimeTurnDetection(
+                mode=RealtimeTurnDetectionMode.SEMANTIC_VAD,
+                semantic_eagerness=eagerness,
+            ),
+        )
+
+        turn_detection = build_session_update(setup, voice="marin")["session"]["audio"][
+            "input"
+        ]["turn_detection"]
+
+        assert turn_detection == {
+            "type": "semantic_vad",
+            "eagerness": wire_eagerness,
+            "create_response": False,
+            "interrupt_response": True,
+        }
+
+    def test_explicit_server_vad_matches_provider_native_wire(self):
+        native = openai_plugin.provider.RealtimeVoiceSetup()
+        server = openai_plugin.provider.RealtimeVoiceSetup(
+            turn_detection=RealtimeTurnDetection(
+                mode=RealtimeTurnDetectionMode.SERVER_VAD
+            )
+        )
+
+        native_wire = build_session_update(native, voice="marin")
+        server_wire = build_session_update(server, voice="marin")
+
+        assert server_wire == native_wire
+
+    @pytest.mark.asyncio
+    async def test_validates_unsupported_turn_detection_before_credentials_or_dial(
+        self, provider, monkeypatch
+    ):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+        provider.supported_turn_detection_modes = frozenset(
+            {RealtimeTurnDetectionMode.PROVIDER_NATIVE}
+        )
+        setup = openai_plugin.provider.RealtimeVoiceSetup(
+            turn_detection=RealtimeTurnDetection(
+                mode=RealtimeTurnDetectionMode.SEMANTIC_VAD
+            )
+        )
+
+        with pytest.raises(ValueError, match="unsupported turn detection mode"):
+            await provider.open_session(setup)
+
+        assert provider.dials == []
+
+    def test_invalid_semantic_eagerness_never_dials(self, provider):
+        with pytest.raises(ValueError, match="valid only for semantic_vad"):
+            openai_plugin.provider.RealtimeVoiceSetup(
+                turn_detection=RealtimeTurnDetection(
+                    mode=RealtimeTurnDetectionMode.SERVER_VAD,
+                    semantic_eagerness=RealtimeSemanticEagerness.HIGH,
+                )
+            )
+
+        assert provider.dials == []
 
     @pytest.mark.asyncio
     async def test_refuses_without_a_key_before_dialing(self, provider, monkeypatch):

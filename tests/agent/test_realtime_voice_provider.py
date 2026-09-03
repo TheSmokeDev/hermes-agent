@@ -18,11 +18,15 @@ from agent.realtime_voice_provider import (
     OutputTranscript,
     RealtimeAudioFormat,
     RealtimeCapability,
+    RealtimeSemanticEagerness,
     RealtimeTool,
+    RealtimeTurnDetection,
+    RealtimeTurnDetectionMode,
     RealtimeToolResult,
     RealtimeVoiceEvent,
     RealtimeVoiceSession,
     RealtimeVoiceSetup,
+    RealtimeVoiceProvider,
     ResponseCompleted,
     ResponseStarted,
     SessionClosed,
@@ -36,6 +40,111 @@ from agent.realtime_voice_provider import (
 
 
 # -- setup -------------------------------------------------------------------
+
+
+def test_turn_detection_defaults_preserve_provider_native_setup() -> None:
+    setup = RealtimeVoiceSetup()
+
+    assert setup.turn_detection == RealtimeTurnDetection()
+    assert setup.turn_detection.mode is RealtimeTurnDetectionMode.PROVIDER_NATIVE
+    assert setup.turn_detection.semantic_eagerness is None
+
+    with pytest.raises(AttributeError):
+        setup.turn_detection.mode = RealtimeTurnDetectionMode.SERVER_VAD
+
+
+@pytest.mark.parametrize(
+    ("mode", "eagerness"),
+    [
+        (RealtimeTurnDetectionMode.PROVIDER_NATIVE, None),
+        (RealtimeTurnDetectionMode.SERVER_VAD, None),
+        *[
+            (RealtimeTurnDetectionMode.SEMANTIC_VAD, eagerness)
+            for eagerness in RealtimeSemanticEagerness
+        ],
+        (RealtimeTurnDetectionMode.SEMANTIC_VAD, None),
+    ],
+)
+def test_turn_detection_accepts_every_valid_mode_and_eagerness(mode, eagerness) -> None:
+    turn_detection = RealtimeTurnDetection(mode=mode, semantic_eagerness=eagerness)
+
+    assert (
+        RealtimeVoiceSetup(turn_detection=turn_detection).turn_detection
+        is turn_detection
+    )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+        RealtimeTurnDetectionMode.SERVER_VAD,
+    ],
+)
+def test_semantic_eagerness_cannot_attach_to_non_semantic_modes(mode) -> None:
+    with pytest.raises(ValueError, match="only for semantic_vad"):
+        RealtimeTurnDetection(
+            mode=mode,
+            semantic_eagerness=RealtimeSemanticEagerness.AUTO,
+        )
+
+
+@pytest.mark.parametrize("mode", ["semantic_vad", None, 1, object()])
+def test_turn_detection_mode_requires_public_enum(mode) -> None:
+    with pytest.raises(TypeError, match="mode"):
+        RealtimeTurnDetection(mode=mode)
+
+
+@pytest.mark.parametrize("eagerness", ["auto", 1, object()])
+def test_semantic_eagerness_requires_public_enum(eagerness) -> None:
+    with pytest.raises(TypeError, match="semantic_eagerness"):
+        RealtimeTurnDetection(
+            mode=RealtimeTurnDetectionMode.SEMANTIC_VAD,
+            semantic_eagerness=eagerness,
+        )
+
+
+@pytest.mark.parametrize("turn_detection", [None, "server_vad", object()])
+def test_setup_requires_turn_detection_value(turn_detection) -> None:
+    with pytest.raises(TypeError, match="turn_detection"):
+        RealtimeVoiceSetup(turn_detection=turn_detection)
+
+
+def test_provider_turn_detection_metadata_defaults_to_immutable_native_only() -> None:
+    modes = RealtimeVoiceProvider.supported_turn_detection_modes
+
+    assert modes == frozenset({RealtimeTurnDetectionMode.PROVIDER_NATIVE})
+    with pytest.raises(AttributeError):
+        modes.add(RealtimeTurnDetectionMode.SERVER_VAD)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        RealtimeTurnDetectionMode.SERVER_VAD,
+        RealtimeTurnDetectionMode.SEMANTIC_VAD,
+    ],
+)
+async def test_default_provider_refuses_unsupported_mode_before_opening(mode) -> None:
+    class NativeOnlyProvider(RealtimeVoiceProvider):
+        opened = False
+
+        @property
+        def name(self) -> str:
+            return "native-only"
+
+        async def open_session(self, setup):
+            self.validate_setup(setup)
+            self.opened = True
+            raise AssertionError("open implementation must not run")
+
+    provider = NativeOnlyProvider()
+    setup = RealtimeVoiceSetup(turn_detection=RealtimeTurnDetection(mode=mode))
+
+    with pytest.raises(ValueError, match=rf"unsupported.*{mode.value}"):
+        await provider.open_session(setup)
+    assert provider.opened is False
 
 
 def test_setup_copies_and_freezes_provider_options() -> None:

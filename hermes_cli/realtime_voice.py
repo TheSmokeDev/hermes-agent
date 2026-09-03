@@ -41,7 +41,10 @@ from agent.realtime_voice_orchestrator import (
 )
 from agent.realtime_voice_provider import (
     RealtimeAudioFormat,
+    RealtimeSemanticEagerness,
     RealtimeTool,
+    RealtimeTurnDetection,
+    RealtimeTurnDetectionMode,
     RealtimeVoiceSetup,
     ToolCall,
 )
@@ -372,7 +375,11 @@ def list_provider_lines() -> list[str]:
     for provider in realtime_voice_registry.list_providers():
         state = "ready" if provider.is_available() else "needs setup"
         model = provider.default_model() or "-"
-        lines.append(f"{provider.name:<16} {state:<12} {provider.display_name} (default model {model})")
+        modes = ", ".join(sorted(mode.value for mode in provider.supported_turn_detection_modes))
+        lines.append(
+            f"{provider.name:<16} {state:<12} {provider.display_name} "
+            f"(default model {model}; turn detection: {modes})"
+        )
     return lines
 
 
@@ -394,6 +401,8 @@ async def run_session(
     tools_enabled: bool = True,
     tool_timeout_s: float = DEFAULT_TOOL_TIMEOUT_S,
     instructions: str = DEFAULT_INSTRUCTIONS,
+    turn_detection_mode: RealtimeTurnDetectionMode = RealtimeTurnDetectionMode.PROVIDER_NATIVE,
+    semantic_eagerness: RealtimeSemanticEagerness | None = None,
     audio_factory: Callable[[], DuplexAudio] | None = None,
     out: Callable[[str], None] | None = None,
 ) -> int:
@@ -404,6 +413,21 @@ async def run_session(
         out(f"realtime: unknown provider '{provider_name}'. Registered providers:")
         for line in list_provider_lines():
             out(f"  {line}")
+        return 2
+    if turn_detection_mode not in provider.supported_turn_detection_modes:
+        supported = ", ".join(sorted(mode.value for mode in provider.supported_turn_detection_modes))
+        out(
+            f"realtime: configuration error: provider '{provider.name}' does not support "
+            f"turn detection mode '{turn_detection_mode.value}' (supported: {supported})"
+        )
+        return 2
+    try:
+        turn_detection = RealtimeTurnDetection(
+            mode=turn_detection_mode,
+            semantic_eagerness=semantic_eagerness,
+        )
+    except (TypeError, ValueError) as exc:
+        out(f"realtime: configuration error: {exc}")
         return 2
     if not provider.is_available():
         schema = provider.get_setup_schema()
@@ -427,6 +451,7 @@ async def run_session(
         voice=voice or provider.default_voice(),
         instructions=instructions,
         tools=tools,
+        turn_detection=turn_detection,
     )
     out(
         f"realtime: opening {provider.display_name} ({setup.model or 'default model'}, "
@@ -484,6 +509,15 @@ def cmd_realtime(args) -> int:
                 toolset=getattr(args, "toolset", None) or DEFAULT_TOOLSET,
                 tools_enabled=not getattr(args, "no_tools", False),
                 tool_timeout_s=float(getattr(args, "tool_timeout", None) or DEFAULT_TOOL_TIMEOUT_S),
+                turn_detection_mode=RealtimeTurnDetectionMode(
+                    getattr(args, "turn_detection", None)
+                    or RealtimeTurnDetectionMode.PROVIDER_NATIVE.value
+                ),
+                semantic_eagerness=(
+                    RealtimeSemanticEagerness(args.semantic_eagerness)
+                    if getattr(args, "semantic_eagerness", None)
+                    else None
+                ),
             )
         )
     except KeyboardInterrupt:
