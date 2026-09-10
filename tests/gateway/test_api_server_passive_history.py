@@ -49,7 +49,7 @@ async def test_authenticated_profile_ingress_and_canonical_readback(tmp_path, mo
                         {"Authorization": "bearer " + keys["alpha"]}):
             assert (await client.get(base + "/capabilities", headers=headers)).status == 401
         response = await client.get("/p/alpha/v1/capabilities", headers=auth)
-        assert (await response.json())["features"]["passive_history"]["origin_adoption"] is False
+        assert (await response.json())["features"]["passive_history"]["origin_adoption_sources"] == ["api_runs"]
         response = await client.post(base + "/attach", headers=auth,
                                      json={"tab_id": "tab", "session_id": "same-id"})
         assert response.status == 200

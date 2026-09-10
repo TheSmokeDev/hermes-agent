@@ -162,7 +162,7 @@ def test_snapshot_is_bounded_display_context(store):
     assert len(snapshot["messages"]) <= 20
     assert sum(len(m["content"].encode()) for m in snapshot["messages"]) <= 32 * 1024
     assert all(m["role"] == "user" for m in snapshot["messages"])
-    assert snapshot["capabilities"]["origin_adoption"] is False
+    assert snapshot["capabilities"]["origin_adoption_sources"] == ["api_runs"]
 
 
 def test_schema_31_upgrade_replays_attachment_ddl(tmp_path):

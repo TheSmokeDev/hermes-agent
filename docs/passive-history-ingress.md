@@ -21,6 +21,7 @@ Profile authority and DB resolution remain with the host. Paths and credentials 
 | POST | `/snapshot` | `tab_id`, `attachment_id`, `generation`, `session_id` |
 | POST | `/commit` | attachment fields plus `event_id`, `origin_turn_id`, `messages` |
 | POST | `/reconcile` | `session_id`, `event_id` |
+| POST | `/adopt` | `session_id`, `event_id`, `origin_turn_id`, singleton user `messages` |
 | POST | `/detach` | attachment fields |
 
 Unknown fields are rejected. Event, origin, tab and attachment IDs are 1–128 ASCII letters,
@@ -78,11 +79,40 @@ missing target 404; stale attachment, target unavailable, event conflict or busy
 SQLite unavailable 503. Only busy/store-unavailable are marked retryable. Error bodies omit
 transcript contents, paths and credentials. Closed or ambiguous lineages refuse without selecting a sibling.
 
-`origin_adoption` is explicitly **false**. Do not pass an utterance here while an authoritative
-execution submission may also persist it. Run acceptance alone is not proof of canonical input;
-verified execution-origin adoption requires a separate capability and is not implemented by v1.
+Origin adoption is supported only for opt-in API runs: capabilities include `origin_adoption: true`
+and `origin_adoption_sources: ["api_runs"]`. This is a read-only proof operation, never permission
+to execute or an instruction to submit the utterance again.
 
-Compatibility: schema 32 adds revocable attachment storage over the existing passive receipt
-contract. Database recovery deliberately drops attachment authority while retaining receipts.
+For a new authoritative request, `POST /v1/runs` accepts an optional
+`origin: {"event_id":"event-uuid","origin_turn_id":"utterance-uuid"}`. It requires a durable
+`Idempotency-Key`, an explicit existing `session_id`, and plain-string `input` containing the
+original user utterance. Origin requests cannot use caller-supplied history, response chains,
+or hosted-room/child-worker dispatch. Ordinary requests without origin retain existing behavior.
+
+Before scheduling the run, the host reserves the event in state.db. Passive insertion of that
+event then conflicts; if passive persistence already won, run admission conflicts instead of
+launching another canonical input. The run's user row and origin binding commit atomically.
+Generated assistant/tool text and later independent requests do not receive that user-origin claim.
+
+Call `/adopt` with the original target/event/origin and the single original user message. It
+verifies canonical owner, payload, host-written provenance and committed row ID. `adopted`
+returns the original run ID and message IDs; `pending` returns no message IDs. `reserved: false`
+means no reservation was found, which grants no fresh-write or execution authority. Changed
+payload/owner returns conflict; removed canonical references return retired. No history is appended.
+The run ID is only a link: its existing authorization still governs access to run controls.
+
+202 admission, running/completed status, and matching text alone are not canonical-row proof.
+A lost-response retry uses the same Idempotency-Key. An uncertain/crashed pending reservation
+remains pending and prevents a passive fallback; this version does not automatically release it
+or restart an execution that might still finish. Do not retrofit legacy runs by matching text.
+An explicit origin-admission refusal before dispatch is terminal for that Idempotency-Key:
+the original HTTP error is stored and replayed with `retryable: false`, never converted into 202.
+Deferred input flushes retain their own host-created origin claim after the executor exits.
+Dashboard-origin execution and steering propagation remain unsupported separate work; the dashboard
+can read authenticated adoption proofs for API-origin rows in its authorized profile.
+
+Compatibility: schema 33 adds canonical execution-origin reservations/bindings and deletion
+tombstones over schema 32's attachment storage. Database recovery deliberately drops attachment
+authority while retaining passive receipts and execution origins with their canonical row IDs.
 Rollback to a prior executable leaves additive tables harmless, but clients must treat missing
 capabilities as unsupported. Local tests and commits do not establish deployed availability.

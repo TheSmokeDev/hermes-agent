@@ -327,6 +327,9 @@ class SessionPassiveHistoryMixin:
             # same writer transaction, serialized against tab replacement and detach.
             if _commit_guard is not None:
                 _commit_guard(conn)
+            if conn.execute("SELECT 1 FROM execution_origins WHERE producer=? AND event_id=?",
+                            (producer, event_id)).fetchone():
+                raise PassiveHistoryConflictError("Origin belongs to authoritative execution; use adoption")
             receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
             if receipt is not None:
                 self._verify_passive_receipt(conn, receipt, producer=producer, event_id=event_id)

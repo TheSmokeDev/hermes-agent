@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from contextlib import suppress
@@ -302,6 +303,10 @@ def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _op
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
     status = self._durable_run_status(request, original_id) or record["status"]
+    admission_error = status.get("admission_error")
+    if isinstance(admission_error, dict):
+        return web.json_response(admission_error["body"], status=admission_error["http_status"],
+                                 headers={"Idempotency-Replayed": "true"})
     return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
 
 
@@ -327,6 +332,7 @@ class _RunLaunch:
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    origin_claim: Optional[dict] = None
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -397,6 +403,22 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
+    origin = body.get("origin")
+    if origin is not None:
+        from hermes_state_execution_origins import validate_origin_input
+        try:
+            if not self._expected_api_key() or self._room_grant_token(request):
+                return _json_error(_openai_error, "Origin input requires gateway bearer authentication",
+                                   code="origin_auth_required", status=401)
+            if (not idempotency_key or not self._run_idempotency_store.durable
+                    or not isinstance(body.get("session_id"), str) or not body["session_id"]
+                    or body.get("previous_response_id") or body.get("conversation_history")
+                    or room_dispatch is not None or room_execution_policy is not None):
+                raise ValueError("Origin input requires durable idempotency and an existing conversation")
+            validate_origin_input(origin, body.get("input"))
+        except ValueError:
+            return _json_error(_openai_error, "Invalid authoritative origin request",
+                               code="invalid_origin", status=400)
     idempotency_scope = idempotency_fingerprint = ""
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
@@ -484,6 +506,27 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    origin_claim = None
+    if origin is not None:
+        from passive_history_ingress import PRODUCER, IngressError, error_response
+        try:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                raise IngressError("store_unavailable", 503)
+            origin_claim = await asyncio.to_thread(
+                db.reserve_execution_origin, body["session_id"], producer=PRODUCER,
+                **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope)
+            session_id = origin_claim["session_id"]
+        except (ValueError, RuntimeError, sqlite3.Error) as exc:
+            error, status = error_response(exc)
+            # No task was scheduled. Do not replay this durable admission as 202, or release
+            # it across an uncertain canonical write and risk dispatching the origin twice.
+            error = {**error, "retryable": False}
+            self._set_run_status(run_id, "failed", error=error["error"],
+                                 admission_error={"http_status": status, "body": error})
+            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
+                        self._run_approval_sessions, self._run_statuses, self._run_owners)
+            return web.json_response(error, status=status)
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -494,7 +537,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        origin_claim=origin_claim, turn_author=turn_author)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -521,6 +564,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
+    had_origin_claim = hasattr(agent, "_execution_origin_claim")
+    prior_origin_claim = getattr(agent, "_execution_origin_claim", None)
     with self._profile_scope(run.request_profile):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
@@ -550,12 +595,26 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
+            origin_kwargs = {}
+            if run.origin_claim is not None:
+                from hermes_state_execution_origins import origin_metadata
+                agent._execution_origin_claim = run.origin_claim
+                origin_kwargs = {
+                    "persist_user_message": run.user_message,
+                    "persist_user_platform_id": "origin:" + run.origin_claim["event_id"],
+                    "persist_user_display_metadata": {"execution_origin": origin_metadata(run.origin_claim)},
+                }
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+                task_id=effective_task_id, **origin_kwargs, **author_kwargs)
         finally:
+            if run.origin_claim is not None:
+                if had_origin_claim:
+                    agent._execution_origin_claim = prior_origin_claim
+                elif hasattr(agent, "_execution_origin_claim"):
+                    del agent._execution_origin_claim
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.

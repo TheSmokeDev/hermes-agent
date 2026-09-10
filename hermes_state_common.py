@@ -200,7 +200,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -394,6 +394,29 @@ BEGIN
     DELETE FROM passive_history_attachments
     WHERE session_id = OLD.session_id OR conversation_id = OLD.session_id
        OR snapshot_session_id = OLD.session_id;
+END;
+
+-- Canonical execution-input ownership survives deletion/recovery; never cascade away tombstones.
+CREATE TABLE IF NOT EXISTS execution_origins (
+    producer TEXT NOT NULL, event_id TEXT NOT NULL, origin_turn_id TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL, conversation_id TEXT NOT NULL,
+    requested_session_id TEXT NOT NULL, session_id TEXT NOT NULL,
+    run_id TEXT NOT NULL, run_scope TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','adopted','retired')),
+    message_id INTEGER, created_at REAL NOT NULL,
+    PRIMARY KEY (producer,event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_origins_message_id ON execution_origins(message_id);
+CREATE TRIGGER IF NOT EXISTS execution_origin_message_delete
+AFTER DELETE ON messages
+BEGIN
+    UPDATE execution_origins SET state='retired' WHERE message_id=OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS execution_origin_session_delete
+AFTER DELETE ON sessions
+BEGIN
+    UPDATE execution_origins SET state='retired'
+    WHERE session_id=OLD.id OR conversation_id=OLD.id OR requested_session_id=OLD.id;
 END;
 
 -- Idempotency receipts for passively saved conversation turns (Talk voice ingress and any other

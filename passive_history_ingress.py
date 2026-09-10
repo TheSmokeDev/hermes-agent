@@ -26,6 +26,7 @@ _BODY_KEYS = {
     "snapshot": _ATTACHMENT_KEYS,
     "commit": _ATTACHMENT_KEYS | {"event_id", "origin_turn_id", "messages"},
     "reconcile": {"session_id", "event_id"},
+    "adopt": {"session_id", "event_id", "origin_turn_id", "messages"},
     "detach": _ATTACHMENT_KEYS,
 }
 
@@ -43,8 +44,9 @@ def principal_key(identity: str) -> str:
 
 def capabilities() -> dict:
     return {
-        "version": PROTOCOL_VERSION, "passive_only": True, "origin_adoption": False,
-        "operations": ["attach", "snapshot", "commit", "reconcile", "detach"],
+        "version": PROTOCOL_VERSION, "passive_only": True, "origin_adoption": True,
+        "origin_adoption_sources": ["api_runs"],
+        "operations": ["attach", "snapshot", "commit", "reconcile", "detach", "adopt"],
         "max_request_bytes": MAX_REQUEST_BYTES, "max_message_bytes": 64 * 1024,
         "max_messages": 2, "max_snapshot_messages": MAX_SNAPSHOT_MESSAGES,
         "max_snapshot_bytes": MAX_SNAPSHOT_BYTES,
@@ -211,3 +213,12 @@ class PassiveHistoryIngress:
                          "WHERE profile_id=? AND principal_id=? AND tab_id=?", scope)
             return {"status": "detached"}
         return db._execute_write(write)
+
+    def _adopt(self, db, scope, body):
+        from hermes_state_passive_history import _validated_messages
+        messages = _validated_messages(body["messages"])
+        if len(messages) != 1 or messages[0]["role"] != "user":
+            raise IngressError("invalid_request", 400)
+        return {"profile": scope[0], **db.adopt_execution_origin(
+            body["session_id"], producer=PRODUCER, event_id=body["event_id"],
+            origin_turn_id=body["origin_turn_id"], content=messages[0]["content"])}
