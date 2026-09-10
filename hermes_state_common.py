@@ -198,7 +198,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -405,6 +405,24 @@ CREATE TABLE IF NOT EXISTS execution_origins (
     PRIMARY KEY (producer,event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_execution_origins_message_id ON execution_origins(message_id);
+CREATE TABLE IF NOT EXISTS child_dispatches (
+    run_id TEXT PRIMARY KEY, run_scope TEXT NOT NULL, fingerprint TEXT NOT NULL,
+    correlation_id TEXT NOT NULL, producer TEXT NOT NULL, event_id TEXT NOT NULL, origin_turn_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL, requested_session_id TEXT NOT NULL, parent_session_id TEXT NOT NULL,
+    parent_message_id INTEGER NOT NULL, child_id TEXT, child_session_id TEXT,
+    state TEXT NOT NULL CHECK(state IN ('admitted','launching','started','retired')), created_at REAL NOT NULL,
+    UNIQUE(conversation_id,correlation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_child_dispatches_parent_message ON child_dispatches(parent_message_id);
+CREATE TRIGGER IF NOT EXISTS child_dispatch_message_delete AFTER DELETE ON messages
+BEGIN
+    UPDATE child_dispatches SET state='retired' WHERE parent_message_id=OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS child_dispatch_session_delete AFTER DELETE ON sessions
+BEGIN
+    UPDATE child_dispatches SET state='retired' WHERE parent_session_id=OLD.id
+       OR conversation_id=OLD.id OR requested_session_id=OLD.id OR child_session_id=OLD.id;
+END;
 CREATE TRIGGER IF NOT EXISTS execution_origin_message_delete
 AFTER DELETE ON messages
 BEGIN

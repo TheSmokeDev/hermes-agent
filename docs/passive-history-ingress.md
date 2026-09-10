@@ -114,5 +114,44 @@ can read authenticated adoption proofs for API-origin rows in its authorized pro
 Compatibility: schema 33 adds canonical execution-origin reservations/bindings and deletion
 tombstones over schema 32's attachment storage. Database recovery deliberately drops attachment
 authority while retaining passive receipts and execution origins with their canonical row IDs.
+
+## Linked child work on `/v1/runs`
+
+Hosts advertising `features.linked_child_dispatch.version: 1` accept a `child` object alongside
+the original `input`, explicit parent `session_id`, `origin` and durable `Idempotency-Key`:
+
+```json
+{
+  "session_id": "existing-parent", "input": "Exact original user utterance",
+  "origin": {"event_id": "utterance-event", "origin_turn_id": "voice-turn"},
+  "child": {"goal": "Derived execution goal", "context": "Bounded child context",
+            "correlation_id": "stable-action-id", "allowed_toolsets": ["file"]}
+}
+```
+
+Goal is nonempty, at most 16000 characters; context is optional and at most 32000 characters.
+Correlation IDs use the existing bounded ASCII identifier rules. Optional allowed_toolsets is
+a nonempty list of at most 32 known toolsets and remains subordinate to host permissions.
+Model/role/cwd overrides, arbitrary child keys, room dispatch and caller history are unsupported.
+
+Fresh original input commits through the existing passive writer. A prior matching passive
+receipt reuses its exact user row, including a user/assistant pair's user row, without modifying
+provenance. Supply `origin.receipt_id` for reuse-only intent: a missing/foreign/mismatched receipt
+then refuses instead of inserting fresh input. Execution-origin reservations from parent-model
+runs are not supported as child origins by this version. The original utterance is never replaced
+with the generated child goal, and this mode never invokes the parent's model.
+
+Distinct actions may reference one utterance; each needs its own Idempotency-Key and correlation.
+Complete request fingerprints bind goal, context, tool restrictions and origin. Canonical origin/
+dispatch links commit before launch, and a durable CAS consumes launch authority. Response loss,
+process-local registry loss or restart never authorizes replacement execution for that dispatch.
+Run status exposes parent_message_id and, once known, child_id/child_session_id. Lifecycle handles
+now include optional child_session_id; their capability tokens remain inside the host.
+
+The existing run's auth/status/events/approval/stop ownership stays active through child terminal
+completion. Child context is copied across executor boundaries; stop cancels through the public
+lifecycle service. Construction or permission failures never fall back to a parent-model run.
+Schema 34 adds child_dispatches to the same canonical DB/recovery path with deletion tombstones.
+Child IDs may remain unknown after an uncertain launch; that is not permission to launch again.
 Rollback to a prior executable leaves additive tables harmless, but clients must treat missing
 capabilities as unsupported. Local tests and commits do not establish deployed availability.

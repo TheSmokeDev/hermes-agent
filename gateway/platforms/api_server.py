@@ -2236,6 +2236,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
         from passive_history_ingress import capabilities as passive_capabilities
+        from gateway.platforms.api_server_children import capabilities as child_capabilities
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2248,6 +2249,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "explicit split-runtime mode is enabled.")},
             "features": {
                 "passive_history": passive_capabilities(),
+                "linked_child_dispatch": child_capabilities(),
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),

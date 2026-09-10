@@ -30,6 +30,7 @@ _CANONICAL_TABLES = (
     # spent identities survive recovery; a source predating the table simply reports "missing".
     "passive_history_commits",
     "execution_origins",
+    "child_dispatches",
 )
 _TOPIC_TABLES = ("telegram_dm_topic_mode", "telegram_dm_topic_bindings")
 
