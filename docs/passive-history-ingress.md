@@ -105,6 +105,9 @@ The run ID is only a link: its existing authorization still governs access to ru
 A lost-response retry uses the same Idempotency-Key. An uncertain/crashed pending reservation
 remains pending and prevents a passive fallback; this version does not automatically release it
 or restart an execution that might still finish. Do not retrofit legacy runs by matching text.
+An explicit origin-admission refusal before dispatch is terminal for that Idempotency-Key:
+the original HTTP error is stored and replayed with `retryable: false`, never converted into 202.
+Deferred input flushes retain their own host-created origin claim after the executor exits.
 Dashboard-origin execution and steering propagation remain unsupported separate work; the dashboard
 can read authenticated adoption proofs for API-origin rows in its authorized profile.
 

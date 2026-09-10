@@ -303,6 +303,10 @@ def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _op
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
     status = self._durable_run_status(request, original_id) or record["status"]
+    admission_error = status.get("admission_error")
+    if isinstance(admission_error, dict):
+        return web.json_response(admission_error["body"], status=admission_error["http_status"],
+                                 headers={"Idempotency-Replayed": "true"})
     return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
 
 
@@ -510,7 +514,11 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             session_id = origin_claim["session_id"]
         except (ValueError, RuntimeError, sqlite3.Error) as exc:
             error, status = error_response(exc)
-            self._set_run_status(run_id, "failed", error=error["error"])
+            # No task was scheduled. Do not replay this durable admission as 202, or release
+            # it across an uncertain canonical write and risk dispatching the origin twice.
+            error = {**error, "retryable": False}
+            self._set_run_status(run_id, "failed", error=error["error"],
+                                 admission_error={"http_status": status, "body": error})
             _forget_run(self, run_id, self._run_streams, self._run_streams_created,
                         self._run_approval_sessions, self._run_statuses, self._run_owners)
             return web.json_response(error, status=status)

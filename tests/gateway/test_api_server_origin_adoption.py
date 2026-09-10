@@ -19,6 +19,99 @@ from run_agent import AIAgent
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["missing_store", "sqlite"])
+async def test_pre_dispatch_refusal_replays_terminal_error_not_phantom_acceptance(tmp_path, monkeypatch, refusal):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("conversation", source="test")
+    key = secrets.token_hex(24)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": key}))
+    adapter._session_db = db
+    auth = {"Authorization": "Bearer " + key, "Idempotency-Key": "stable-refused-request"}
+    body = {"session_id": "conversation", "input": "original request",
+            "origin": {"event_id": "refused-event", "origin_turn_id": "refused-origin"}}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("refused admission must not schedule execution")
+
+    monkeypatch.setattr(api_server_runs, "_execute_run", forbidden)
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        with monkeypatch.context() as failing:
+            if refusal == "missing_store":
+                async def unavailable():
+                    return None
+                failing.setattr(adapter, "_ensure_session_db_async", unavailable)
+            else:
+                def busy(*args, **kwargs):
+                    raise sqlite3.OperationalError("injected reservation refusal")
+                failing.setattr(db, "reserve_execution_origin", busy)
+            response = await client.post("/v1/runs", headers=auth, json=body)
+            assert response.status == 503
+            refused = await response.json()
+        # Even after storage recovers, this key must not replay a run that was never scheduled.
+        replay = await client.post("/v1/runs", headers=auth, json=body)
+        assert replay.status == 503
+        assert await replay.json() == refused
+        assert refused["retryable"] is False
+        assert replay.headers["Idempotency-Replayed"] == "true"
+        assert not adapter._active_run_tasks and not adapter._run_streams
+        assert db.get_messages("conversation") == []
+    finally:
+        await client.close()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_tip_handoff_keeps_run_scoped_approval_and_operator_memory_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("parent", source="test")
+    db.end_session("parent", "compression")
+    db.create_session("tip", source="test", parent_session_id="parent")
+    db.append_message("tip", "user", "carried context")
+    key = secrets.token_hex(24)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": key}))
+    adapter._session_db = db
+    seen, dispatched = [], asyncio.Event()
+
+    async def inspect_dispatch(owner, run, **kwargs):
+        seen.append(run)
+        dispatched.set()
+
+    monkeypatch.setattr(api_server_runs, "_execute_run", inspect_dispatch)
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post("/v1/runs", headers={
+            "Authorization": "Bearer " + key, "Idempotency-Key": "compression-origin",
+            "X-Hermes-Session-Key": "operator-memory"}, json={
+                "session_id": "parent", "input": "original request",
+                "origin": {"event_id": "compressed-event", "origin_turn_id": "compressed-origin"}})
+        assert response.status == 202
+        run_id = (await response.json())["run_id"]
+        await asyncio.wait_for(dispatched.wait(), timeout=5)
+        run = seen[0]
+        assert run.session_id == run.agent_kwargs["session_id"] == run.origin_claim["session_id"] == "tip"
+        assert run.conversation_history[0]["content"] == "carried context"
+        assert run.approval_session_key == adapter._run_approval_sessions[run_id] == run_id
+        assert run.declared_selected is False
+        assert run.gateway_session_key == "operator-memory"
+    finally:
+        for run in seen:
+            api_server_runs._retire_live_run(adapter, run.run_id)
+        await client.close()
+        await adapter.disconnect()
+        db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_first_write", [False, True])
 async def test_accepted_origin_waits_for_real_user_row(tmp_path, monkeypatch, failed_first_write):
     from tests.run_agent.test_run_agent import _mock_response

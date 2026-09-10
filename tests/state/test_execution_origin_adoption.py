@@ -108,10 +108,45 @@ def test_binding_rollback_never_claims_uncommitted_input(stores, monkeypatch):
     assert adopt(reader)["status"] == "adopted"
 
 
-def test_text_or_fabricated_provenance_is_not_adoption(stores):
+@pytest.mark.parametrize("replaced_claim", [False, True])
+def test_deferred_flush_retains_its_origin_after_executor_claim_ends(stores, monkeypatch, replaced_claim):
+    from run_agent import AIAgent
     db, reader = stores
     claim = reserve(db)
-    db.append_messages_batch("conversation", [row(claim)])  # no trusted writer claim
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id, agent._session_db = "conversation", db
+    agent._session_db_created, agent._persist_disabled = True, False
+    agent._last_flushed_db_idx = 0
+    agent._execution_origin_claim = claim
+    messages = [row(claim)]
+    with monkeypatch.context() as failing:
+        def unavailable(*args, **kwargs):
+            raise sqlite3.OperationalError("injected unavailable first flush")
+        failing.setattr(db, "append_messages_batch", unavailable)
+        assert agent._flush_messages_to_session_db(messages) is False
+    if replaced_claim:
+        db.create_session("foreign", source="test")
+        agent._execution_origin_claim = db.reserve_execution_origin(
+            "foreign", **{**IDENTITY, "event_id": "other-event"}, content=TEXT,
+            run_id="other-run", run_scope="other-scope")
+    else:
+        del agent._execution_origin_claim
+    assert agent._flush_messages_to_session_db(messages) is True
+    assert adopt(reader)["status"] == "adopted"
+    assert len(reader.get_messages("conversation")) == 1
+    assert agent._flush_messages_to_session_db([{"role": "user", "content": "unrelated typed input"}]) is True
+
+
+def test_text_or_fabricated_provenance_is_not_adoption(stores):
+    from run_agent import AIAgent
+    db, reader = stores
+    claim = reserve(db)
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id, agent._session_db = "conversation", db
+    agent._session_db_created, agent._persist_disabled, agent._last_flushed_db_idx = True, False, 0
+    # JSON-like caller data cannot manufacture the typed host-created flush unit.
+    fabricated = {**row(claim), "_execution_origin_flush_claim": dict(claim)}
+    assert agent._flush_messages_to_session_db([fabricated]) is True
     assert adopt(reader)["status"] == "pending"
     for override in ({"content": "derived worker prompt"}, {"run_id": "another_run"},
                      {"run_scope": "foreign-owner"}):
@@ -154,6 +189,13 @@ def test_compression_and_branch_ownership(stores):
     assert proof["session_id"] == "tip"
     assert reader.adopt_execution_origin("tip", **IDENTITY, content=TEXT) == proof
     assert reader.get_messages("branch") == []
+    # Canonical deletion destroys the original authorization lineage even if the bound row
+    # survives in an orphaned child; keeping that old origin live would silently retarget it.
+    db.delete_session("conversation")
+    assert reader.get_messages("tip")[0]["content"] == TEXT
+    assert reader.get_session("tip")["parent_session_id"] is None
+    with pytest.raises(PassiveHistoryRetiredError):
+        reader.adopt_execution_origin("tip", **IDENTITY, content=TEXT)
 
 
 def test_recovery_keeps_bound_ids_and_retired_origins(tmp_path):

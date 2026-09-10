@@ -404,6 +404,7 @@ CREATE TABLE IF NOT EXISTS execution_origins (
     message_id INTEGER, created_at REAL NOT NULL,
     PRIMARY KEY (producer,event_id)
 );
+CREATE INDEX IF NOT EXISTS idx_execution_origins_message_id ON execution_origins(message_id);
 CREATE TRIGGER IF NOT EXISTS execution_origin_message_delete
 AFTER DELETE ON messages
 BEGIN
