@@ -10,7 +10,7 @@ from hermes_state_passive_history import _validated_identifier
 def capabilities():
     return {"version": 1, "supported": True, "origin_sources": ["fresh", "passive_receipt"],
             "max_goal_chars": 16000, "max_context_chars": 32000,
-            "separate_child_goal": True, "restart_relaunch": False}
+            "separate_child_goal": True, "owning_run_approvals": True, "restart_relaunch": False}
 
 
 def validate_child_request(child):
@@ -35,7 +35,9 @@ def validate_child_request(child):
 def cancel_linked_child(parent):
     control = getattr(parent, "_api_linked_child_control", None)
     if control is not None:
-        service, handle = control
+        from tools.approval import unregister_gateway_notify
+        service, handle, approval_key = control
+        unregister_gateway_notify(approval_key)
         service.cancel(handle, reason="Owning API run stopped")
 
 
@@ -60,16 +62,19 @@ def run_child_sync(adapter, run, parent):
             metadata={"run_id": run.run_id, "event_id": dispatch["event_id"],
                       "origin_turn_id": dispatch["origin_turn_id"], "correlation_id": request["correlation_id"],
                       "parent_message_id": dispatch["parent_message_id"]}))
-        parent._api_linked_child_control = (service, handle)
+        parent._api_linked_child_control = (service, handle, run.approval_session_key)
         if not handle.child_session_id:
             raise ValueError("Host lifecycle does not expose linked child session identity")
         db.record_child_dispatch_handle(dispatch, child_id=handle.subagent_id,
                                         child_session_id=handle.child_session_id)
-        adapter._set_run_status(run.run_id, "running", child_id=handle.subagent_id,
+        current = adapter._run_statuses.get(run.run_id, {})
+        phase = current.get("status", "running")
+        adapter._set_run_status(run.run_id, phase, child_id=handle.subagent_id,
                                 child_session_id=handle.child_session_id,
-                                parent_message_id=dispatch["parent_message_id"], last_event="child.started")
+                                parent_message_id=dispatch["parent_message_id"],
+                                last_event=current.get("last_event") if phase != "running" else "child.started")
         if run.run_id in adapter._stopping_run_ids:
-            service.cancel(handle, reason="Owning API run stopped during launch")
+            cancel_linked_child(parent)
         service.wait(handle)
         result = service.result(handle)
         interrupted = result.terminal_state in {SubagentState.INTERRUPTED, SubagentState.CANCELLED}
@@ -79,6 +84,8 @@ def run_child_sync(adapter, run, parent):
                 "child_id": handle.subagent_id, "child_session_id": handle.child_session_id}
     except BaseException:
         if handle is not None:
+            from tools.approval import unregister_gateway_notify
+            unregister_gateway_notify(run.approval_session_key)
             service.cancel(handle, reason="Owning run could not retain child dispatch")
             service.wait(handle)
         raise

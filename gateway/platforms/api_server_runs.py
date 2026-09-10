@@ -636,7 +636,9 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
             if run.child_request is not None:
                 from gateway.platforms.api_server_children import run_child_sync
-                r = run_child_sync(self, run, agent)
+                from tools.approval_context import bind_api_run_approval_transport
+                with bind_api_run_approval_transport(run.approval_session_key, approval_notify):
+                    r = run_child_sync(self, run, agent)
             else:
                 r = agent.run_conversation(
                     user_message=run.user_message, conversation_history=run.conversation_history,
@@ -972,10 +974,10 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
     if agent is not None:
-        with suppress(Exception):
-            _api_server.request_hard_interrupt(agent, "Stop requested via API")
         from gateway.platforms.api_server_children import cancel_linked_child
         cancel_linked_child(agent)
+        with suppress(Exception):
+            _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")

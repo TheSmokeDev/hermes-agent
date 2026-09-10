@@ -8,6 +8,8 @@ gate in :mod:`tools.approval`.
 import contextvars
 import logging
 import os
+from contextlib import contextmanager
+from dataclasses import dataclass
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled, is_truthy_value
 
@@ -32,6 +34,36 @@ _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
 # it onto the non-interactive auto-approve path so a dangerous command runs without the approval callback firing
 # (GHSA-96vc-wcxf-jjff). None = unset → env fallback.
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
+
+
+@dataclass(frozen=True)
+class _LiveApiRunApproval:
+    session_key: str
+    callback: object
+
+
+_live_api_run_approval: contextvars.ContextVar = contextvars.ContextVar("live_api_run_approval", default=None)
+
+
+@contextmanager
+def bind_api_run_approval_transport(session_key: str, callback):
+    """Trusted host binding, not request data: exact current run and its registered callback."""
+    from tools.approval import _gateway_notify_cb
+    if not callable(callback) or _approval_session_key.get() != session_key or _gateway_notify_cb(session_key) is not callback:
+        raise ValueError("API run has no matching live approval transport")
+    token = _live_api_run_approval.set(_LiveApiRunApproval(session_key, callback))
+    try:
+        yield
+    finally:
+        _live_api_run_approval.reset(token)
+
+
+def _has_live_api_run_approval() -> bool:
+    from tools.approval import _gateway_notify_cb
+    binding = _live_api_run_approval.get()
+    return (isinstance(binding, _LiveApiRunApproval)
+            and _approval_session_key.get() == binding.session_key
+            and _gateway_notify_cb(binding.session_key) is binding.callback)
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
@@ -142,7 +174,10 @@ def _is_unattended_platform_approval_context() -> bool:
     blocks the session for the full approval timeout (60-300s) and then fails closed anyway — the deadlock
     in #37284/#87509.
     """
-    return _get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+    platform = _get_session_platform()
+    if platform == "api_server" and _has_live_api_run_approval():
+        return False
+    return platform in _UNATTENDED_APPROVAL_PLATFORMS
 
 
 def _is_single_query_approval_context() -> bool:

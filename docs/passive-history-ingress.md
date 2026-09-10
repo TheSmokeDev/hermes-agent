@@ -151,6 +151,10 @@ now include optional child_session_id; their capability tokens remain inside the
 The existing run's auth/status/events/approval/stop ownership stays active through child terminal
 completion. Child context is copied across executor boundaries; stop cancels through the public
 lifecycle service. Construction or permission failures never fall back to a parent-model run.
+Linked-child human approval requires a host-created context binding to this exact run and its
+currently registered callback. Missing, foreign or revoked callbacks grant nothing. Ordinary API
+and webhook unattended policy is unchanged; no tool permission is widened and nothing auto-approves.
+Stop revokes pending approval before cancelling the child, so a late decision cannot resume it.
 Schema 34 adds child_dispatches to the same canonical DB/recovery path with deletion tombstones.
 Child IDs may remain unknown after an uncertain launch; that is not permission to launch again.
 Rollback to a prior executable leaves additive tables harmless, but clients must treat missing

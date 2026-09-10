@@ -70,7 +70,9 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
             provider_payloads.append(json.dumps(request["messages"]))
             if len(scopes) == 1:
                 ready.set()
-                assert request_tool_approval("write_file", "fixture child approval", rule_key="child-boundary")["approved"]
+                decision = request_tool_approval("write_file", "fixture child approval", rule_key="child-boundary")
+                if not decision["approved"]:
+                    return _mock_response(content="Child approval refused", finish_reason="stop")
                 while not finish.wait(0.02):
                     if self._interrupt_requested:
                         break
@@ -121,13 +123,16 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
             wrong = await client.post(f"/v1/runs/{run_id}/approval", headers={"Authorization": "Bearer wrong"},
                                        json={"choice": "once"})
             assert wrong.status == 401
-            response = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
-                                          json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
-            assert response.status == 200
             if reuse_and_stop:
                 response = await client.post(f"/v1/runs/{run_id}/stop", headers=auth, json={})
                 assert response.status == 200
+                late = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
+                                          json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
+                assert late.status == 409
             else:
+                response = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
+                                              json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
+                assert response.status == 200
                 finish.set()
             terminal = await wait_status(client, run_id, auth, {"completed", "failed", "cancelled"})
             assert terminal["status"] == ("cancelled" if reuse_and_stop else "completed"), terminal
