@@ -104,6 +104,7 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
         ("GET", "/v1/runs/{run_id}/approval", self._handle_run_approvals),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+        ("GET", "/v1/runs/{run_id}/steer", self._handle_get_run_steering),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
 
 
@@ -959,15 +960,20 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
-    # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
-    # agent ref) is what rejects stop-then-steer.
-    if status.get("status") != "running" or not hasattr(agent, "steer"):
-        return _json_error(
-            _openai_error, f"Run is not currently accepting steer input: {run_id}",
-            code="run_not_accepting_steer", status=409)
     body, err = await self._read_json_body(request)
     if err:
         return err
+    if isinstance(body, dict) and "control" in body:
+        from gateway.platforms.api_server_steering import handle
+        return await handle(self, request, _api_server=_api_server, body=body)
+    # Recheck after body I/O: a concurrent stop must not leave a usable parent reference.
+    status = self._run_statuses.get(run_id, status)
+    # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
+    # agent ref) is what rejects stop-then-steer.
+    if run_id in self._stopping_run_ids or status.get("status") != "running" or not hasattr(agent, "steer"):
+        return _json_error(
+            _openai_error, f"Run is not currently accepting steer input: {run_id}",
+            code="run_not_accepting_steer", status=409)
     raw_text = body.get("input") or body.get("message") or body.get("text") or ""
     steer_text = _api_server._normalize_chat_content(raw_text).strip()
     if not steer_text:
@@ -975,7 +981,14 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
             _openai_error, "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
             code="invalid_steer_input", status=400)
     try:
-        accepted = bool(agent.steer(steer_text))
+        if "child_correlation_id" in status or "child_id" in status:
+            from gateway.platforms.api_server_steering import live_target
+            target, child = live_target(self, run_id, agent, status)
+            accepted = bool(child and target["supported"] and child[0].steer(
+                child[1], steer_text, expected_session_id=target["session_id"],
+                expected_turn_id=target["turn_id"]) == "queued")
+        else:
+            accepted = bool(agent.steer(steer_text))
     except Exception as exc:
         logger.exception("[api_server] steer failed for run %s", run_id)
         return _json_error(_openai_error, _api_server._redact_api_error_text(exc), code="steer_failed", status=500)
@@ -984,6 +997,11 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)
     _mark_run_event(self, run_id, "run.steered", accepted=True)
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+
+
+async def _handle_get_run_steering(self, request: "web.Request", *, _api_server) -> "web.Response":
+    from gateway.platforms.api_server_steering import handle
+    return await handle(self, request, _api_server=_api_server)
 
 
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":

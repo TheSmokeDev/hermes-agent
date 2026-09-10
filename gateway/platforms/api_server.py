@@ -84,6 +84,7 @@ _CAPABILITY_ENDPOINTS = (
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_approvals", ("GET", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
+    ("run_steering", ("GET", "/v1/runs/{run_id}/steer")),
     ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
     ("session_create", ("POST", "/api/sessions")),
@@ -2249,6 +2250,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
         from passive_history_ingress import capabilities as passive_capabilities
         from gateway.platforms.api_server_children import capabilities as child_capabilities
+        from gateway.platforms.api_server_steering import capabilities as steer_capabilities
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2262,6 +2264,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "features": {
                 "passive_history": passive_capabilities(),
                 "linked_child_dispatch": child_capabilities(),
+                "run_steering": steer_capabilities(),
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
@@ -3802,6 +3805,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_run_approvals = _run_route_delegate("_handle_run_approvals")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
+    _handle_get_run_steering = _run_route_delegate("_handle_get_run_steering")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
 
     async def _sweep_orphaned_runs(self) -> None:

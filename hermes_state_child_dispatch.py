@@ -10,6 +10,15 @@ from hermes_state_passive_history import (
 
 
 class SessionChildDispatchMixin:
+    def verify_child_steer_origin(self, run_id, *, run_scope, child_id, content, event_id, origin_turn_id, receipt_id):
+        """Reuse exact receipt-owned parent input without appending or searching by text."""
+        with self._read_ctx() as conn:
+            row = conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (run_id,)).fetchone()
+            if row is None or row["state"] != "started" or row["run_scope"] != run_scope or row["child_id"] != child_id:
+                raise PassiveHistoryRetiredError("Child dispatch is unavailable for this owner")
+            return self._child_origin_user(conn, row["requested_session_id"], row["producer"], event_id,
+                                           origin_turn_id, content, receipt_id)
+
     def _child_origin_user(self, conn, session_id, producer, event_id, origin_turn_id, content, receipt_id=None):
         receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
         if receipt is None:
