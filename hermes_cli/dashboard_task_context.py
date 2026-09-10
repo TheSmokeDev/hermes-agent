@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 from typing import Literal
 
@@ -15,6 +16,9 @@ from fastapi import HTTPException, Request
 
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.web_server_cron import _cron_profile_home
+from hermes_cli.web_server_sessions import _open_session_db_for_profile
+from hermes_state_registry import release_or_close
+from hermes_state_store_identity import get_store_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +29,7 @@ class DashboardTaskContext:
     principal_kind: Literal["verified_session", "shared_dashboard_operator"]
     profile_name: str
     profile_home: Path = field(repr=False)
+    store_id: str
 
 
 def _denied():
@@ -69,4 +74,12 @@ def resolve_dashboard_task_context(request: Request, profile: str | None = None)
     if profile is not None and not isinstance(profile, str):
         raise HTTPException(status_code=400, detail="profile must be a string")
     profile_name, profile_home = _cron_profile_home(profile)
-    return DashboardTaskContext(principal_id, principal_kind, profile_name, Path(profile_home))
+    try:
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            store_id = get_store_id(db)
+        finally:
+            release_or_close(db)
+    except (OSError, sqlite3.Error, RuntimeError):
+        raise HTTPException(status_code=503, detail="Canonical profile store identity unavailable") from None
+    return DashboardTaskContext(principal_id, principal_kind, profile_name, Path(profile_home), store_id)

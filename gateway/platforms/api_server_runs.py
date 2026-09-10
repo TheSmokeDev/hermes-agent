@@ -101,6 +101,7 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+        ("GET", "/v1/runs/{run_id}/approval", self._handle_run_approvals),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
@@ -873,6 +874,26 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
 
 
 _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
+
+
+async def _handle_run_approvals(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Read the owning run's live approval queue; cached status metadata is never actionable."""
+    if not self._expected_api_key() and not self._room_grant_token(request):
+        return self._auth_failed_response()
+    run_id, status, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="approve", active_fallback=False)
+    if err is not None:
+        return err
+    state = self._run_statuses.get(run_id, status).get("status", "unknown")
+    if run_id in self._stopping_run_ids and state not in TERMINAL_STATUSES:
+        state = "stopping"
+    pending = []
+    approval_key = self._run_approval_sessions.get(run_id)
+    if approval_key and state != "stopping" and state not in TERMINAL_STATUSES:
+        from tools.approval import list_gateway_approvals
+        pending = list_gateway_approvals(approval_key)
+    return web.json_response({"object": "hermes.run.approvals", "run_id": run_id,
+                              "status": state, "approvals": pending}, headers={"Cache-Control": "no-store"})
 
 
 async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
