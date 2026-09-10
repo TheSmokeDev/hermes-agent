@@ -72,6 +72,7 @@ class SubagentHandle:
     role: str
     depth: int
     capability: str
+    child_session_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -212,6 +213,7 @@ _HANDLE_FIELD_CHECKS: tuple[tuple[str, Callable[[Any], bool]], ...] = (
     ("role", lambda v: isinstance(v, str)),
     ("depth", lambda v: type(v) is int),
     ("capability", lambda v: isinstance(v, str)),
+    ("child_session_id", _opt_str),
 )
 
 # Launch-request rejections in check order: (predicate, error). The type check leads so later predicates may
@@ -270,13 +272,15 @@ class SubagentLifecycleService:
             PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
             getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
             int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
+            child_session_id=_session_id_of(child),
         )
         record = _Record(handle, SubagentState.PENDING, created, agent=child)
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        context = contextvars.copy_context()
+        record.future = _EXECUTOR.submit(context.run, self._run, record, request.goal, parent)
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:

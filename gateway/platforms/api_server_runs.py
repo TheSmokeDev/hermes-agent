@@ -136,7 +136,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     should_persist = (
         status != previous_status
         or status in TERMINAL_STATUSES
-        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"}))
+        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id", "child_id", "child_session_id"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -333,6 +333,8 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     origin_claim: Optional[dict] = None
+    child_request: Optional[dict] = None
+    child_dispatch: Optional[dict] = None
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -404,6 +406,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
     origin = body.get("origin")
+    child_request = body.get("child")
+    if child_request is not None:
+        from gateway.platforms.api_server_children import validate_child_request
+        try:
+            if origin is None:
+                raise ValueError("Linked child work requires its original utterance identity")
+            validate_child_request(child_request)
+        except ValueError as exc:
+            return _json_error(_openai_error, str(exc), code="invalid_child_dispatch", status=400)
     if origin is not None:
         from hermes_state_execution_origins import validate_origin_input
         try:
@@ -415,7 +426,12 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                     or body.get("previous_response_id") or body.get("conversation_history")
                     or room_dispatch is not None or room_execution_policy is not None):
                 raise ValueError("Origin input requires durable idempotency and an existing conversation")
-            validate_origin_input(origin, body.get("input"))
+            if child_request is not None and isinstance(origin, dict) and "receipt_id" in origin:
+                if type(origin["receipt_id"]) is not int or origin["receipt_id"] < 1:
+                    raise ValueError("receipt_id must be positive")
+                validate_origin_input({key: value for key, value in origin.items() if key != "receipt_id"}, body.get("input"))
+            else:
+                validate_origin_input(origin, body.get("input"))
         except ValueError:
             return _json_error(_openai_error, "Invalid authoritative origin request",
                                code="invalid_origin", status=400)
@@ -506,17 +522,28 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
-    origin_claim = None
+    origin_claim = child_dispatch = None
     if origin is not None:
         from passive_history_ingress import PRODUCER, IngressError, error_response
         try:
             db = await self._ensure_session_db_async()
             if db is None:
                 raise IngressError("store_unavailable", 503)
-            origin_claim = await asyncio.to_thread(
-                db.reserve_execution_origin, body["session_id"], producer=PRODUCER,
-                **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope)
-            session_id = origin_claim["session_id"]
+            if child_request is not None:
+                child_dispatch = await asyncio.to_thread(
+                    db.prepare_child_dispatch, body["session_id"], producer=PRODUCER,
+                    **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope,
+                    correlation_id=child_request["correlation_id"], fingerprint=idempotency_fingerprint)
+                session_id = child_dispatch["parent_session_id"]
+                self._set_run_status(run_id, "queued", session_id=session_id,
+                                     parent_message_id=child_dispatch["parent_message_id"],
+                                     origin_event_id=origin["event_id"], origin_turn_id=origin["origin_turn_id"],
+                                     child_correlation_id=child_request["correlation_id"])
+            else:
+                origin_claim = await asyncio.to_thread(
+                    db.reserve_execution_origin, body["session_id"], producer=PRODUCER,
+                    **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope)
+                session_id = origin_claim["session_id"]
         except (ValueError, RuntimeError, sqlite3.Error) as exc:
             error, status = error_response(exc)
             # No task was scheduled. Do not replay this durable admission as 202, or release
@@ -537,7 +564,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        origin_claim=origin_claim, turn_author=turn_author)
+        origin_claim=origin_claim, child_request=child_request, child_dispatch=child_dispatch,
+        turn_author=turn_author)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -604,11 +632,17 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                     "persist_user_platform_id": "origin:" + run.origin_claim["event_id"],
                     "persist_user_display_metadata": {"execution_origin": origin_metadata(run.origin_claim)},
                 }
-            # Passed only when set: a human turn keeps today's call shape.
+            # Author labels remain attribution-only, including alongside origin metadata.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **origin_kwargs, **author_kwargs)
+            if run.child_request is not None:
+                from gateway.platforms.api_server_children import run_child_sync
+                from tools.approval_context import bind_api_run_approval_transport
+                with bind_api_run_approval_transport(run.approval_session_key, approval_notify):
+                    r = run_child_sync(self, run, agent)
+            else:
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id, **origin_kwargs, **author_kwargs)
         finally:
             if run.origin_claim is not None:
                 if had_origin_claim:
@@ -683,8 +717,21 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage = await loop.run_in_executor(
+        execution = loop.run_in_executor(
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        if run.child_request is not None:
+            from gateway.platforms.api_server_children import cancel_linked_child
+            while True:
+                try:
+                    result, usage = await asyncio.shield(execution)
+                    break
+                except asyncio.CancelledError:
+                    self._stopping_run_ids.add(run_id)
+                    cancel_linked_child(agent, approval_key=run.approval_session_key)
+                    with suppress(Exception):
+                        _api_server.request_hard_interrupt(agent, "API run task cancelled")
+        else:
+            result, usage = await execution
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
@@ -831,7 +878,7 @@ _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "onc
 async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, run_status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -864,6 +911,11 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             return _json_error(_openai_error, message, code=code, status=status)
     try:
         from tools.approval import resolve_gateway_approval
+        # Body parsing awaited after authorization; stop/completion may have landed since.
+        current_status = self._run_statuses.get(run_id, run_status).get("status")
+        if run_id in self._stopping_run_ids or current_status == "stopping" or current_status in TERMINAL_STATUSES:
+            return _json_error(_openai_error, "Run no longer accepts approval decisions",
+                               code="approval_not_active", status=409)
         resolved = resolve_gateway_approval(
             approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
     except Exception as exc:
@@ -928,6 +980,8 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    from gateway.platforms.api_server_children import cancel_linked_child
+    cancel_linked_child(agent, approval_key=self._run_approval_sessions.get(run_id))
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
