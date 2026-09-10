@@ -342,7 +342,7 @@ class SessionMessagesMixin:
     def append_messages_batch(
         self, session_id: str, messages: List[Dict[str, Any]], compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, chunk_rows: Optional[int] = None,
-        turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_ttl_seconds: float = 300.0, _execution_origin=None) -> int:
         """Append *messages* in ONE write txn (all rows land or none, guards run once); returns the inserted
         count. ``chunk_rows`` bounds txn size for LARGE copies (branch seeds; FTS triggers run per row)."""
         if not messages:
@@ -350,15 +350,20 @@ class SessionMessagesMixin:
         if chunk_rows is not None and len(messages) > chunk_rows:
             return sum(self.append_messages_batch(session_id, messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
-                    turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                    turn_lease_ttl_seconds=turn_lease_ttl_seconds, _execution_origin=_execution_origin)
                 for start in range(0, len(messages), chunk_rows))
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+            fresh, binding = messages, None
+            if _execution_origin is not None:
+                fresh, binding = self._prepare_execution_origin_batch(conn, session_id, messages, _execution_origin)
             from agent.transcript_repair import resolve_and_repair_transcript_batch
-            inserted_rows = resolve_and_repair_transcript_batch(conn, session_id, messages,
+            inserted_rows = resolve_and_repair_transcript_batch(conn, session_id, fresh,
                 encode_content_fn=self._encode_content, decode_content_fn=self._decode_content)
             inserted, tool_calls_total = self._insert_message_rows(conn, session_id, inserted_rows)
+            if _execution_origin is not None:
+                self._bind_execution_origin_row(conn, session_id, _execution_origin, binding)
             self._bump_session_counters(conn, session_id, inserted, tool_calls_total, unit=False)
             return inserted
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)

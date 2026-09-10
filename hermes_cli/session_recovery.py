@@ -29,6 +29,7 @@ _CANONICAL_TABLES = (
     # a retry re-inserting deleted content. Copied WITH their ids (shared-column copy) so revisions and
     # spent identities survive recovery; a source predating the table simply reports "missing".
     "passive_history_commits",
+    "execution_origins",
 )
 _TOPIC_TABLES = ("telegram_dm_topic_mode", "telegram_dm_topic_bindings")
 

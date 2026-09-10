@@ -42,7 +42,7 @@ async def get_capabilities(request: Request):
 
 def _dispatch(profile, principal, operation, body):
     resolved = _cron_profile_home(profile)[0] if profile else _cron_default_profile()
-    db = _open_session_db_for_profile(profile, read_only=operation in {"snapshot", "reconcile"})
+    db = _open_session_db_for_profile(profile, read_only=operation in {"snapshot", "reconcile", "adopt"})
     try:
         return service.dispatch(db, profile=resolved, principal=principal, operation=operation, body=body)
     finally:
