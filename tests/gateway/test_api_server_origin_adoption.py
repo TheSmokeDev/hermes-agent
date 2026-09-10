@@ -113,7 +113,8 @@ async def test_tip_handoff_keeps_run_scoped_approval_and_operator_memory_key(tmp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_first_write", [False, True])
-async def test_accepted_origin_waits_for_real_user_row(tmp_path, monkeypatch, failed_first_write):
+@pytest.mark.parametrize("turn_author", [None, {"id": "bot:fixture", "name": "Fixture", "is_bot": True}])
+async def test_accepted_origin_waits_for_real_user_row(tmp_path, monkeypatch, failed_first_write, turn_author):
     from tests.run_agent.test_run_agent import _mock_response
     root = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_HOME", str(root))
@@ -139,6 +140,8 @@ async def test_accepted_origin_waits_for_real_user_row(tmp_path, monkeypatch, fa
                         provider="openrouter", model="test-model", session_id="conversation",
                         session_db=db, quiet_mode=True, skip_context_files=True, skip_memory=True)
     agent.client = MagicMock()
+    run_conversation = MagicMock(wraps=agent.run_conversation)
+    monkeypatch.setattr(agent, "run_conversation", run_conversation)
     agent._cached_system_prompt = "cached system prompt\n"
     agent._use_prompt_caching = False
     agent.compression_enabled = False
@@ -199,6 +202,8 @@ async def test_accepted_origin_waits_for_real_user_row(tmp_path, monkeypatch, fa
     base = "/p/alpha/v1/passive-history"
     run_body = {"session_id": "conversation", "input": "original spoken request",
                 "origin": {"event_id": "event", "origin_turn_id": "utterance"}}
+    if turn_author is not None:
+        run_body["author"] = turn_author
     try:
         assert (await client.post("/p/alpha/v1/runs", headers=auth, json=run_body)).status == 400
         response_202 = await client.post("/p/alpha/v1/runs", headers=run_auth, json=run_body)
@@ -236,6 +241,9 @@ async def test_accepted_origin_waits_for_real_user_row(tmp_path, monkeypatch, fa
         assert [(row["role"], row["content"]) for row in rows[len(prefix):]] == [
             ("user", "original spoken request"), ("assistant", "answer to original request")]
         assert proof["message_ids"] == [rows[-2]["id"]]
+        first_call = run_conversation.call_args_list[0].kwargs
+        assert first_call.get("turn_author") == turn_author
+        assert first_call["persist_user_message"] == "original spoken request"
         assert provider_saw == ["pending" if failed_first_write else "adopted"]
         assert not hasattr(agent, "_execution_origin_claim")
         assert agent._cached_system_prompt == "cached system prompt\n"

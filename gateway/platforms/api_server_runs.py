@@ -333,6 +333,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     origin_claim: Optional[dict] = None
+    turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
     def approval_session_key(self) -> str:
@@ -434,6 +435,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
     if not user_message:
         return _json_error(_openai_error, "No user message found in input", status=400)
+    try:
+        turn_author = _api_server._request_turn_author(body)
+    except ValueError as exc:
+        return _json_error(_openai_error, str(exc), code="invalid_author", status=400)
     conversation_history, instructions, stored_session_id, history_err = (
         _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
     if history_err is not None:
@@ -532,7 +537,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        origin_claim=origin_claim)
+        origin_claim=origin_claim, turn_author=turn_author)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -599,9 +604,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                     "persist_user_platform_id": "origin:" + run.origin_claim["event_id"],
                     "persist_user_display_metadata": {"execution_origin": origin_metadata(run.origin_claim)},
                 }
+            # Passed only when set: a human turn keeps today's call shape.
+            author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **origin_kwargs)
+                task_id=effective_task_id, **origin_kwargs, **author_kwargs)
         finally:
             if run.origin_claim is not None:
                 if had_origin_claim:
