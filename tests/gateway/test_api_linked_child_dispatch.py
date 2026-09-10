@@ -31,11 +31,13 @@ async def wait_status(client, run_id, auth, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reuse_and_stop", [False, True])
-async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, monkeypatch, reuse_and_stop):
+@pytest.mark.parametrize("reuse_and_stop,pause_mode", [(False, None), (True, None), (True, "stop"), (True, "cancel")])
+async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, monkeypatch, reuse_and_stop, pause_mode):
     from tests.run_agent.test_run_agent import _mock_response
     from tools.approval_context import get_current_session_key
     from tools.approval import request_tool_approval
+    from agent.subagent_lifecycle import SubagentLifecycleService
+    from tools import approval, approval_gateway_wait
     root = tmp_path / "hermes"
     root.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(root))
@@ -54,6 +56,29 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
     adapter._session_db = db
     parents, children, scopes, provider_payloads = [], [], [], []
     ready, finish = threading.Event(), threading.Event()
+    handle_created, publish_control = threading.Event(), threading.Event()
+    wait_entered, release_approval_wait = threading.Event(), threading.Event()
+    decisions = []
+    if pause_mode:
+        real_launch = SubagentLifecycleService.launch
+        def paused_launch(service, request):
+            handle = real_launch(service, request)
+            handle_created.set()
+            assert publish_control.wait(10)
+            return handle
+        monkeypatch.setattr(SubagentLifecycleService, "launch", paused_launch)
+        real_entry = approval_gateway_wait._ApprovalEntry
+        def barrier_entry(data):
+            entry = real_entry(data)
+            event_wait = entry.event.wait
+            def paused_wait(timeout=None):
+                # The real approval poll has already checked interruption before this wait.
+                wait_entered.set()
+                assert release_approval_wait.wait(10)
+                return event_wait(timeout)
+            entry.event.wait = paused_wait
+            return entry
+        monkeypatch.setattr(approval_gateway_wait, "_ApprovalEntry", barrier_entry)
     original_run = AIAgent.run_conversation
 
     def child_only(self, *args, **kwargs):
@@ -71,6 +96,7 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
             if len(scopes) == 1:
                 ready.set()
                 decision = request_tool_approval("write_file", "fixture child approval", rule_key="child-boundary")
+                decisions.append(decision)
                 if not decision["approved"]:
                     return _mock_response(content="Child approval refused", finish_reason="stop")
                 while not finish.wait(0.02):
@@ -124,11 +150,36 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
                                        json={"choice": "once"})
             assert wrong.status == 401
             if reuse_and_stop:
-                response = await client.post(f"/v1/runs/{run_id}/stop", headers=auth, json={})
-                assert response.status == 200
-                late = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
-                                          json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
-                assert late.status == 409
+                if pause_mode:
+                    assert await asyncio.to_thread(handle_created.wait, 5)
+                    assert await asyncio.to_thread(wait_entered.wait, 5)
+                    assert getattr(parents[0], "_api_linked_child_control", None) is None
+                    # State admission must refuse even while the callback/queue still exists.
+                    prior_phase = adapter._run_statuses[run_id]["status"]
+                    try:
+                        for blocked_phase in ("stopping", "completed"):
+                            adapter._run_statuses[run_id]["status"] = blocked_phase
+                            blocked = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
+                                json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
+                            assert blocked.status == 409
+                            assert approval.get_pending_gateway_approval(run_id)["request_id"] == waiting["approval"]["request_id"]
+                    finally:
+                        adapter._run_statuses[run_id]["status"] = prior_phase
+                if pause_mode == "cancel":
+                    adapter._active_run_tasks[run_id].cancel()
+                    await asyncio.sleep(0)
+                    assert run_id in adapter._stopping_run_ids
+                else:
+                    response = await client.post(f"/v1/runs/{run_id}/stop", headers=auth, json={})
+                    assert response.status == 200
+                try:
+                    late = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
+                                              json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
+                    assert late.status == 409
+                    assert approval._gateway_notify_cb(run_id) is None
+                finally:
+                    release_approval_wait.set()
+                    publish_control.set()
             else:
                 response = await client.post(f"/v1/runs/{run_id}/approval", headers=auth,
                                               json={"choice": "once", "request_id": waiting["approval"]["request_id"]})
@@ -136,6 +187,8 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
                 finish.set()
             terminal = await wait_status(client, run_id, auth, {"completed", "failed", "cancelled"})
             assert terminal["status"] == ("cancelled" if reuse_and_stop else "completed"), terminal
+            if reuse_and_stop:
+                assert not any(decision["approved"] for decision in decisions)
             parent_rows = db.get_messages("parent")
             if before:
                 assert parent_rows == before
@@ -169,6 +222,8 @@ async def test_child_goal_is_separate_and_run_owns_approval_and_stop(tmp_path, m
                 await peer.close()
                 await restarted.disconnect()
     finally:
+        release_approval_wait.set()
+        publish_control.set()
         finish.set()
         await client.close()
         await adapter.disconnect()

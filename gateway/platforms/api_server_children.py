@@ -32,12 +32,15 @@ def validate_child_request(child):
             raise ValueError("allowed_toolsets must be a nonempty bounded list of known toolsets")
 
 
-def cancel_linked_child(parent):
-    control = getattr(parent, "_api_linked_child_control", None)
-    if control is not None:
-        from tools.approval import unregister_gateway_notify
-        service, handle, approval_key = control
+def cancel_linked_child(parent, *, approval_key):
+    # The child is live as soon as launch submits it, before the handle is published here.
+    # Revoke the owning run's transport first, even during that publication gap.
+    from tools.approval import unregister_gateway_notify
+    if approval_key:
         unregister_gateway_notify(approval_key)
+    control = getattr(parent, "_api_linked_child_control", None)
+    if control is not None and control[2] == approval_key:
+        service, handle, _ = control
         service.cancel(handle, reason="Owning API run stopped")
 
 
@@ -74,7 +77,7 @@ def run_child_sync(adapter, run, parent):
                                 parent_message_id=dispatch["parent_message_id"],
                                 last_event=current.get("last_event") if phase != "running" else "child.started")
         if run.run_id in adapter._stopping_run_ids:
-            cancel_linked_child(parent)
+            cancel_linked_child(parent, approval_key=run.approval_session_key)
         service.wait(handle)
         result = service.result(handle)
         interrupted = result.terminal_state in {SubagentState.INTERRUPTED, SubagentState.CANCELLED}

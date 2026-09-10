@@ -727,7 +727,9 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                     break
                 except asyncio.CancelledError:
                     self._stopping_run_ids.add(run_id)
-                    cancel_linked_child(agent)
+                    cancel_linked_child(agent, approval_key=run.approval_session_key)
+                    with suppress(Exception):
+                        _api_server.request_hard_interrupt(agent, "API run task cancelled")
         else:
             result, usage = await execution
         if not isinstance(result, dict):
@@ -876,7 +878,7 @@ _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "onc
 async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, run_status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -909,6 +911,11 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             return _json_error(_openai_error, message, code=code, status=status)
     try:
         from tools.approval import resolve_gateway_approval
+        # Body parsing awaited after authorization; stop/completion may have landed since.
+        current_status = self._run_statuses.get(run_id, run_status).get("status")
+        if run_id in self._stopping_run_ids or current_status == "stopping" or current_status in TERMINAL_STATUSES:
+            return _json_error(_openai_error, "Run no longer accepts approval decisions",
+                               code="approval_not_active", status=409)
         resolved = resolve_gateway_approval(
             approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
     except Exception as exc:
@@ -973,9 +980,9 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    from gateway.platforms.api_server_children import cancel_linked_child
+    cancel_linked_child(agent, approval_key=self._run_approval_sessions.get(run_id))
     if agent is not None:
-        from gateway.platforms.api_server_children import cancel_linked_child
-        cancel_linked_child(agent)
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
