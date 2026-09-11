@@ -57,9 +57,17 @@ def register(ctx):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("cancel", [False, True, "active-delete"])
 async def test_worker_discovery_origin_controls_profile_fences_and_terminal_result(tmp_path, monkeypatch, cancel):
     task_worker_registry._reset_for_tests()
+    timers=[]
+    if cancel == "active-delete":
+        from agent import periodic_scheduler
+        original_schedule=periodic_scheduler.schedule
+        def schedule(callback, interval, *args, **kwargs):
+            timers.append(callback)
+            return original_schedule(callback, interval, *args, **kwargs)
+        monkeypatch.setattr(periodic_scheduler,"schedule",schedule)
     monkeypatch.setattr(AIAgent, "run_conversation", lambda *a, **kw: pytest.fail("parent model ran"))
     monkeypatch.setattr("agent.model_metadata.fetch_model_metadata", lambda *a, **kw: {})
     async with gateway(tmp_path, monkeypatch) as (root, keys, stores, adapter, client):
@@ -114,6 +122,17 @@ async def test_worker_discovery_origin_controls_profile_fences_and_terminal_resu
                 session=provider.sessions[0]
                 assert session.request.profile=="alpha" and session.request.profile_home==home
                 assert session.request.still_authorized()
+                if cancel == "active-delete":
+                    child_id=session.request.child_session_id
+                    db.delete_session("same-session")
+                    assert db.get_session(child_id) is None and db.get_messages(child_id)==[]
+                    assert not session.request.still_authorized()
+                    assert timers
+                    for callback in timers: callback()
+                    assert session.cancelled
+                    await asyncio.wait_for(status_in({"failed"}),10)
+                    assert db.get_session(child_id) is None and db.get_messages(child_id)==[]
+                    return
                 assert initial["child_session_id"]==session.request.child_session_id
                 assert [row["content"] for row in db.get_messages("same-session")]==[body["input"]]
                 target=await (await client.get(route+"/steer",headers=auth)).json()
@@ -145,6 +164,11 @@ async def test_worker_discovery_origin_controls_profile_fences_and_terminal_resu
                 assert [row["content"] for row in db.get_messages(session.request.child_session_id)]==[
                     body["child"]["goal"],"Full external result"]
                 assert [row["content"] for row in db.get_messages("same-session")]==[body["input"],text]
+                child_id=session.request.child_session_id
+                db.delete_session("same-session")
+                assert db.get_session(child_id) is None
+                assert db.get_messages(child_id)==[]
+                assert not session.request.still_authorized()
         finally:
             if session: session.finish.set()
             task_worker_registry._reset_for_tests()

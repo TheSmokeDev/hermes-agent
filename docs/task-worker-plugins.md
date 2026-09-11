@@ -18,13 +18,15 @@ The host creates a canonical child, acquires and renews its writer lease, persis
 derived worker goal, and supplies immutable owner/profile/action/origin data. A worker
 never runs the parent model. The request's read-only `still_authorized()` callback
 checks canonical parent/child/origin retention and must guard external writes. Canonical
-owner loss cancels active work. Worker results may include full output and an artifact
+owner or exact lease-holder loss irrevocably retires active work. Worker children carry
+the standard `_delegate_from` marker, so canonical parent deletion removes their messages
+and sessions through the existing deletion path. Worker results may include full output and an artifact
 array; failure/cancellation preserves available partial output.
 
 Existing owning-run steering/approval/stop routes remain the only control routes. A
 worker exposes its current turn and queues origin-linked corrections under the host's
 durable action reservation. Exact parent receipt verification precedes queueing. The
-API reports queue acknowledgement, never inferred application. Legacy uncorrelated
+API keeps bounded external approval delivery off the event loop and reports queue acknowledgement, never inferred application. Legacy uncorrelated
 steering is refused for external workers. Pending approvals come from the active worker
 session and require their exact original request ID; replay, resolve-all and stale
 requests cannot acquire new authority. No permanent grants are added.

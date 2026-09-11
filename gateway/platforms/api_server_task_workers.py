@@ -11,22 +11,28 @@ from agent.task_worker_registry import configured_worker
 
 
 class WorkerBinding:
-    def __init__(self, session, run_id, child_id):
+    def __init__(self, session, run_id, child_id, authorize):
         self.session, self.run_id, self.child_id = session, run_id, child_id
+        self.authorize = authorize
         self.active = True
 
     def steering(self):
         target = self.session.steering()
-        if not self.active or not isinstance(target, dict) or target.get("supported") is not True:
+        if not self.active or not self.authorize() or not isinstance(target, dict) or target.get("supported") is not True:
             return {"supported": False, "reason": "worker_not_available"}
         return {**target, "session_id": self.child_id, "child_id": self.child_id,
                 "kind": "linked_child"}
 
     def steer(self, text, **control):
-        if not self.active or control["expected_session_id"] != self.child_id:
+        if not self.active or not self.authorize() or control["expected_session_id"] != self.child_id:
             return "rejected"
         state = self.session.steer(text, **control)
         return state if state in {"queued", "rejected", "unsupported", "unknown"} else "unknown"
+
+    def approve(self, request_id, choice):
+        if not self.active or not self.authorize():
+            raise ValueError("Worker approval is no longer authorized")
+        return self.session.approve(request_id, choice)
 
     def cancel(self):
         if self.active:
@@ -48,7 +54,7 @@ def run_worker_sync(adapter, run, parent):
     db = parent._session_db
     child_id = "worker-" + uuid.uuid4().hex
     db.create_session(child_id, source="subagent", parent_session_id=dispatch["parent_session_id"],
-                      model_config={"task_worker": provider.name})
+                      model_config={"task_worker": provider.name, "_delegate_from": dispatch["parent_session_id"]})
     holder = f"pid={os.getpid()}:turn={run.run_id}:platform=task_worker"
     if not db.acquire_session_turn_lease(child_id, holder, ttl_seconds=30, wait_seconds=0):
         raise ValueError("Task worker child is busy")
@@ -56,7 +62,13 @@ def run_worker_sync(adapter, run, parent):
     retired = threading.Event()
 
     def authorized():
-        return db.child_dispatch_is_current(run.run_id, run_scope=dispatch["run_scope"], child_id=child_id)
+        if retired.is_set():
+            return False
+        try:
+            return db.child_dispatch_is_current(run.run_id, run_scope=dispatch["run_scope"],
+                                                child_id=child_id, lease_holder=holder)
+        except Exception:
+            return False
 
     def report(data):
         if not isinstance(data, dict):
@@ -82,7 +94,7 @@ def run_worker_sync(adapter, run, parent):
             context=request.get("context") or "", report=report, still_authorized=authorized))
         if not isinstance(session, TaskWorkerSession):
             raise ValueError("Task worker returned an invalid session")
-        binding = WorkerBinding(session, run.run_id, child_id)
+        binding = WorkerBinding(session, run.run_id, child_id, authorized)
         parent._api_task_worker = binding
 
         def refresh():

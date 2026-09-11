@@ -936,7 +936,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             or self._run_statuses.get(run_id, run_status).get("status") in TERMINAL_STATUSES):
             return _json_error(_openai_error, "Exact active worker approval required", status=409)
         try:
-            receipt = worker.session.approve(request_id, choice)
+            receipt = await asyncio.to_thread(worker.approve, request_id, choice)
         except ValueError:
             return _json_error(_openai_error, "Worker approval is no longer current", status=409)
         return web.json_response({"object": "hermes.run.approval_response", "run_id": run_id,
