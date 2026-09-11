@@ -8,13 +8,15 @@ from hermes_state_passive_history import _validated_identifier
 
 
 def capabilities():
+    from agent.task_worker_registry import available_workers
     return {"version": 1, "supported": True, "origin_sources": ["fresh", "passive_receipt"],
             "max_goal_chars": 16000, "max_context_chars": 32000,
-            "separate_child_goal": True, "owning_run_approvals": True, "restart_relaunch": False}
+            "separate_child_goal": True, "owning_run_approvals": True, "restart_relaunch": False,
+            "external_workers": {"version": 1, "names": available_workers()}}
 
 
 def validate_child_request(child):
-    required, optional = {"goal", "correlation_id"}, {"context", "allowed_toolsets"}
+    required, optional = {"goal", "correlation_id"}, {"context", "allowed_toolsets", "worker"}
     if not isinstance(child, dict) or not required <= set(child) or set(child) - required - optional:
         raise ValueError("child requires goal/correlation_id and supported optional fields only")
     if not isinstance(child["goal"], str) or not child["goal"].strip() or len(child["goal"]) > 16000:
@@ -23,6 +25,11 @@ def validate_child_request(child):
     context = child.get("context")
     if context is not None and (not isinstance(context, str) or len(context) > 32000):
         raise ValueError("child context must be at most 32000 characters")
+    if "worker" in child:
+        from agent.task_worker_registry import configured_worker
+        _validated_identifier(child["worker"], "worker", 128)
+        if "allowed_toolsets" in child or configured_worker(child["worker"]) is None:
+            raise ValueError("External worker is unavailable or has incompatible toolset overrides")
     requested = child.get("allowed_toolsets")
     if requested is not None:
         from toolsets import TOOLSETS
@@ -36,6 +43,10 @@ def cancel_linked_child(parent, *, approval_key):
     # The child is live as soon as launch submits it, before the handle is published here.
     # Revoke the owning run's transport first, even during that publication gap.
     from tools.approval import unregister_gateway_notify
+    from gateway.platforms.api_server_task_workers import current_worker
+    worker = current_worker(parent, approval_key)
+    if worker is not None:
+        worker.cancel()
     if approval_key:
         unregister_gateway_notify(approval_key)
     control = getattr(parent, "_api_linked_child_control", None)
@@ -53,6 +64,9 @@ def run_child_sync(adapter, run, parent):
     if db is None or str(getattr(parent, "session_id", "")) != dispatch["parent_session_id"]:
         raise ValueError("Linked child dispatch requires the authorized parent and its durable store")
     db.claim_child_dispatch(dispatch)
+    if "worker" in request:
+        from gateway.platforms.api_server_task_workers import run_worker_sync
+        return run_worker_sync(adapter, run, parent)
     service = SubagentLifecycleService(lambda: parent)
     handle = None
     prior_turn = getattr(parent, "_current_turn_id", None)

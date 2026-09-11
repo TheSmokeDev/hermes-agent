@@ -23,6 +23,10 @@ def live_target(adapter, run_id, agent, status):
     from agent.run_steering import steering_target
     if run_id in adapter._stopping_run_ids or status.get("status") not in {"running", "waiting_for_approval"}:
         return {"supported": False, "reason": "run_not_accepting_steer"}, None
+    from gateway.platforms.api_server_task_workers import current_worker
+    worker = current_worker(agent, run_id)
+    if worker is not None:
+        return worker.steering(), worker
     control = getattr(agent, "_api_linked_child_control", None)
     linked = "child_correlation_id" in status or "child_id" in status or control is not None
     if linked:
@@ -141,7 +145,10 @@ async def handle(adapter, request, *, _api_server, body=None):
             return response(receipt)
         try:
             kw = {"expected_session_id": control["expected_session_id"], "expected_turn_id": control["expected_turn_id"]}
-            if child is not None:
+            from gateway.platforms.api_server_task_workers import WorkerBinding
+            if isinstance(child, WorkerBinding):
+                state = child.steer(text, action_id=action_id, **kw)
+            elif child is not None:
                 state = child[0].steer(child[1], text, **kw)
             else:
                 from agent.run_steering import steer_current_turn

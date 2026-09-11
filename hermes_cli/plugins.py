@@ -1004,6 +1004,9 @@ class PluginContext:
 # the displaced entry. Rows: (method, kind, registry module, base-class module:attr, label, docstring,
 # options). ``normalize``: ``strip`` (default), ``lower`` (strip+lowercase) or ``None`` (raw name).
 _SCOPED_PROVIDER_REGISTRARS: Tuple[Tuple[str, str, str, str, str, str, Dict[str, Any]], ...] = (
+    ("register_task_worker_provider", "task_worker_provider", "agent.task_worker_registry",
+     "agent.task_worker_provider:TaskWorkerProvider", "task worker provider",
+     "Register an installed, profile-scoped TaskWorkerProvider for authenticated linked-child jobs.", {}),
     ("register_image_gen_provider", "image_gen_provider", "agent.image_gen_registry",
      "agent.image_gen_provider:ImageGenProvider", "image_gen provider",
      "Register an :class:`agent.image_gen_provider.ImageGenProvider`; "

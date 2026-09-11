@@ -415,6 +415,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             if origin is None:
                 raise ValueError("Linked child work requires its original utterance identity")
             validate_child_request(child_request)
+            if "worker" in child_request and room_dispatch is not None:
+                raise ValueError("External workers require an explicitly authorized gateway job")
         except ValueError as exc:
             return _json_error(_openai_error, str(exc), code="invalid_child_dispatch", status=400)
     if origin is not None:
@@ -736,15 +738,17 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             result, usage = await execution
         if not isinstance(result, dict):
             result = {}
+        artifact_fields = {"artifacts": result["artifacts"]} if result.get("artifacts") else {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
-            _finish("cancelled")
+            _finish("cancelled", artifact_fields, output=result.get("final_response", ""))
         elif result.get("failed"):
             # Non-retryable client errors (401/400) return failed=True rather than raising.
-            _finish("failed", error=_redact_api_error_text(result.get("error") or "agent run failed"))
+            _finish("failed", artifact_fields, output=result.get("final_response", ""),
+                    error=_redact_api_error_text(result.get("error") or "agent run failed"))
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
-            _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
+            _finish("completed", {**extra, **artifact_fields}, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
         _finish("cancelled")
         raise
@@ -888,7 +892,15 @@ async def _handle_run_approvals(self, request: "web.Request", *, _api_server) ->
     state = self._run_statuses.get(run_id, status).get("status", "unknown")
     if run_id in self._stopping_run_ids and state not in TERMINAL_STATUSES:
         state = "stopping"
+    from gateway.platforms.api_server_task_workers import current_worker
+    worker = current_worker(self._active_run_agents.get(run_id), run_id)
     pending = []
+    if worker is not None and state not in TERMINAL_STATUSES and state != "stopping":
+        pending = worker.session.approvals()
+        for item in pending:
+            item["description"] = _api_server.redact_sensitive_text(str(item.get("description", "")))
+        return web.json_response({"object": "hermes.run.approvals", "run_id": run_id,
+                                  "status": state, "approvals": pending}, headers={"Cache-Control": "no-store"})
     approval_key = self._run_approval_sessions.get(run_id)
     if approval_key and state != "stopping" and state not in TERMINAL_STATUSES:
         from tools.approval import list_gateway_approvals
@@ -916,6 +928,19 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     # Room grants may resolve exactly one request and never widen to session/always.
     allowed = {"once", "deny"} if room_scoped else {"once", "session", "always", "deny"}
     resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
+    from gateway.platforms.api_server_task_workers import current_worker
+    worker = current_worker(self._active_run_agents.get(run_id), run_id)
+    if worker is not None:
+        if (not request_id or resolve_all or choice not in {"once", "session", "deny"}
+            or (room_scoped and choice == "session") or run_id in self._stopping_run_ids
+            or self._run_statuses.get(run_id, run_status).get("status") in TERMINAL_STATUSES):
+            return _json_error(_openai_error, "Exact active worker approval required", status=409)
+        try:
+            receipt = worker.session.approve(request_id, choice)
+        except ValueError:
+            return _json_error(_openai_error, "Worker approval is no longer current", status=409)
+        return web.json_response({"object": "hermes.run.approval_response", "run_id": run_id,
+                                  **receipt}, headers={"Cache-Control": "no-store"})
     approval_session_key = self._run_approval_sessions.get(run_id)
     for failed, message, code, status in (
         (raw_request_id is not None and (not request_id or len(request_id) > 256),
@@ -966,6 +991,9 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     if isinstance(body, dict) and "control" in body:
         from gateway.platforms.api_server_steering import handle
         return await handle(self, request, _api_server=_api_server, body=body)
+    from gateway.platforms.api_server_task_workers import current_worker
+    if current_worker(agent, run_id) is not None:
+        return _json_error(_openai_error, "Worker steering requires an origin-linked control", status=409)
     # Recheck after body I/O: a concurrent stop must not leave a usable parent reference.
     status = self._run_statuses.get(run_id, status)
     # /stop keeps agent refs during cooperative shutdown, so the status gate (not the

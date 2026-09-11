@@ -116,6 +116,15 @@ class SessionChildDispatchMixin:
             return dict(conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (run_id,)).fetchone())
         return self._execute_write(write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def child_dispatch_is_current(self, run_id, *, run_scope, child_id):
+        """Read-only ownership proof for a plugin worker; deletion/retirement revokes it."""
+        with self._read_ctx() as conn:
+            return conn.execute(
+                "SELECT 1 FROM child_dispatches d JOIN sessions p ON p.id=d.parent_session_id "
+                "JOIN sessions c ON c.id=d.child_session_id JOIN messages m ON m.id=d.parent_message_id "
+                "WHERE d.run_id=? AND d.run_scope=? AND d.child_id=? AND d.state='started'",
+                (run_id, run_scope, child_id)).fetchone() is not None
+
     def claim_child_dispatch(self, dispatch):
         def write(conn):
             row = conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (dispatch["run_id"],)).fetchone()
