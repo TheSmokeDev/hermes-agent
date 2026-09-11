@@ -20,11 +20,13 @@ from tests.run_agent.test_steer import _bare_agent
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recorded", [False, True])
-async def test_ordinary_origin_has_one_row_and_preserves_cached_prefix(tmp_path, monkeypatch, recorded):
+@pytest.mark.parametrize("legacy_followup", [False, True])
+async def test_ordinary_origin_has_one_row_and_preserves_cached_prefix(tmp_path, monkeypatch, recorded, legacy_followup):
     ready, finish = threading.Event(), threading.Event()
     agents, payloads = [], []
     real_run = AIAgent.run_conversation
-    text, wire = "Please use the revised constraint", "Exact existing API correction bytes"
+    text = " \tPlease use the revised\nconstraint  "
+    wire = "Exact existing API correction bytes"
     monkeypatch.setattr("agent.model_metadata.fetch_model_metadata", lambda *a, **k: {})
     async with gateway(tmp_path, monkeypatch) as (_, keys, stores, adapter, client):
         db = stores["alpha"]
@@ -127,7 +129,7 @@ async def test_ordinary_origin_has_one_row_and_preserves_cached_prefix(tmp_path,
                 assert delayed.message_ids == (receipts[0]["parent_message_id"],)
                 assert delayed.revision == receipts[0]["origin"]["receipt_id"]
                 # Queue admission followed by a lost outcome remains unknown and never requeues.
-                uncertain_text = "Retain the original deadline"
+                uncertain_text = "  Retain the original\ndeadline\t "
                 uncertain = {"input": uncertain_text, "control": {**control, "action_id": "uncertain", "origin": {
                     "event_id": "uncertain-event", "origin_turn_id": "uncertain-turn"}}}
                 with patch.object(store, "settle_steer_receipt", side_effect=RuntimeError("fixture settlement failure")):
@@ -136,7 +138,8 @@ async def test_ordinary_origin_has_one_row_and_preserves_cached_prefix(tmp_path,
                 assert unknown["status"] == "unknown" and unknown["evidence"] == "reserved_before_queue"
                 assert await (await client.get(path + "?action_id=uncertain", headers=auth)).json() == unknown
                 # Mixed legacy input uses the same queue and retains its own ordinary persistence.
-                assert (await client.post(path, headers=auth, json={"input": "Legacy follow-up"})).status == 200
+                if legacy_followup:
+                    assert (await client.post(path, headers=auth, json={"input": "Legacy follow-up"})).status == 200
                 assert await (await client.get(path + "?action_id=origin-action", headers=auth)).json() == receipts[0]
                 assert (await client.post(path, headers=auth, json={**body, "input": "Changed correction"})).status == 409
                 finish.set()
@@ -159,10 +162,15 @@ async def test_ordinary_origin_has_one_row_and_preserves_cached_prefix(tmp_path,
                 tail = payloads[1][len(payloads[0]):]
                 # The provider's existing alternation adapter joins adjacent user copies.
                 # Check the entire composed wire value, including the exact origin bytes.
-                assert tail[-1]["content"] == "\n\n".join([
-                    wire if recorded else text, uncertain_text, steer_user_row("Legacy follow-up")["content"]])
+                expected = [wire if recorded else text, uncertain_text]
+                if legacy_followup:
+                    expected.append(steer_user_row("Legacy follow-up")["content"])
+                assert tail[-1]["content"] == "\n\n".join(expected)
+                assert not any(key.startswith("_exact_steer_") for payload in payloads
+                               for message in payload for key in message)
                 assert sum(row["content"] == uncertain_text for row in rows) == 1
-                assert sum(row.get("display_kind") == "steer" and "Legacy follow-up" in row["content"] for row in rows) == 1
+                assert sum(row.get("display_kind") == "steer" and "Legacy follow-up" in row["content"]
+                           for row in rows) == int(legacy_followup)
                 assert await (await client.post(path, headers=auth, json=body)).json() == receipts[0]
                 assert (await (await client.post(path, headers=auth, json={**body,
                     "control": {**control, "action_id": "terminal"}})).json())["status"] == "rejected"

@@ -35,6 +35,12 @@ class SessionChildDispatchMixin:
             row = conn.execute("SELECT * FROM messages WHERE id=?", (user_id,)).fetchone()
             message = self._rows_to_conversation([row], session_id=session_id, include_ancestors=False,
                                                  repair_alternation=False, include_row_ids=True)[0]
+            # This receipt-owned input was verified byte-for-byte above. Keep it
+            # exact while retaining the persisted row markers and API sidecar.
+            message["content"] = content
+            if not message.get("api_content"):
+                message["_exact_steer_leading"] = True
+                message["_exact_steer_trailing"] = True
             return {"receipt_id": receipt["id"], "message": message}
         return self._execute_write(write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 

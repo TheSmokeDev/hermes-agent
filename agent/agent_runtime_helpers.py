@@ -1051,6 +1051,12 @@ def drop_thinking_only_and_merge_users(
             merged.append(m)
         else:
             merged[-1] = {**prev, "content": content}  # copy so caller dicts are never mutated
+            # Exact receipt-owned steering retains only the outer boundary flags:
+            # internal whitespace is already preserved by the concatenation.
+            if m.get("_exact_steer_trailing"):
+                merged[-1]["_exact_steer_trailing"] = True
+            else:
+                merged[-1].pop("_exact_steer_trailing", None)
             merges += 1
     if dropped == 0 and merges == 0:
         return messages

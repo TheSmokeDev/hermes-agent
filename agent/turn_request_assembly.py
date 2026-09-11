@@ -174,8 +174,13 @@ def assemble_api_request(
     # Normalize whitespace and tool-call JSON for bit-perfect prefixes across turns
     # (KV-cache reuse on local servers, better cloud cache hits); API copy only.
     for am in api_messages:
+        exact_leading = am.pop("_exact_steer_leading", False)
+        exact_trailing = am.pop("_exact_steer_trailing", False)
         if isinstance(am.get("content"), str):
-            am["content"] = am["content"].strip()
+            if not exact_leading:
+                am["content"] = am["content"].lstrip()
+            if not exact_trailing:
+                am["content"] = am["content"].rstrip()
     _canonicalize_api_tool_calls(api_messages)
 
     # Strip lone surrogates (U+D800-U+DFFF) that some Ollama-served models emit;
