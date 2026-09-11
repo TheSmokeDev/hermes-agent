@@ -8,13 +8,14 @@ import time
 
 from aiohttp import web
 
-from hermes_state_passive_history import PassiveHistoryRetiredError, _validated_identifier
+from hermes_state_passive_history import PassiveHistoryBusyError, PassiveHistoryRetiredError, _validated_identifier
+from hermes_state_errors import SessionTurnLeaseLostError
 
 
 def capabilities():
     return {"version": 1, "supported": True, "durable_actions": True,
             "receipt_states": ["queued", "rejected", "unsupported", "unknown"],
-            "origin_sources": {"linked_child": ["passive_receipt"], "ordinary": []},
+            "origin_sources": {"linked_child": ["passive_receipt"], "ordinary": ["passive_receipt", "pending"]},
             "max_input_chars": 16000}
 
 
@@ -50,11 +51,12 @@ def _validate(body):
             raise ValueError("Invalid host target identity")
     origin = control.get("origin")
     if origin is not None:
-        if not isinstance(origin, dict) or set(origin) != {"event_id", "origin_turn_id", "receipt_id"}:
+        if not isinstance(origin, dict) or set(origin) not in (
+            {"event_id", "origin_turn_id"}, {"event_id", "origin_turn_id", "receipt_id"}):
             raise ValueError("Invalid origin")
         for key in ("event_id", "origin_turn_id"):
             _validated_identifier(origin[key], key, 128)
-        if type(origin["receipt_id"]) is not int or origin["receipt_id"] < 1:
+        if "receipt_id" in origin and (type(origin["receipt_id"]) is not int or origin["receipt_id"] < 1):
             raise ValueError("Invalid origin receipt")
     return text, control
 
@@ -109,20 +111,33 @@ async def handle(adapter, request, *, _api_server, body=None):
             receipt["status"] = "unsupported" if reason == "backend_unsupported" else "rejected"
         elif target["session_id"] != control["expected_session_id"] or target["turn_id"] != control["expected_turn_id"]:
             receipt["status"], reason = "rejected", "stale_target"
-        elif origin is not None and child is None:
-            receipt["status"], reason = "unsupported", "ordinary_origin_adoption_unsupported"
-        elif origin is not None:
-            try:
-                receipt["parent_message_id"] = agent._session_db.verify_child_steer_origin(
-                    run_id, run_scope=scope, child_id=target["child_id"], content=text, **origin)
-            except (ValueError, PassiveHistoryRetiredError):
-                receipt["status"], reason = "rejected", "origin_unavailable"
         if reason:
             receipt["evidence"] = reason
+        # Origin binding may persist pending input. Reserve the immutable action before
+        # that first side effect so a competing request cannot write a losing origin.
         outcome, stored = store.steer_receipt(scope, run_id, action_id, fingerprint=fingerprint, reserve=receipt)
         if outcome != "created":
             return response({"error": "steer_action_conflict"}, 409) if outcome == "conflict" else response(stored)
         if reason:
+            return response(receipt)
+        if origin is not None:
+            try:
+                if child is None:
+                    from agent.run_steering import bind_origin_steer
+                    text, binding = bind_origin_steer(agent, text, origin,
+                        expected_session_id=control["expected_session_id"], expected_turn_id=control["expected_turn_id"])
+                    receipt["parent_message_id"] = binding["message"]["_row_id"]
+                    receipt["origin"] = {**origin, "receipt_id": binding["receipt_id"]}
+                else:
+                    if "receipt_id" not in origin:
+                        raise ValueError("Child steering requires an existing origin receipt")
+                    receipt["parent_message_id"] = agent._session_db.verify_child_steer_origin(
+                        run_id, run_scope=scope, child_id=target["child_id"], content=text, **origin)
+            except (ValueError, PassiveHistoryBusyError, PassiveHistoryRetiredError, SessionTurnLeaseLostError):
+                receipt["status"], reason = "rejected", "origin_unavailable"
+        if reason:
+            receipt["evidence"] = reason
+            store.settle_steer_receipt(scope, run_id, action_id, receipt)
             return response(receipt)
         try:
             kw = {"expected_session_id": control["expected_session_id"], "expected_turn_id": control["expected_turn_id"]}
@@ -133,7 +148,7 @@ async def handle(adapter, request, *, _api_server, body=None):
                 state = steer_current_turn(agent, text, **kw)
         except Exception:
             # Persisted unknown is a deliberate no-replay boundary: backend acceptance may have happened.
-            return response(receipt)
+            return response(store.steer_receipt(scope, run_id, action_id)[1])
         receipt.update(status=state, evidence="backend_queue_ack" if state == "queued" else "backend_refused")
         store.settle_steer_receipt(scope, run_id, action_id, receipt)
         if state == "queued":

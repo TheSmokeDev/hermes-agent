@@ -28,3 +28,20 @@ def steer_current_turn(agent, text, *, expected_session_id, expected_turn_id):
         if target["session_id"] != expected_session_id or target["turn_id"] != expected_turn_id:
             return "rejected"
         return "queued" if agent.steer(text) else "rejected"
+
+
+def bind_origin_steer(agent, text, origin, *, expected_session_id, expected_turn_id):
+    """Mint a trusted row-bound queue value using only this run's host-owned store and lease."""
+    from agent.steer_origin import bound_steer_text
+    from passive_history_ingress import PRODUCER
+    def current():
+        target = steering_target(agent)
+        return (target["supported"] and target["session_id"] == expected_session_id
+                and target["turn_id"] == expected_turn_id)
+    with _ic_lock(agent, "_pending_redirect_lock"):
+        if not current():
+            raise ValueError("Steering target no longer accepts origin binding")
+        result = agent._session_db.bind_ordinary_steer_origin(expected_session_id,
+            producer=PRODUCER, content=text, **origin, target_guard=current,
+            turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None))
+        return bound_steer_text(text, result["message"]), result

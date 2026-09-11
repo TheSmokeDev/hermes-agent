@@ -32,10 +32,21 @@ exactly. Changed, deleted, foreign or unavailable origins refuse. The correction
 concurrent typed input retain separate parent origins; steering adds no parent row or model call.
 The child receives the existing steer marker through its own execution history.
 
-Ordinary runs support unbound corrections through their stock queue and canonical persistence.
-**Already-persisted parent-origin adoption is unsupported for ordinary runs:** the stock queue
-would otherwise create another canonical parent row. A client must not drop an origin reference
-and retry as unbound to bypass this limit. This capability is not full origin parity for every lane.
+Ordinary stock-loop runs also support `control.origin`. Supply `{event_id, origin_turn_id,
+receipt_id}` to reuse an exact passive receipt-owned user row, or omit `receipt_id` for a pending
+utterance. The host checks the current target, canonical conversation, and its own live turn lease.
+A pending utterance commits once through the existing passive writer; a delayed passive retry with
+the same event and payload returns that receipt. A present `receipt_id` never creates missing input.
+Capabilities advertise `origin_sources.ordinary: ["passive_receipt", "pending"]`; check this before
+sending bound input to an older host. Never drop an origin reference and retry as unbound.
+
+The ordinary queue carries the host-verified row identity through drain/requeue. Delivery appends
+a persisted row copy after a tool result, preserving its `api_content` and the previous provider
+prefix; canonical flush does not insert another user row. Provider adapters may compose adjacent
+user copies for role alternation without modifying stored rows. An already-contextualized utterance
+may be presented again by this explicit steer action. If the run finishes before consuming the queue,
+bound input remains recorded and is never automatically replayed as a fresh next-turn prompt.
+Unbound corrections retain their existing formatting and next-turn behavior.
 Native app-server, ACP/detached and unrecognized backends are unsupported by this receipt protocol.
 The legacy text-only POST remains available with its older, weaker acknowledgement semantics.
 

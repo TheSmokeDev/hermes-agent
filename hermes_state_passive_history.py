@@ -336,7 +336,7 @@ class SessionPassiveHistoryMixin:
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def _append_passive_messages_on_conn(self, conn, session_id, *, producer, event_id,
-                                         origin_turn_id, rows, fingerprint):
+                                         origin_turn_id, rows, fingerprint, _turn_lease_holder=None):
         """Canonical writer body for validated input; caller owns the same state.db transaction."""
         if conn.execute("SELECT 1 FROM execution_origins WHERE producer=? AND event_id=?",
                         (producer, event_id)).fetchone():
@@ -363,7 +363,8 @@ class SessionPassiveHistoryMixin:
         tip = self._resolve_passive_history_tip(
             conn, conversation_id, requested_session_id=session_id)
         try:
-            self._check_transcript_write_guards(conn, tip, None, reject_active_turn_lease=True)
+            self._check_transcript_write_guards(conn, tip, None,
+                turn_lease_holder=_turn_lease_holder, reject_active_turn_lease=True)
         except SessionTurnLeaseLostError as exc:
             raise PassiveHistoryBusyError(
                 f"Conversation {conversation_id!r} has an active turn; "

@@ -116,7 +116,7 @@ async def test_same_run_control_origin_and_durable_replay(tmp_path, monkeypatch,
                     unsupported = control("ordinary-persisted-origin")
                     unsupported["control"]["origin"] = {"event_id": "event", "origin_turn_id": "turn", "receipt_id": 1}
                     unsupported_result = await (await client.post(route, headers=auth, json=unsupported)).json()
-                    assert unsupported_result.get("status") == "unsupported", unsupported_result
+                    assert unsupported_result.get("status") == "rejected", unsupported_result
                 responses = await asyncio.gather(*(client.post(route, headers=auth, json=first) for _ in range(2)))
                 receipts = [await response.json() for response in responses]
                 assert receipts[0] == receipts[1] and receipts[0]["status"] == "queued", receipts
