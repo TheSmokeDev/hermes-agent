@@ -10,6 +10,49 @@ from hermes_state_passive_history import (
 
 
 class SessionChildDispatchMixin:
+    def bind_ordinary_steer_origin(self, session_id, *, producer, event_id, origin_turn_id, content,
+                                   turn_lease_holder, target_guard, receipt_id=None):
+        """Bind exact user input under the live run's existing lease; never accept client lease authority."""
+        rows = _validated_messages([{"role": "user", "content": content}])
+        for name, value in (("producer", producer), ("event_id", event_id), ("origin_turn_id", origin_turn_id)):
+            _validated_identifier(value, name, 128)
+        if not turn_lease_holder or (receipt_id is not None and (type(receipt_id) is not int or receipt_id < 1)):
+            raise ValueError("A live lease and valid origin reference are required")
+        def write(conn):
+            if not target_guard():
+                raise PassiveHistoryConflictError("Steering target changed before origin binding")
+            self._check_transcript_write_guards(conn, session_id, None, turn_lease_holder=turn_lease_holder)
+            owner = self._passive_conversation_id(conn, session_id)
+            if self._resolve_passive_history_tip(conn, owner, requested_session_id=session_id) != session_id:
+                raise PassiveHistoryConflictError("Steering must target the current canonical segment")
+            user_id = self._child_origin_user(conn, session_id, producer, event_id, origin_turn_id, content, receipt_id)
+            if user_id is None:
+                receipt = self._append_passive_messages_on_conn(conn, session_id, producer=producer,
+                    event_id=event_id, origin_turn_id=origin_turn_id, rows=rows,
+                    fingerprint=_payload_fingerprint(origin_turn_id, rows), _turn_lease_holder=turn_lease_holder)
+                user_id = receipt.message_ids[0]
+            receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
+            row = conn.execute("SELECT * FROM messages WHERE id=?", (user_id,)).fetchone()
+            message = self._rows_to_conversation([row], session_id=session_id, include_ancestors=False,
+                                                 repair_alternation=False, include_row_ids=True)[0]
+            # This receipt-owned input was verified byte-for-byte above. Keep it
+            # exact while retaining the persisted row markers and API sidecar.
+            message["content"] = content
+            if not message.get("api_content"):
+                message["_exact_steer_leading"] = True
+                message["_exact_steer_trailing"] = True
+            return {"receipt_id": receipt["id"], "message": message}
+        return self._execute_write(write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def verify_child_steer_origin(self, run_id, *, run_scope, child_id, content, event_id, origin_turn_id, receipt_id):
+        """Reuse exact receipt-owned parent input without appending or searching by text."""
+        with self._read_ctx() as conn:
+            row = conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (run_id,)).fetchone()
+            if row is None or row["state"] != "started" or row["run_scope"] != run_scope or row["child_id"] != child_id:
+                raise PassiveHistoryRetiredError("Child dispatch is unavailable for this owner")
+            return self._child_origin_user(conn, row["requested_session_id"], row["producer"], event_id,
+                                           origin_turn_id, content, receipt_id)
+
     def _child_origin_user(self, conn, session_id, producer, event_id, origin_turn_id, content, receipt_id=None):
         receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
         if receipt is None:

@@ -7,6 +7,7 @@ import sqlite3
 from functools import partial
 
 from aiohttp import web
+from hermes_state_store_identity import StoreIdentityUnavailable, get_store_id
 
 from passive_history_ingress import (
     IngressError, MAX_REQUEST_BYTES, PassiveHistoryIngress, capabilities, error_response,
@@ -30,9 +31,13 @@ async def handle(adapter, operation, request):
     auth_error = adapter._check_auth(request)
     if auth_error is not None:
         return auth_error
-    if operation == "capabilities":
-        return web.json_response(capabilities())
     try:
+        if operation == "capabilities":
+            db = await adapter._ensure_session_db_async()
+            if db is None:
+                raise IngressError("store_unavailable", 503)
+            return web.json_response({**capabilities(), "store_id": await asyncio.to_thread(get_store_id, db)},
+                                     headers={"Cache-Control": "no-store"})
         raw = bytearray()
         async for chunk in request.content.iter_chunked(4096):
             if len(raw) + len(chunk) > MAX_REQUEST_BYTES:
@@ -50,6 +55,8 @@ async def handle(adapter, operation, request):
             principal="gateway:" + request.headers["Authorization"][7:].strip(),
             operation=operation, body=body)
         return web.json_response(result)
+    except StoreIdentityUnavailable:
+        return web.json_response({"error": "store_identity_unavailable", "retryable": False}, status=503)
     except (ValueError, TypeError, RuntimeError, sqlite3.Error) as exc:
         payload, status = error_response(exc)
         return web.json_response(payload, status=status)

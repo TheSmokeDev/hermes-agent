@@ -104,6 +104,10 @@ class RunIdempotencyStore:
                 self._conn.execute(f"ALTER TABLE run_idempotency ADD COLUMN {column} {ddl}")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS run_steer_receipts (
+            scope TEXT NOT NULL, run_id TEXT NOT NULL, action_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL, receipt_json TEXT NOT NULL,
+            PRIMARY KEY(scope,run_id,action_id))""")
         self._conn.commit()
         self._lock = threading.Lock()
         self._tighten_permissions()
@@ -183,6 +187,7 @@ class RunIdempotencyStore:
             if terminal:
                 self._conn.execute(
                     "DELETE FROM run_idempotency WHERE scope=? AND idempotency_key=?", (stale_scope, stale_key))
+        self._conn.execute("DELETE FROM run_steer_receipts WHERE run_id NOT IN (SELECT run_id FROM run_idempotency)")
 
     def status_for_run(self, scope: str, run_id: str, *, retention_until: float = 0) -> dict[str, Any] | None:
         """Load one durable run status inside its authenticated scope."""
@@ -220,6 +225,32 @@ class RunIdempotencyStore:
             self._conn.execute(
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",
                 (_encode_status(status), time.time(), run_id))
+            self._conn.commit()
+
+    def steer_receipt(self, scope, run_id, action_id, *, fingerprint=None, reserve=None):
+        """Read or reserve a same-run control once, including across gateway restarts."""
+        with self._immediate_txn():
+            if not self._conn.execute("SELECT 1 FROM run_idempotency WHERE scope=? AND run_id=?",
+                                      (scope, run_id)).fetchone():
+                raise ValueError("Steering receipts require a durable owning run")
+            row = self._conn.execute("SELECT fingerprint,receipt_json FROM run_steer_receipts "
+                                     "WHERE scope=? AND run_id=? AND action_id=?",
+                                     (scope, run_id, action_id)).fetchone()
+            if row:
+                self._conn.commit()
+                return ("conflict" if fingerprint is not None and not hmac.compare_digest(row[0], fingerprint)
+                        else "reused"), json.loads(row[1])
+            if reserve is not None:
+                self._conn.execute("INSERT INTO run_steer_receipts VALUES(?,?,?,?,?)",
+                                   (scope, run_id, action_id, fingerprint, _encode_status(reserve)))
+            self._conn.commit()
+            return ("created", reserve) if reserve is not None else ("missing", None)
+
+    def settle_steer_receipt(self, scope, run_id, action_id, receipt):
+        with self._immediate_txn():
+            self._conn.execute("UPDATE run_steer_receipts SET receipt_json=? "
+                               "WHERE scope=? AND run_id=? AND action_id=?",
+                               (_encode_status(receipt), scope, run_id, action_id))
             self._conn.commit()
 
     def close(self) -> None:

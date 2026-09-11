@@ -322,6 +322,27 @@ class SubagentLifecycleService:
                 )
         return SubagentCancelResult(bool(accepted), unsupported=not accepted, state=SubagentState.CANCEL_REQUESTED)
 
+    def steering(self, handle: SubagentHandle) -> dict:
+        """Public current child target; a handle never authorizes control of an inactive parent."""
+        from agent.run_steering import steering_target
+        record = self._record(handle)
+        with _REGISTRY.lock:
+            if record is None or record.state is not SubagentState.RUNNING or record.result is not None:
+                return {"supported": False, "reason": "child_not_running"}
+            return {**steering_target(record.agent), "child_id": record.handle.subagent_id}
+
+    def steer(self, handle: SubagentHandle, text: str, *, expected_session_id: str, expected_turn_id: str) -> str:
+        """Return queued/rejected/unsupported, never delivered/applied. No replacement execution."""
+        from agent.run_steering import steer_current_turn
+        if not isinstance(text, str) or not text.strip() or len(text) > _MAX_GOAL_CHARS:
+            raise SubagentLifecycleError("steer text must be nonempty and at most 16000 characters")
+        record = self._record(handle)
+        with _REGISTRY.lock:
+            if record is None or record.state is not SubagentState.RUNNING or record.result is not None:
+                return "rejected"
+            return steer_current_turn(record.agent, text, expected_session_id=expected_session_id,
+                                      expected_turn_id=expected_turn_id)
+
     def result(self, handle: SubagentHandle) -> SubagentResult:
         record = self._record(handle)
         if record is None:
