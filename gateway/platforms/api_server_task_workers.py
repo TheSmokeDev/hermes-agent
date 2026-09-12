@@ -5,6 +5,7 @@ import os
 import threading
 import uuid
 from pathlib import Path
+from types import MappingProxyType
 
 from agent.task_worker_provider import TaskWorkerRequest, TaskWorkerSession
 from agent.task_worker_registry import configured_worker
@@ -91,7 +92,10 @@ def run_worker_sync(adapter, run, parent):
             profile_home=Path(db.db_path).parent, parent_session_id=dispatch["parent_session_id"],
             child_session_id=child_id, action_id=request["correlation_id"],
             origin_turn_id=dispatch["origin_turn_id"], goal=request["goal"],
-            context=request.get("context") or "", report=report, still_authorized=authorized))
+            context=request.get("context") or "", report=report, still_authorized=authorized,
+            room_context=(MappingProxyType({**run.discord_task_context,
+                "audience_user_ids": tuple(run.discord_task_context["audience_user_ids"])})
+                if getattr(run, "discord_task_context", None) is not None else None)))
         if not isinstance(session, TaskWorkerSession):
             raise ValueError("Task worker returned an invalid session")
         binding = WorkerBinding(session, run.run_id, child_id, authorized)

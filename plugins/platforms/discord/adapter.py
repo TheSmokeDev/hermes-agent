@@ -1225,6 +1225,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
             @self._client.event
             async def on_ready():
+                from gateway.discord_task_context import reset_voice_context
+                reset_voice_context(adapter_self)
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
@@ -1259,6 +1261,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
+                from gateway.discord_task_context import note_voice_state
+                note_voice_state(adapter_self, member, before, after)
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
                     return

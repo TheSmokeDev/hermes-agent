@@ -12,7 +12,8 @@ def capabilities():
     return {"version": 1, "supported": True, "origin_sources": ["fresh", "passive_receipt"],
             "max_goal_chars": 16000, "max_context_chars": 32000,
             "separate_child_goal": True, "owning_run_approvals": True, "restart_relaunch": False,
-            "external_workers": {"version": 1, "names": available_workers()}}
+            "external_workers": {"version": 1, "names": available_workers(),
+                                 "discord_task_context": {"version": 1, "event_proof_required": True}}}
 
 
 def validate_child_request(child):

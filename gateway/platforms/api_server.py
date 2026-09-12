@@ -1553,6 +1553,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes.extend(_api_runs._http_routes(self))
         from gateway.platforms.api_server_passive_history import http_routes
         routes.extend(http_routes(self))
+        from gateway.platforms.api_server_discord_context import http_routes as discord_context_routes
+        routes.extend(discord_context_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))

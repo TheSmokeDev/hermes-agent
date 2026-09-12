@@ -11,14 +11,20 @@ The linked-child v1 capability gains an additive `external_workers` sub-contract
 version 1 and configured names. A child request may select one such registered name in
 `worker`. It cannot supply an executable, workspace, model, policy, or toolset override.
 The existing authenticated `/v1/runs` admission still owns exact original input,
-idempotency and parent/child persistence. Hosted-room external execution remains
-unsupported until its policy mapping is defined; it cannot bypass room restrictions.
+idempotency and parent/child persistence. Discord voice execution uses the event-issued
+context and control policy in [Discord task contexts](discord-task-context.md). RoomLink
+hosted-room grants still cannot dispatch external workers; their independent room/tool
+policy is not widened by a Discord voice proof.
 
 The host creates a canonical child, acquires and renews its writer lease, persists the
 derived worker goal, and supplies immutable owner/profile/action/origin data. A worker
 never runs the parent model. The request's read-only `still_authorized()` callback
 checks canonical parent/child/origin retention and must guard external writes. Canonical
-owner or exact lease-holder loss irrevocably retires active work. Worker children carry
+owner or exact lease-holder loss irrevocably retires active work. An optional immutable
+`room_context` describes the verified Discord audience at admission and grants no text
+destination or additional tools. Voice rebind, close, audience changes and proof expiry
+do not revoke canonical ownership or cancel accepted work; voice control and delivery
+are checked separately. Worker children carry
 the standard `_delegate_from` marker, so canonical parent deletion removes their messages
 and sessions through the existing deletion path. Worker results may include full output and an artifact
 array; failure/cancellation preserves available partial output.

@@ -337,6 +337,7 @@ class _RunLaunch:
     origin_claim: Optional[dict] = None
     child_request: Optional[dict] = None
     child_dispatch: Optional[dict] = None
+    discord_task_context: Optional[dict] = None
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -439,6 +440,17 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         except ValueError:
             return _json_error(_openai_error, "Invalid authoritative origin request",
                                code="invalid_origin", status=400)
+    discord_context = None
+    if "discord_task_context" in body or request.headers.get("X-Hermes-Discord-Task-Proof") is not None:
+        from gateway.platforms.api_server_discord_context import verify_request, error_response
+        from gateway.discord_task_context import DiscordTaskContextError
+        try:
+            if origin is None or child_request is None or "discord_task_context" not in body:
+                raise DiscordTaskContextError("discord_context_requires_linked_child", 400)
+            discord_context = verify_request(self, request, session_id=body.get("session_id"),
+                                             binding=body["discord_task_context"])
+        except DiscordTaskContextError as exc:
+            return error_response(exc)
     idempotency_scope = idempotency_fingerprint = ""
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
@@ -569,6 +581,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         origin_claim=origin_claim, child_request=child_request, child_dispatch=child_dispatch,
+        discord_task_context=discord_context,
         turn_author=turn_author)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
@@ -816,6 +829,12 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
         status = self._set_run_status(run_id, "running")
     if status is None:
         return run_id, None, agent, task, _run_not_found(_openai_error, run_id)
+    from gateway.platforms.api_server_discord_context import verify_request, error_response
+    from gateway.discord_task_context import DiscordTaskContextError
+    try:
+        verify_request(self, request, session_id=status.get("parent_session_id") or status.get("session_id"))
+    except DiscordTaskContextError as exc:
+        return run_id, None, None, None, error_response(exc)
     return run_id, status, agent, task, None
 
 
@@ -845,6 +864,17 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         await asyncio.sleep(0.05)
     else:
         return _run_not_found(_api_server._openai_error, run_id)
+    from gateway.platforms.api_server_discord_context import verify_request, error_response
+    from gateway.discord_task_context import DiscordTaskContextError
+
+    def check_voice_delivery():
+        status = self._durable_run_status(request, run_id) or {}
+        return verify_request(self, request, session_id=status.get("parent_session_id") or status.get("session_id"))
+
+    try:
+        check_voice_delivery()
+    except DiscordTaskContextError as exc:
+        return error_response(exc)
     q = self._run_streams[run_id]
     self._run_stream_subscribers.add(run_id)
     response = web.StreamResponse(status=200, headers={
@@ -855,8 +885,10 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
             try:
                 event = await asyncio.wait_for(q.get(), timeout=30.0)
             except asyncio.TimeoutError:
+                check_voice_delivery()
                 await response.write(b": keepalive\n\n")
                 continue
+            check_voice_delivery()
             if event is None:  # run finished
                 await response.write(b": stream closed\n\n")
                 break
@@ -920,9 +952,15 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    from gateway.platforms.api_server_discord_context import verify_request, error_response
+    from gateway.discord_task_context import DiscordTaskContextError
+    try:
+        verify_request(self, request, session_id=run_status.get("parent_session_id") or run_status.get("session_id"))
+    except DiscordTaskContextError as exc:
+        return error_response(exc)
     raw_choice = str(body.get("choice", "")).strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
-    room_scoped = bool(self._room_grant_token(request))
+    room_scoped = bool(self._room_grant_token(request) or request.headers.get("X-Hermes-Discord-Task-Proof"))
     raw_request_id = body.get("request_id")
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
     # Room grants may resolve exactly one request and never widen to session/always.

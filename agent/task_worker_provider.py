@@ -21,6 +21,7 @@ class TaskWorkerRequest:
     context: str
     report: Callable[[dict], None] = field(repr=False)
     still_authorized: Callable[[], bool] = field(repr=False)
+    room_context: object | None = None  # Host assertion; grants no message destination or broader tool policy.
 
 
 class TaskWorkerSession(ABC):
