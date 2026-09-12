@@ -169,6 +169,15 @@ class RecipientBridge:
     def _receipt(operation):
         private = {"message", "target_token", "baseline"}
         result = {key: value for key, value in operation.items() if key not in private}
+        result["submission_attempted"] = bool(operation.get("attempted_at"))
+        if operation["status"] == "posted":
+            result["delivery_stage"] = "posted"
+        elif result["submission_attempted"]:
+            result["delivery_stage"] = "submission_attempted"
+        elif operation["status"] == "queued":
+            result["delivery_stage"] = "prepared"
+        else:
+            result["delivery_stage"] = operation["status"]
         if result["status"] == "preparing":
             result["status"] = "unknown"
         return result

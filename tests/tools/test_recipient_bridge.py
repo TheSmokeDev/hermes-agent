@@ -319,3 +319,77 @@ def test_unknown_accessibility_nodes_never_grant_control(surface):
             state["nodes"].append({"id": "unknown-modal", "role": "Unknown", "modal": True})
         with pytest.raises(RecipientError):
             recipient_view(state)
+
+
+@pytest.mark.parametrize("control_change", ["none", "name", "disabled", "pane", "offscreen", "custom_profile"])
+def test_codex_queue_requires_exact_enabled_control_in_current_profile(control_change):
+    state = snapshot()
+    control = state["nodes"][2]
+    control["name"] = "Queue"
+    profile = None
+    if control_change == "name":
+        control["name"] = "Queue something else"
+    elif control_change == "disabled":
+        control["enabled"] = False
+    elif control_change == "pane":
+        control["parent"] = "other-pane"
+    elif control_change == "offscreen":
+        control["offscreen"] = True
+    elif control_change == "custom_profile":
+        profile = {"send_names": ["Send"]}
+    assert recipient_view(state, profile)["submit_id"] == ("send" if control_change == "none" else None)
+
+
+def test_pre_submit_refusal_can_continue_only_same_prepared_operation(tmp_path):
+    desktop = Desktop()
+    desktop.state["nodes"][2]["name"] = "Queue"
+    desktop.profiles = {"codex_desktop": {"send_names": ["Send"]}}
+    desktop.no_post = True
+    service = bridge(tmp_path, desktop)
+    token = selected(service)
+    prepared = prepare(service, token)
+    with pytest.raises(RecipientError, match="composer_or_submit_changed"):
+        commit(service, token, prepared)
+    reconciled = service.reconcile(operation_id="operation", target_token=token)
+    assert reconciled["delivery_stage"] == "prepared" and not reconciled["submission_attempted"]
+    assert reconciled["commit_token"] == prepared["commit_token"]
+    assert desktop.composes == 1 and desktop.submits == 0
+    desktop.profiles = {}
+    attempted = commit(service, token, reconciled)
+    assert attempted["status"] == "unknown" and attempted["delivery_stage"] == "submission_attempted"
+    assert attempted["submission_attempted"] and "commit_token" not in attempted
+    assert "message_receipt" not in attempted and desktop.state["nodes"][1]["value"] == "requested message"
+    assert commit(service, token, reconciled)["status"] == "unknown"
+    assert desktop.composes == desktop.submits == 1
+
+
+def test_queue_preview_and_draft_are_not_posted_transcript_receipts(tmp_path):
+    desktop = Desktop()
+    desktop.state["nodes"][2]["name"] = "Queue"
+    desktop.no_post = True
+    service = bridge(tmp_path, desktop)
+    token = selected(service)
+    prepared = prepare(service, token)
+    assert prepared["status"] == "queued" and prepared["delivery_stage"] == "prepared"
+    assert not prepared["submission_attempted"] and "message_receipt" not in prepared
+    attempted = commit(service, token, prepared)
+    desktop.state["nodes"].extend([
+        {"id": "queue-preview", "parent": "pane", "role": "Group"},
+        {"id": "preview-user", "parent": "queue-preview", "role": "Text", "name": "You said:"},
+        {"id": "preview-text", "parent": "queue-preview", "role": "Text",
+         "name": "requested message", "text_supported": True},
+    ])
+    reconciled = service.reconcile(operation_id="operation", target_token=token)
+    assert reconciled["status"] == attempted["status"] == "unknown"
+    assert reconciled["delivery_stage"] == "submission_attempted" and "message_receipt" not in reconciled
+    desktop.state["nodes"][1]["value"] = ""
+    desktop.state["nodes"].extend([
+        {"id": "posted-user", "parent": "pane", "role": "Text", "name": "You said:"},
+        {"id": "posted-text", "parent": "pane", "role": "Text",
+         "name": "requested message", "text_supported": True},
+        {"id": "posted-end", "parent": "pane", "role": "Text", "name": "ChatGPT said:"},
+    ])
+    posted = service.reconcile(operation_id="operation", target_token=token)
+    assert posted["status"] == posted["delivery_stage"] == "posted"
+    assert posted["message_receipt"]["native_message_id"] == "posted-user"
+    assert desktop.composes == desktop.submits == 1

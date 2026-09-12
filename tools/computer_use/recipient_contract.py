@@ -71,9 +71,12 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
     markers = (profile or {}).get("user_markers", ["You said:"] if app == "codex_desktop" else [])
     if not markers or not any(n.get("name") in markers and n.get("role") == "Text" for n in peers):
         raise RecipientError("unverified_conversation")
-    send_names = (profile or {}).get("send_names", ["Send", "Send message", "Send prompt"])
+    default_send_names = ["Send", "Send message", "Send prompt"]
+    if app == "codex_desktop":
+        default_send_names.append("Queue")
+    send_names = (profile or {}).get("send_names", default_send_names)
     submits = [n for n in peers if n.get("role") == "Button" and n.get("name") in send_names
-               and n.get("invoke_supported") and not n.get("offscreen")]
+               and n.get("enabled") and n.get("invoke_supported") and not n.get("offscreen")]
     if len(submits) > 1:
         raise RecipientError("ambiguous_submit_control")
     denied = any(n.get("modal") or (n.get("role") == "Button" and n.get("name") in {

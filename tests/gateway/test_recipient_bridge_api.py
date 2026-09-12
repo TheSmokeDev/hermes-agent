@@ -40,9 +40,11 @@ async def test_authenticated_recipient_route_roundtrip_and_scope(tmp_path, tmp_p
         prepared = await client.post(base + "send", headers=auth, json=payload)
         queued = await prepared.json()
         assert queued["status"] == "queued" and desktop.submits == 0
+        assert queued["delivery_stage"] == "prepared" and not queued["submission_attempted"]
         posted = await client.post(base + "send", headers=auth, json={**payload, "commit_token": queued["commit_token"]})
         posted_receipt = await posted.json()
         assert posted_receipt["status"] == "posted" and desktop.submits == 1
+        assert posted_receipt["delivery_stage"] == "posted" and posted_receipt["submission_attempted"]
         reconciled = await client.post(base + "reconcile", headers=auth,
                                        json={**body, "target_token": target["target_token"], "operation_id": "op"})
         assert await reconciled.json() == posted_receipt
