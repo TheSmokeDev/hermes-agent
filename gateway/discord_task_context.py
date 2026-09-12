@@ -69,7 +69,7 @@ def _snapshot(runner, adapter, guild_id, channel_id, operator_id):
     # dashboard credentials are not authority to operate a voice room.
     if not _explicitly_allowed(adapter, member):
         raise DiscordTaskContextError("discord_operator_not_allowlisted")
-    states = guild.voice_states
+    states = channel.voice_states
     audience = []
     for user_id, state in states.items():
         if getattr(getattr(state, "channel", None), "id", None) != int(channel_id):
