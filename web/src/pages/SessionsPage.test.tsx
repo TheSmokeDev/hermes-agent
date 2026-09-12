@@ -33,6 +33,11 @@ vi.mock("@/components/Markdown", () => ({ Markdown: () => null }));
 
 let container: HTMLDivElement;
 let root: Root;
+let SessionsPage: typeof import("./SessionsPage").default;
+let I18nProvider: typeof import("@/i18n").I18nProvider;
+let SystemActionsProvider: typeof import("@/contexts/SystemActions").SystemActionsProvider;
+let ProfileProvider: typeof import("@/contexts/ProfileProvider").ProfileProvider;
+let PageHeaderProvider: typeof import("@/contexts/PageHeaderProvider").PageHeaderProvider;
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 async function waitFor(cond: () => boolean, timeoutMs = 5000) {
@@ -61,14 +66,6 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
     limit,
     offset: 0,
   }));
-  const [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] =
-    await Promise.all([
-      import("./SessionsPage"),
-      import("@/i18n"),
-      import("@/contexts/SystemActions"),
-      import("@/contexts/ProfileProvider"),
-      import("@/contexts/PageHeaderProvider"),
-    ]);
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -90,7 +87,7 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
   await waitFor(() => Boolean(button("Delete session")));
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   for (const fn of Object.values(apiMocks)) fn.mockReset();
   apiMocks.getStatus.mockResolvedValue({});
   apiMocks.getEmptySessionsCount.mockResolvedValue({ count: 0 });
@@ -110,6 +107,15 @@ beforeEach(() => {
   vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
   vi.stubGlobal("matchMedia", () => ({ addEventListener() {}, matches: false, media: "", removeEventListener() {} }));
   sessionStorage.clear();
+  // Keep cold module transforms outside the interaction timeout.
+  [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] =
+    await Promise.all([
+      import("./SessionsPage"),
+      import("@/i18n"),
+      import("@/contexts/SystemActions"),
+      import("@/contexts/ProfileProvider"),
+      import("@/contexts/PageHeaderProvider"),
+    ]);
 });
 
 afterEach(async () => {
