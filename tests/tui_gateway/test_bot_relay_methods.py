@@ -12,6 +12,7 @@ The Desktop's relay door on each connected gateway. Contracts:
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -179,17 +180,21 @@ def test_deliver_write_failure_still_removes_tempfile(home, monkeypatch, tmp_pat
         return fd, path
 
     class _BrokenWriter:
+        def __init__(self, fd):
+            self.fd = fd
+
         def __enter__(self):
             return self
 
         def __exit__(self, *exc_info):
+            os.close(self.fd)
             return False
 
         def write(self, content):
             raise OSError("disk full")
 
     monkeypatch.setattr("tempfile.mkstemp", _tracking_mkstemp)
-    monkeypatch.setattr("os.fdopen", lambda *a, **k: _BrokenWriter())
+    monkeypatch.setattr("os.fdopen", lambda fd, *a, **k: _BrokenWriter(fd))
     err = srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "x"})
     assert "error" in err
     assert made, "mkstemp was never reached"
@@ -198,7 +203,7 @@ def test_deliver_write_failure_still_removes_tempfile(home, monkeypatch, tmp_pat
 
 @pytest.fixture
 def fake_runs(monkeypatch):
-    """Fake ``subprocess.run`` that records each call's kwargs; ``outcomes`` holds (returncode, stderr) per call."""
+    """Record delivery subprocess kwargs without intercepting unrelated metadata probes."""
     calls, outcomes = [], []
 
     def _fake_run(argv, **kwargs):
@@ -210,8 +215,22 @@ def fake_runs(monkeypatch):
 
         return _Proc()
 
-    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("tui_gateway.methods_bot_relay.subprocess", SimpleNamespace(run=_fake_run))
     return calls, outcomes
+
+
+def test_delivery_fake_does_not_intercept_unrelated_subprocesses(home, fake_runs):
+    import subprocess
+    import sys
+
+    calls, outcomes = fake_runs
+    outcomes.extend([(1, "HTTP 429 rate limit"), (0, "")])
+    probe = subprocess.run([sys.executable, "-c", "print('metadata probe')"],
+                           capture_output=True, text=True, check=True)
+    assert probe.stdout.strip() == "metadata probe"
+    assert not calls
+    _result(srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "ping"}))
+    assert len(calls) == 2 and not outcomes
 
 
 @pytest.mark.parametrize("sender, expected", [
