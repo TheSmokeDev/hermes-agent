@@ -3,6 +3,15 @@
 CLIPBOARD_NATIVE_API = r'''
 using System; using System.Collections.Generic; using System.Runtime.InteropServices;
 public class HermesClipboardApi {
+ public delegate bool EnumerateWindow(IntPtr h,IntPtr p);
+ [DllImport("user32.dll")] public static extern bool EnumWindows(EnumerateWindow callback,IntPtr p);
+ [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint command);
+ [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+ public static long[] TopLevelWindows(){
+  var windows=new List<long>();
+  EnumWindows((h,p)=>{windows.Add(h.ToInt64());return true;},IntPtr.Zero);
+  return windows.ToArray();
+ }
  [DllImport("user32.dll",SetLastError=true)] public static extern bool OpenClipboard(IntPtr h);
  [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateWindowEx(uint ex,string cls,string title,uint style,int x,int y,int w,int h,IntPtr parent,IntPtr menu,IntPtr instance,IntPtr param);
  [DllImport("user32.dll")] public static extern bool DestroyWindow(IntPtr h);
@@ -103,14 +112,42 @@ public sealed class HermesClipboardBackup : HermesClipboardApi, IDisposable {
 '''
 
 CLIPBOARD_FUNCTIONS = r'''
-function FindVisibleNamed($window,$name,$type) {
+function TaskMenuPopupElement($handle) {
+ return [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$handle)
+}
+function TaskMenuRoots($window,$target) {
+ $roots=@((ExactWindow $target))
+ foreach($handle in [HermesClipboardApi]::TopLevelWindows()){
+  if($handle -eq $target.window_id -or -not [HermesClipboardApi]::IsWindowVisible([IntPtr]$handle)){continue}
+  [uint32]$processId=0
+  [void][HermesClipboardApi]::GetWindowThreadProcessId([IntPtr]$handle,[ref]$processId)
+  if($processId -ne $target.pid){continue}
+  $owner=[HermesClipboardApi]::GetWindow([IntPtr]$handle,4);$owned=$false
+  for($depth=0;$depth -lt 8 -and $owner -ne [IntPtr]::Zero;$depth++){
+   if($owner.ToInt64() -eq $target.window_id){$owned=$true;break}
+   $owner=[HermesClipboardApi]::GetWindow($owner,4)
+  }
+  if(-not $owned){continue}
+  $popup=TaskMenuPopupElement $handle
+  if($popup.Current.ProcessId -eq $target.pid){$roots+=$popup}
+ }
+ return $roots
+}
+function FindVisibleNamed($window,$name,$type,$menuTarget=$null) {
  $condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$name)
  $wait=[Diagnostics.Stopwatch]::StartNew()
  do {
-  $matches=@($window.FindAll($desc,$condition) | Where-Object {
-   $_.Current.ControlType -eq $type -and -not $_.Current.IsOffscreen -and $_.Current.IsEnabled
-  })
-  if($matches.Count -eq 1){return $matches[0]}
+  $roots=@($window)
+  if($menuTarget -and $type -eq [System.Windows.Automation.ControlType]::MenuItem){$roots=@(TaskMenuRoots $window $menuTarget)}
+  $matches=@{}
+  foreach($root in $roots){
+   foreach($element in $root.FindAll($desc,$condition)){
+    if($element.Current.ControlType -eq $type -and -not $element.Current.IsOffscreen -and $element.Current.IsEnabled){
+     $matches[(Rid $element)]=$element
+    }
+   }
+  }
+  if($matches.Count -eq 1){return @($matches.Values)[0]}
   if($matches.Count -gt 1){throw 'task_deeplink_ambiguous'}
   Start-Sleep -Milliseconds 50
  } while($wait.ElapsedMilliseconds -lt 1000)
@@ -121,11 +158,11 @@ function CopyTaskDeeplink($window,$target) {
  try {
   $button=FindVisibleNamed $window 'Chat actions' ([System.Windows.Automation.ControlType]::Button)
   $actions=$button.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-  $actions.Expand();Start-Sleep -Milliseconds 150
-  $copyItem=FindVisibleNamed $window 'Copy' ([System.Windows.Automation.ControlType]::MenuItem)
+  if($actions.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Expanded){$actions.Expand();Start-Sleep -Milliseconds 150}
+  $copyItem=FindVisibleNamed $window 'Copy' ([System.Windows.Automation.ControlType]::MenuItem) $target
   $copy=$copyItem.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-  $copy.Expand();Start-Sleep -Milliseconds 150
-  $item=FindVisibleNamed $window 'Copy deeplink Alt+Ctrl+L' ([System.Windows.Automation.ControlType]::MenuItem)
+  if($copy.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Expanded){$copy.Expand();Start-Sleep -Milliseconds 150}
+  $item=FindVisibleNamed $window 'Copy deeplink Alt+Ctrl+L' ([System.Windows.Automation.ControlType]::MenuItem) $target
   $invoke=$item.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
   $backup=New-Object HermesClipboardBackup
   $backup.AssertUnchanged()

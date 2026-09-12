@@ -98,3 +98,101 @@ try {
     receipt = json.loads(result.stdout)
     assert receipt["matches"] and receipt["formats"] == 2
     assert receipt["restored"] is (not user_changed)
+
+
+MENU_SHIM = r'''
+using System;
+public class HermesClipboardApi {
+ public static long[] TopLevelWindows(){return new long[]{100,200,201,300,400,500,600};}
+ public static bool IsWindowVisible(IntPtr h){return h.ToInt64()!=500;}
+ public static uint GetWindowThreadProcessId(IntPtr h,out uint p){p=h.ToInt64()==300?8u:7u;return 1;}
+ public static IntPtr GetWindow(IntPtr h,uint command){
+  long n=h.ToInt64();return new IntPtr(n==200||n==300||n==500||n==600?100:n==201?200:n==400?999:0);
+ }
+}
+public class HermesClipboardBackup : IDisposable {
+ public int FormatCount {get{return 2;}}
+ public void AssertUnchanged(){}
+ public string ReadCopy(uint pid){return "codex://threads/11111111-2222-4333-8444-555555555555";}
+ public bool RestoreIfUnchanged(){return true;}
+ public void Dispose(){}
+}
+'''
+
+
+@pytest.mark.windows_only
+def test_task_menu_owned_popup_identity_and_expansion():
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_FUNCTIONS
+    script = ("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
+              "Add-Type -AssemblyName UIAutomationClient\nAdd-Type -AssemblyName UIAutomationTypes\n"
+              + 'Add-Type -TypeDefinition @"\n' + MENU_SHIM + '\n"@\n'
+              + CLIPBOARD_FUNCTIONS + r'''
+$desc=[System.Windows.Automation.TreeScope]::Descendants
+$target=@{pid=7;window_id=100}
+function Rid($element){return [string]$element.Id}
+function ExactWindow($target){return $script:main}
+function Element($id,$name,$role){
+ $e=[pscustomobject]@{Id=$id;Current=[pscustomobject]@{Name=$name;ControlType=$role;IsOffscreen=$false;IsEnabled=$true;ProcessId=7};Nodes=@();Pattern=$null}
+ $e|Add-Member ScriptMethod FindAll {param($scope,$condition);return @($this.Nodes|Where-Object {$_.Current.Name -ceq $condition.Value})}
+ $e|Add-Member ScriptMethod GetCurrentPattern {param($pattern);return $this.Pattern}
+ return $e
+}
+function TaskMenuPopupElement($handle){$script:opened+=[long]$handle;return $script:popups[[long]$handle]}
+function Pattern($expanded){
+ $p=[pscustomobject]@{Current=[pscustomobject]@{ExpandCollapseState=$(if($expanded){[System.Windows.Automation.ExpandCollapseState]::Expanded}else{[System.Windows.Automation.ExpandCollapseState]::Collapsed})};Expands=0;Invokes=0}
+ $p|Add-Member ScriptMethod Expand {$this.Expands++;$this.Current.ExpandCollapseState=[System.Windows.Automation.ExpandCollapseState]::Expanded}
+ $p|Add-Member ScriptMethod Collapse {}
+ $p|Add-Member ScriptMethod Invoke {$this.Invokes++}
+ return $p
+}
+$menuType=[System.Windows.Automation.ControlType]::MenuItem
+$answers=@{}
+foreach($mode in @('main','owned','nested','duplicate','ambiguous','foreign')){
+ $script:opened=@();$script:main=Element 100 '' ([System.Windows.Automation.ControlType]::Window)
+ $script:popups=@{}
+ foreach($id in @(200,201,300,400,500,600)){$script:popups[[long]$id]=Element $id '' ([System.Windows.Automation.ControlType]::Menu)}
+ $script:popups[[long]600].Current.ProcessId=8
+ $one=Element 1 'Copy' $menuType;$two=Element 2 'Copy' $menuType
+ switch($mode){
+  main {$script:main.Nodes=@($one)}
+  owned {$script:popups[[long]200].Nodes=@($one)}
+  nested {$script:popups[[long]201].Nodes=@($one)}
+  duplicate {$script:main.Nodes=@($one);$script:popups[[long]200].Nodes=@($one)}
+  ambiguous {$script:main.Nodes=@($one);$script:popups[[long]200].Nodes=@($two)}
+  foreign {foreach($id in @(300,400,500,600)){$script:popups[[long]$id].Nodes=@($one)}}
+ }
+ try {$found=FindVisibleNamed $script:main 'Copy' $menuType $target;$answers[$mode]=[string]$found.Id}
+ catch {$answers[$mode]=$_.Exception.Message}
+ if(@($script:opened|Where-Object {$_ -in @(300,400,500)}).Count){throw 'foreign_popup_read'}
+}
+$expansions=@()
+foreach($expanded in @($false,$true)){
+ $script:main=Element 100 '' ([System.Windows.Automation.ControlType]::Window)
+ foreach($popup in $script:popups.Values){$popup.Nodes=@()}
+ $button=Element 10 'Chat actions' ([System.Windows.Automation.ControlType]::Button);$button.Pattern=Pattern $expanded
+ $copy=Element 11 'Copy' $menuType;$copy.Pattern=Pattern $expanded
+ $link=Element 12 'Copy deeplink Alt+Ctrl+L' $menuType;$link.Pattern=Pattern $false
+ $script:main.Nodes=@($button);$script:popups[[long]200].Nodes=@($copy,$link)
+ $result=CopyTaskDeeplink $script:main $target
+ $expansions+=@{actions=$button.Pattern.Expands;copy=$copy.Pattern.Expands;invoked=$link.Pattern.Invokes;restored=$result.clipboard_restored}
+}
+@{lookups=$answers;expansions=$expansions}|ConvertTo-Json -Depth 4 -Compress
+''')
+    bootstrap = ("[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false);"
+                 "Invoke-Expression ([Text.Encoding]::Unicode.GetString("
+                 "[Convert]::FromBase64String([Console]::In.ReadLine())))")
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand",
+         base64.b64encode(bootstrap.encode("utf-16le")).decode()],
+        input=base64.b64encode(script.encode("utf-16le")).decode() + "\n", capture_output=True,
+        text=True, encoding="utf-8", timeout=15, creationflags=windows_hide_flags())
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout)
+    assert value["lookups"] == {"main": "1", "owned": "1", "nested": "1", "duplicate": "1",
+                                "ambiguous": "task_deeplink_ambiguous",
+                                "foreign": "task_deeplink_unavailable_Copy"}
+    assert value["expansions"] == [
+        {"actions": 1, "copy": 1, "invoked": 1, "restored": True},
+        {"actions": 0, "copy": 0, "invoked": 1, "restored": True}]
