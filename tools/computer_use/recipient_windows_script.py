@@ -1,8 +1,9 @@
 """Windows inbox UIAutomationClient driver. Requests are JSON on stdin, never shell code."""
 
+from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_SCRIPT
+
 SCRIPT = r'''
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
-[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -69,6 +70,7 @@ function FindRuntime($nodes,$id) {
  return $found[0]
 }
 function VerifyComposer($window,$target,$expected) {
+ [void](CodexTaskBinding $window $target)
  $nodes=AllNodes $window
  $composer=FindRuntime $nodes $target.composer_id
  $pane=FindRuntime $nodes $target.pane_id
@@ -95,12 +97,16 @@ try {
    }
    $result=@{windows=$out}
   }
+  'task_identity' { $w=ExactWindow $request.target; $result=CopyTaskDeeplink $w $request.target }
   'snapshot' {
    $w=ExactWindow $request.target
    # Chromium's documented per-window accessibility handshake; no global screen-reader setting.
    $reply=[UIntPtr]::Zero
    [void][HermesRecipientNative]::SendMessageTimeout([IntPtr]$request.target.window_id,0x003D,[UIntPtr]::Zero,[IntPtr]1,2,1000,[ref]$reply)
-   $result=@{window=(WindowFacts $w);nodes=@(AllNodes $w | ForEach-Object {NodeFacts $_});truncated=$false}
+   $binding=$null;$identityError=$null
+   try {$binding=CodexTaskBinding $w $request.target}catch{$identityError=$_.Exception.Message}
+   $result=@{window=(WindowFacts $w);nodes=@(AllNodes $w | ForEach-Object {NodeFacts $_});truncated=$false;
+    task_binding=$binding;task_identity_error=$identityError}
   }
   'compose' {
    $w=ExactWindow $request.target
@@ -140,3 +146,6 @@ try {
  exit 1
 }
 '''
+
+
+SCRIPT = SCRIPT.replace("$request=[Console]", CLIPBOARD_SCRIPT + "\n$request=[Console]")

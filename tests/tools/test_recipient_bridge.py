@@ -14,7 +14,12 @@ WINDOW = {"pid": 71, "window_id": 9, "exe": "C:/Apps/Codex.exe", "process_starte
 
 
 def snapshot():
-    return {"window": dict(WINDOW), "nodes": [
+    task_id = "11111111-2222-4333-8444-555555555555"
+    return {"window": dict(WINDOW), "task_binding": {
+        "task_id": task_id, "deeplink": "codex://threads/" + task_id,
+        "pid": WINDOW["pid"], "window_id": WINDOW["window_id"],
+        "process_started": WINDOW["process_started"], "composer_id": "editor", "pane_id": "pane",
+    }, "nodes": [
         {"id": "pane", "parent": "root", "role": "Group"},
         {"id": "editor", "parent": "pane", "role": "Edit", "name": "Do anything",
          "value_supported": True, "enabled": True, "value": ""},
@@ -34,6 +39,10 @@ class Desktop:
         self.state = snapshot()
         self.composes = self.submits = self.captures = 0
         self.lose_prepare = self.lose_submit = self.no_post = False
+
+    def computer_use_capability(self):
+        return {"mode": "delegated", "verified": True, "tool": "inspect_screen",
+                "reason": "selected_host_fixture_capture_backend"}
 
     def windows(self):
         return [dict(self.state["window"])]
@@ -70,7 +79,8 @@ class Desktop:
 
 def bridge(tmp_path, desktop=None, owner="owner", authorize=None):
     return RecipientBridge(session_id="session", owner=owner, state_dir=tmp_path,
-                           desktop=desktop or Desktop(), authorize=authorize)
+                           desktop=desktop or Desktop(), claude=SimpleNamespace(list_recipients=lambda: []),
+                           authorize=authorize)
 
 
 def selected(service):
@@ -265,3 +275,30 @@ def test_native_pre_action_guard_revocation_is_not_swallowed(tmp_path):
     with pytest.raises(RecipientError, match="revoked"):
         commit(service, token, queued)
     assert desktop.submits == 0
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_same_pane_task_switch_cannot_redirect_delivery(tmp_path, prepared):
+    desktop = Desktop()
+    service = bridge(tmp_path, desktop)
+    token = selected(service)
+    queued = prepare(service, token) if prepared else None
+    other_task = "11111111-2222-3333-4444-555555555555"
+    desktop.state["task_binding"].update(task_id=other_task, deeplink="codex://threads/" + other_task)
+    with pytest.raises(RecipientError, match="recipient_task_changed"):
+        commit(service, token, queued) if prepared else prepare(service, token)
+    assert desktop.submits == 0 and desktop.composes == int(prepared)
+
+
+def test_unproven_task_can_only_offer_available_window_capture(tmp_path):
+    desktop = Desktop()
+    desktop.state.pop("task_binding")
+    service = bridge(tmp_path, desktop)
+    row = service.list_recipients(app="codex_desktop")["recipients"][0]
+    assert row["proven_control"] == "none" and "send" not in row["operations"]
+    assert service.select(row["target_token"])["status"] == "selected"
+    assert service.inspect(target_token=row["target_token"], capture=True)["artifact"]
+    desktop.computer_use_capability = lambda: {
+        "mode": "unavailable", "verified": True, "tool": "inspect_screen", "reason": "runtime_missing"}
+    catalog = service.list_recipients(app="codex_desktop")
+    assert catalog["capabilities"]["computer_use"]["mode"] == "unavailable"
+    assert "inspect" not in catalog["recipients"][0]["operations"]

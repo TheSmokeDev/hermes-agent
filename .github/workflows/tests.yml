@@ -210,6 +210,6 @@ jobs:
       - name: Verify the Discord SDK is installed
         run: .venv/bin/python -c "import discord; from discord import VoiceChannel; print(discord.__version__, VoiceChannel.__module__)"
       - name: Run recipient and Discord boundary regressions
-        run: scripts/run_tests.sh tests/tools/test_recipient_bridge.py tests/tools/test_recipient_native_transport.py tests/gateway/test_recipient_bridge_api.py tests/gateway/test_discord_task_context.py tests/gateway/test_discord_task_worker_policy.py
+        run: scripts/run_tests.sh tests/tools/test_recipient_bridge.py tests/tools/test_recipient_claude.py tests/tools/test_recipient_clipboard.py tests/tools/test_recipient_native_transport.py tests/gateway/test_recipient_bridge_api.py tests/gateway/test_discord_task_context.py tests/gateway/test_discord_task_worker_policy.py
         env:
           HERMES_TEST_WORKERS: 2

@@ -7,7 +7,7 @@ import hmac
 import json
 import secrets
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,28 +33,31 @@ def authorization_guard(callback):
     return guard
 
 
-def capabilities():
+def capabilities(computer_use=None):
     return {"version": 1, "operations": ["list", "select", "send", "reconcile", "inspect"],
             "two_phase_send": True, "existing_tasks_only": True,
-            "task_identity": "native_window_and_pane", "completion_tracking": False}
+            "task_identity": "application_deeplink_or_verified_process_session", "completion_tracking": False,
+            "computer_use": computer_use or {"mode": "unknown", "verified": False,
+                                           "tool": "inspect_screen", "reason": "host_not_probed"}}
 
 
 class RecipientBridge:
-    def __init__(self, *, session_id, owner, state_dir=None, desktop=None, authorize=None):
+    def __init__(self, *, session_id, owner, state_dir=None, desktop=None, claude=None, authorize=None):
         from hermes_constants import get_hermes_home
         self.scope = digest([identifier(session_id, "session_id"), identifier(owner, "owner")])
         self.root = Path(state_dir) if state_dir else get_hermes_home() / "recipient-bridge"
         self.root.mkdir(parents=True, exist_ok=True)
         self.desktop = desktop or WindowsRecipients()
+        self.claude = claude
         self.authorize = authorization_guard(authorize or (lambda: None))
 
     @contextmanager
     def _locked(self):
         # A separate lease database permits receipt commits without releasing the UI lease.
         # Every bridge in this profile shares the lease, including different API peers.
-        with desktop_lease(), sqlite3.connect(self.root / "desktop-lease.sqlite3", timeout=25) as lease:
+        with desktop_lease(), closing(sqlite3.connect(self.root / "desktop-lease.sqlite3", timeout=25)) as lease:
             lease.execute("BEGIN IMMEDIATE")
-            with sqlite3.connect(self.root / "receipts.sqlite3", timeout=25) as db:
+            with closing(sqlite3.connect(self.root / "receipts.sqlite3", timeout=25)) as db:
                 db.execute("CREATE TABLE IF NOT EXISTS records "
                            "(scope TEXT, kind TEXT, key TEXT, value TEXT, PRIMARY KEY(scope,kind,key))")
                 db.commit()
@@ -77,7 +80,18 @@ class RecipientBridge:
             raise RecipientError("recipient_not_found", 404)
         return value
 
+    def _claude_adapter(self):
+        if self.claude is None:
+            from tools.computer_use.recipient_claude import ClaudeRecipients
+            try:
+                self.claude = ClaudeRecipients()
+            except ImportError as exc:
+                raise RecipientError("claude_native_dependency_unavailable", 503) from exc
+        return self.claude
+
     def _snapshot(self, target):
+        if target.get("backend") == "claude_peer":
+            raise RecipientError("recipient_inspection_unavailable")
         snapshot = self.desktop.snapshot(target["identity"])
         if window_identity(snapshot["window"]) != window_identity(target["identity"]):
             raise RecipientError("recipient_window_changed")
@@ -90,22 +104,21 @@ class RecipientBridge:
         return view
 
     def probe(self):
-        from tools.computer_use.cua_backend import cua_driver_runtime_contract_status
         self.authorize()
-        contract = cua_driver_runtime_contract_status()
-        return {"recipient_bridge": capabilities(), **self.desktop.probe(),
-                "computer_use": {"available": bool(contract.get("ready")),
-                                 "reason": contract.get("reason"), "capture": "on_demand",
-                                 "permissions_verified": False}}
+        computer = self.desktop.computer_use_capability()
+        return {"recipient_bridge": capabilities(computer), **self.desktop.probe(),
+                "computer_use": computer}
 
     def list_recipients(self, app=None):
-        if app is not None and app not in {"codex", "claude_code"}:
+        if app is not None and app not in {"codex_desktop", "claude_code"}:
             raise RecipientError("unsupported_application", 400)
         recipients = []
         with self._locked() as db:
-            for window in self.desktop.windows():
+            computer = self.desktop.computer_use_capability()
+            can_capture = computer["mode"] == "delegated" and computer["verified"] is True
+            for window in ([] if app == "claude_code" else self.desktop.windows()):
                 actual_app = app_identity(window)
-                if actual_app is None or (app and app != actual_app):
+                if actual_app != "codex_desktop" or (app and app != actual_app):
                     continue
                 identity = window_identity(window)
                 reason, control = None, "none"
@@ -120,20 +133,37 @@ class RecipientBridge:
                           "app": actual_app, "task_id": identity.get("task_id", "window:" + digest(identity)[:32]),
                           "title": window.get("title", actual_app), "target_token": token,
                           "proven_control": control,
-                          "operations": ["select", "inspect"] + (["send", "reconcile"] if control == "ui_bridge" else []),
+                          "operations": ["select"] + (["inspect"] if can_capture else [])
+                          + (["send", "reconcile"] if control == "ui_bridge" else []),
                           "reason": reason}
                 self._put(db, "target", token, {"identity": identity, "public": public})
                 recipients.append(public)
-        return {"recipients": recipients, "capabilities": capabilities()}
+            peer_reason = None
+            if app in (None, "claude_code"):
+                try:
+                    records = self._claude_adapter().list_recipients()
+                except RecipientError as exc:
+                    records, peer_reason = [], exc.code
+                for record in records:
+                    token = secrets.token_urlsafe(32)
+                    public = {**record["public"], "target_token": token}
+                    self._put(db, "target", token, {**record, "public": public, "backend": "claude_peer"})
+                    recipients.append(public)
+        result = {"recipients": recipients, "capabilities": capabilities(computer)}
+        if peer_reason:
+            result["capabilities"]["claude_peer_reason"] = peer_reason
+        return result
 
     def select(self, target_token):
         with self._locked() as db:
             target = self._target(db, target_token)
-            if target["public"]["proven_control"] == "ui_bridge":
+            if target.get("backend") == "claude_peer":
+                self._claude_adapter().select(target["identity"])
+            elif target["public"]["proven_control"] == "ui_bridge":
                 self._view(target)
             else:
                 self._snapshot(target)
-            return {**target["public"], "selected": True}
+            return {**target["public"], "selected": True, "status": "selected"}
 
     @staticmethod
     def _receipt(operation):
@@ -147,6 +177,14 @@ class RecipientBridge:
         if operation["status"] in {"posted", "failed"}:
             return self._receipt(operation)
         self.authorize()
+        if target.get("backend") == "claude_peer":
+            if operation["status"] != "queued":
+                receipt = self._claude_adapter().reconcile(
+                    target["identity"], digest([self.scope, operation["operation_id"]]),
+                    message=operation["message"])
+                self._peer_result(operation, receipt)
+                self._put(db, "operation", operation["operation_id"], operation)
+            return self._receipt(operation)
         try:
             view = self._view(target)
             if operation["status"] == "preparing":
@@ -170,12 +208,63 @@ class RecipientBridge:
         self._put(db, "operation", operation["operation_id"], operation)
         return self._receipt(operation)
 
+    @staticmethod
+    def _peer_result(operation, receipt):
+        status = receipt.get("status", "unknown")
+        operation["status"] = status if status in {"posted", "failed", "unknown"} else "unknown"
+        for field in ("reason", "message_receipt"):
+            if field in receipt:
+                operation[field] = receipt[field]
+        if status == "posted":
+            operation["posted_at"] = timestamp()
+
+    def _send_peer(self, db, target, operation_id, target_token, message, commit_token):
+        adapter = self._claude_adapter()
+        operation = self._get(db, "operation", operation_id)
+        if operation is None:
+            if commit_token is not None:
+                raise RecipientError("operation_not_found", 404)
+            adapter.select(target["identity"])
+            self.authorize()
+            operation = {key: target["public"][key] for key in ("recipient_id", "app", "task_id")}
+            operation.update(operation_id=operation_id, target_token=target_token, message=message,
+                             status="queued", commit_token=secrets.token_urlsafe(32), created_at=timestamp())
+            self._put(db, "operation", operation_id, operation)
+            return self._receipt(operation)
+        if operation["target_token"] != target_token or operation["message"] != message:
+            raise RecipientError("operation_conflict")
+        if operation["status"] != "queued":
+            return self._reconcile(db, operation, target)
+        if commit_token is None:
+            return self._receipt(operation)
+        if not isinstance(commit_token, str) or not hmac.compare_digest(commit_token, operation["commit_token"]):
+            raise RecipientError("invalid_commit_token", 403)
+        adapter.select(target["identity"])
+        self.authorize()
+        operation.update(status="unknown", attempted_at=timestamp())
+        operation.pop("commit_token", None)
+        self._put(db, "operation", operation_id, operation)
+        try:
+            receipt = adapter.send(target["identity"], message, digest([self.scope, operation_id]),
+                                   authorize=self.authorize)
+            self._peer_result(operation, receipt)
+            self._put(db, "operation", operation_id, operation)
+        except RecipientError as exc:
+            if exc.status in {401, 403}:
+                raise
+        except Exception:
+            # The peer might have consumed the message before the connection failed.
+            pass
+        return self._reconcile(db, operation, target)
+
     def send(self, *, operation_id, target_token, message, commit_token=None):
         operation_id = identifier(operation_id, "operation_id")
         if not isinstance(message, str) or not message.strip() or len(message) > 16000 or "\x00" in message:
             raise RecipientError("invalid_message", 400)
         with self._locked() as db:
             target = self._target(db, target_token)
+            if target.get("backend") == "claude_peer":
+                return self._send_peer(db, target, operation_id, target_token, message, commit_token)
             operation = self._get(db, "operation", operation_id)
             if operation is not None:
                 if operation["target_token"] != target_token or operation["message"] != message:

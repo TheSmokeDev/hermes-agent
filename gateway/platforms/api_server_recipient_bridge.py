@@ -56,6 +56,7 @@ async def handle(adapter, request, *, action):
             raise RecipientError("invalid_recipient_request", 400)
         method = bridge.list_recipients if action == "list" else getattr(bridge, action)
         result = await asyncio.to_thread(method, **arguments)
+        authorize()
         return web.json_response(result, headers={"Cache-Control": "no-store"})
     except (RecipientError, DiscordTaskContextError) as exc:
         return web.json_response({"error": exc.code}, status=exc.status, headers={"Cache-Control": "no-store"})

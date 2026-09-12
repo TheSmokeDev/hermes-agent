@@ -8,6 +8,7 @@ from tools.computer_use.recipient_contract import RecipientError
 from tools.computer_use.recipient_windows import WindowsRecipients
 
 
+@pytest.mark.windows_only
 @pytest.mark.parametrize("revoked", [False, True])
 def test_native_ready_handshake_checks_authority_before_commit(monkeypatch, revoked):
     import tools.computer_use.recipient_windows as native
@@ -36,12 +37,11 @@ def test_native_ready_handshake_checks_authority_before_commit(monkeypatch, revo
             return self.returncode
 
     process, authorized = Process(), [False]
-    monkeypatch.setattr(native.sys, "platform", "win32")
     monkeypatch.setenv("SystemRoot", "C:/Windows")
     monkeypatch.setattr(cua_backend, "sanitized_cua_driver_env", lambda: {})
     monkeypatch.setattr(native.subprocess, "Popen", lambda *a, **kw: process)
     def authorize():
-        payload = json.loads(process.stdin.getvalue())
+        payload = json.loads(process.stdin.getvalue().splitlines()[1])
         assert payload["action"] == "submit" and payload["target"]["composer_id"] == "exact-editor"
         if revoked:
             raise RecipientError("revoked", 403)
