@@ -5,6 +5,13 @@ its authenticated peer inbox. It does not start a new process, resume the sessio
 elsewhere, or inject terminal keystrokes. Delivery is a next-turn user message;
 Claude still applies its peer admission and permission rules.
 
+A Claude task using permission bypass may require approval inside that existing
+Claude session before it admits an external Hermes message. Hermes does not
+claim bypass, child or self-sent authority and does not change Claude's inbound
+policy. Approving the individual incoming message is sufficient when Claude
+presents that choice. An absent approval prompt or transcript row cannot prove
+whether a message was held, rejected or expired; its receipt remains `unknown`.
+
 ## Requirements and identity
 
 Claude must publish peer protocol 1 in its active session registry. The adapter
