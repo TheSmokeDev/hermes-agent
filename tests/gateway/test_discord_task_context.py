@@ -1,5 +1,7 @@
 """Offline event provenance, audience revisions and configured-peer context boundaries."""
+import sys
 import weakref
+from unittest.mock import patch
 
 import pytest
 
@@ -26,13 +28,13 @@ class Runner(GatewayAuthorizationMixin, GatewayInboundMixin):
 
 
 def room_fixture():
-    channel = Object(id=20)
-    guild = Object(id=10, voice_states={})
+    channel = Object(id=20, voice_states={})
+    guild = Object(id=10)
     members = {}
     def add(user_id, bot=False):
         member = Object(id=user_id, bot=bot, guild=guild, roles=[], voice=Object(channel=channel))
         members[user_id] = member
-        guild.voice_states[user_id] = member.voice
+        channel.voice_states[user_id] = member.voice
         return member
     operator, peer = add(2), add(1)
     add(99, bot=True)
@@ -58,6 +60,40 @@ def room_fixture():
 def binding(room):
     token = GatewayCommandInvocation(room.runner, room.source, allowed=True).capture_discord_task_context_proof()
     return {"proof": token["proof"], "session_id": "same-session", "binding_id": "native-connection"}
+
+
+@pytest.mark.parametrize("channel_type", [2, 13], ids=["voice", "stage"])
+def test_real_discord_channel_voice_states_preserve_audience_guards(channel_type):
+    # Gateway conftest installs a Discord mock before this file is collected.
+    with patch.dict(sys.modules):
+        for name in ("discord", "discord.ext", "discord.ext.commands"):
+            sys.modules.pop(name, None)
+        discord = pytest.importorskip("discord")
+        intents = discord.Intents.default()
+        intents.members = True
+        client = discord.Client(intents=intents)
+        users = [(2, 20, False), (1, 20, False), (99, 20, True), (3, 21, False)]
+        guild = discord.Guild(state=client._connection, data={
+            "id": "10",
+            "channels": [{"id": str(channel_id), "type": channel_type, "name": "room",
+                          "position": 0, "bitrate": 64000, "user_limit": 0}
+                         for channel_id in (20, 21)],
+            "voice_states": [{"user_id": str(user_id), "channel_id": str(channel_id),
+                              "session_id": "offline", "deaf": False, "mute": False,
+                              "self_deaf": False, "self_mute": False, "self_video": False,
+                              "suppress": False} for user_id, channel_id, _ in users],
+            "members": [{"user": {"id": str(user_id), "username": "member", "discriminator": "0",
+                                  "avatar": None, "bot": bot}, "roles": [], "flags": 0}
+                        for user_id, _, bot in users],
+        })
+        room = room_fixture()
+        room.client.get_guild = lambda ident: guild if ident == guild.id else None
+        context = room.contexts.issue(room.source)
+        assert context["audience_user_ids"] == ["1", "2"]
+        assert context["channel_id"] == "20" and context["operator_user_id"] == "2"
+        guild._remove_member(guild.get_member(1))
+        with pytest.raises(DiscordTaskContextError, match="audience_incomplete"):
+            room.contexts.issue(room.source)
 
 
 def test_event_only_issuer_scope_lease_and_copy_isolation():
@@ -132,7 +168,7 @@ def test_audience_or_operator_mutation_permanently_retires_proof(mutation):
     room.operator.voice = Object(channel=room.channel)
     room.adapter._client = room.client
     room.members.pop(3, None)
-    room.guild.voice_states.pop(3, None)
+    room.channel.voice_states.pop(3, None)
     with pytest.raises(DiscordTaskContextError, match="expired"):
         room.contexts.verify(**body, profile="alpha", owner="owner")
 
