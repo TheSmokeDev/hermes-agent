@@ -207,10 +207,18 @@ class RecipientBridge:
                 tail = view["messages"][ids.index(anchor) + 1:] if anchor in ids else []
                 matches = [m for m in tail if m["id"] not in operation["baseline"]
                            and m["text"] == operation["message"]]
+                receipt = None
                 if len(matches) == 1:
-                    operation.update(status="posted", posted_at=timestamp(),
-                                     message_receipt={"native_message_id": matches[0]["id"],
-                                                      "sha256": hashlib.sha256(operation["message"].encode()).hexdigest()})
+                    receipt = {"native_message_id": matches[0]["id"],
+                               "sha256": hashlib.sha256(operation["message"].encode()).hexdigest()}
+                elif operation.get("attempted_at"):
+                    observer = getattr(self.desktop, "posted_receipt", None)
+                    if observer is not None:
+                        receipt = observer(target["identity"], operation["message"],
+                                           operation["attempted_at"], view["messages"])
+                if receipt is not None:
+                    self.authorize()
+                    operation.update(status="posted", posted_at=timestamp(), message_receipt=receipt)
         except RecipientError:
             # Identity loss after a possibly successful invoke can never authorize a retry.
             pass

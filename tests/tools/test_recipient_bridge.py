@@ -393,3 +393,39 @@ def test_queue_preview_and_draft_are_not_posted_transcript_receipts(tmp_path):
     assert posted["status"] == posted["delivery_stage"] == "posted"
     assert posted["message_receipt"]["native_message_id"] == "posted-user"
     assert desktop.composes == desktop.submits == 1
+
+
+
+def test_codex_user_body_excludes_observed_copy_footer_and_later_status_text():
+    state = snapshot()
+    state["nodes"].extend([
+        {"id": "body-user", "parent": "pane", "role": "Text", "name": "You said:"},
+        {"id": "body-a", "parent": "pane", "role": "Text", "name": "EXACT", "text_supported": True},
+        {"id": "body-b", "parent": "pane", "role": "Text", "name": "_", "text_supported": True},
+        {"id": "body-c", "parent": "pane", "role": "Text", "name": "MESSAGE 3:26 AM", "text_supported": True},
+        {"id": "footer", "parent": "pane", "role": "Text", "name": "3:27 AM", "text_supported": True},
+        {"id": "copy-message", "parent": "pane", "role": "Button", "name": "Copy message", "invoke_supported": True},
+        {"id": "status", "parent": "pane", "role": "Text", "name": "Later transient UI status", "text_supported": True},
+    ])
+    assert recipient_view(state)["messages"][-1]["text"] == "EXACT_MESSAGE 3:26 AM"
+
+
+def test_native_receipt_observation_requires_current_live_identity(tmp_path):
+    desktop = Desktop()
+    desktop.no_post = True
+    service = bridge(tmp_path, desktop)
+    token = selected(service)
+    prepared = prepare(service, token)
+    assert commit(service, token, prepared)["status"] == "unknown"
+    observed = []
+    def posted_receipt(target, message, attempted_at, messages):
+        observed.append(target)
+        return {"native_message_id": "native-item", "sha256": "verified-hash"}
+    desktop.posted_receipt = posted_receipt
+    desktop.state["window"]["pid"] += 1
+    assert service.reconcile(operation_id="operation", target_token=token)["status"] == "unknown"
+    assert observed == []
+    desktop.state["window"]["pid"] -= 1
+    posted = service.reconcile(operation_id="operation", target_token=token)
+    assert posted["status"] == "posted" and posted["message_receipt"]["native_message_id"] == "native-item"
+    assert len(observed) == desktop.submits == 1

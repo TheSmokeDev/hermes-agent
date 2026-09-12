@@ -93,18 +93,25 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
         raise RecipientError("recipient_task_identity_unverified")
     identity = {**window, "app": app, "pane_id": pane["id"], "composer_id": editor["id"],
                 "composer_name": editor["name"], "task_id": task_id, "deeplink": binding["deeplink"]}
-    messages, current = [], None
+    messages, current, parts = [], None, []
     for node in peers:
+        if (app == "codex_desktop" and current is not None and node.get("role") == "Button"
+                and node.get("name") == "Copy message" and node.get("invoke_supported")):
+            if parts and re.fullmatch(r"(?:[1-9]|1[0-2]):[0-5][0-9] [AP]M", parts[-1]):
+                current["text"] = "".join(parts[:-1])
+            current = None
         if node.get("role") != "Text":
             continue
         name = node.get("name", "")
         if name in markers:
             current = {"id": node["id"], "text": ""}
+            parts = []
             messages.append(current)
         elif name in {"ChatGPT said:", "Claude said:", "Assistant:"}:
             current = None
         elif current is not None and node.get("text_supported"):
-            current["text"] += node.get("text", name)
+            parts.append(node.get("text", name))
+            current["text"] = "".join(parts)
     return {"identity": identity, "composer_text": editor.get("value", ""),
             "submit_id": submits[0]["id"] if submits else None, "messages": messages,
             "title": snapshot["window"].get("title", app), "nodes": nodes}

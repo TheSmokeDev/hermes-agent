@@ -113,6 +113,10 @@ class WindowsRecipients:
     def submit(self, target, message, submit_id, *, authorize):
         return self._call("submit", target=target, message=message, submit_id=submit_id, authorize=authorize)
 
+    def posted_receipt(self, target, message, attempted_at, visible_messages):
+        from tools.computer_use.recipient_codex import posted_receipt
+        return posted_receipt(target, message, attempted_at, visible_messages)
+
     def capture(self, target):
         from tools.computer_use.cua_backend import CuaDriverBackend, cua_driver_runtime_contract_status
         if not cua_driver_runtime_contract_status().get("ready"):
