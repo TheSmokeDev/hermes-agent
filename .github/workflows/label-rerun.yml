@@ -37,6 +37,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -uo pipefail
 
@@ -80,6 +81,15 @@ jobs:
               echo "Run is still $STATUS after wait — giving up."
               exit 0
             fi
+          fi
+
+          # A push during the wait can make this run stale. Recheck both
+          # heads immediately before rerunning to avoid cancelling newer CI.
+          RUN_HEAD=$(gh run view "$RUN_ID" --repo "$REPO" --json headSha --jq '.headSha' 2>/dev/null) || RUN_HEAD=""
+          CURRENT_HEAD=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null) || CURRENT_HEAD=""
+          if [ "$RUN_HEAD" != "$HEAD_SHA" ] || [ "$CURRENT_HEAD" != "$HEAD_SHA" ]; then
+            echo "CI run is stale or its current head could not be verified — skipping rerun."
+            exit 0
           fi
 
           echo "Run completed. Rerunning all failed jobs..."
