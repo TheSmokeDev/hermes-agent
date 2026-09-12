@@ -988,9 +988,17 @@ class GatewayInboundMixin:
                 from hermes_cli.plugins import get_plugin_command_handler
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = plugin_handler(event.get_command_args().strip())
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    from hermes_cli.plugins import get_plugin_commands
+                    from gateway.discord_task_context import GatewayCommandInvocation
+                    entry = get_plugin_commands().get(command.replace("_", "-"), {})
+                    invocation = GatewayCommandInvocation(self, source, allowed=event.allow_gateway_control)
+                    try:
+                        kwargs = {"invocation": invocation} if entry.get("invocation_context") is True else {}
+                        result = plugin_handler(event.get_command_args().strip(), **kwargs)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                    finally:
+                        invocation.close()
                     return True, str(result) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)

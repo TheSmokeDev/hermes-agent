@@ -72,6 +72,7 @@ class SubagentHandle:
     role: str
     depth: int
     capability: str
+    child_session_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -212,6 +213,7 @@ _HANDLE_FIELD_CHECKS: tuple[tuple[str, Callable[[Any], bool]], ...] = (
     ("role", lambda v: isinstance(v, str)),
     ("depth", lambda v: type(v) is int),
     ("capability", lambda v: isinstance(v, str)),
+    ("child_session_id", _opt_str),
 )
 
 # Launch-request rejections in check order: (predicate, error). The type check leads so later predicates may
@@ -270,13 +272,15 @@ class SubagentLifecycleService:
             PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
             getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
             int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
+            child_session_id=_session_id_of(child),
         )
         record = _Record(handle, SubagentState.PENDING, created, agent=child)
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        context = contextvars.copy_context()
+        record.future = _EXECUTOR.submit(context.run, self._run, record, request.goal, parent)
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
@@ -317,6 +321,27 @@ class SubagentLifecycleService:
                     agent, f"Lifecycle cancellation requested: {reason[:500]}", tool_reason="subagent cancellation requested",
                 )
         return SubagentCancelResult(bool(accepted), unsupported=not accepted, state=SubagentState.CANCEL_REQUESTED)
+
+    def steering(self, handle: SubagentHandle) -> dict:
+        """Public current child target; a handle never authorizes control of an inactive parent."""
+        from agent.run_steering import steering_target
+        record = self._record(handle)
+        with _REGISTRY.lock:
+            if record is None or record.state is not SubagentState.RUNNING or record.result is not None:
+                return {"supported": False, "reason": "child_not_running"}
+            return {**steering_target(record.agent), "child_id": record.handle.subagent_id}
+
+    def steer(self, handle: SubagentHandle, text: str, *, expected_session_id: str, expected_turn_id: str) -> str:
+        """Return queued/rejected/unsupported, never delivered/applied. No replacement execution."""
+        from agent.run_steering import steer_current_turn
+        if not isinstance(text, str) or not text.strip() or len(text) > _MAX_GOAL_CHARS:
+            raise SubagentLifecycleError("steer text must be nonempty and at most 16000 characters")
+        record = self._record(handle)
+        with _REGISTRY.lock:
+            if record is None or record.state is not SubagentState.RUNNING or record.result is not None:
+                return "rejected"
+            return steer_current_turn(record.agent, text, expected_session_id=expected_session_id,
+                                      expected_turn_id=expected_turn_id)
 
     def result(self, handle: SubagentHandle) -> SubagentResult:
         record = self._record(handle)

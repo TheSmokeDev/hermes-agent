@@ -19,7 +19,7 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants
 )
-from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
+from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_rows
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
@@ -521,7 +521,7 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
 
 def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
-    from agent.context_compressor import split_user_originated_turn
+    from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
 
     repairs = 0
     merged: List[Dict] = []
@@ -530,6 +530,9 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
         if (
             prev is not None and prev.get("role") == "user"
             and isinstance(msg, dict) and msg.get("role") == "user"
+            # Durable rows must remain immutable: merging would hide an unwritten prompt
+            # behind the old marker, or rewrite cached bytes after a turn-start flush.
+            and not prev.get(_DB_PERSISTED_MARKER) and not msg.get(_DB_PERSISTED_MARKER)
             # A summary carrier followed by a new user row is a deliberate durable shape after
             # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
             and split_user_originated_turn(prev)[0] is None
@@ -551,7 +554,33 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
     return merged, repairs
 
 
+def _project_passive_assistant_continuations(messages: List[Dict]) -> Tuple[List[Dict], int]:
+    """Quote an external assistant continuation without rewriting a completed assistant turn.
+
+    A singleton external reply can follow a cached assistant payload. Merging the two
+    invalidates that payload's api_content. Present only the later transcript as attributed
+    context at the next admission instead; raw storage keeps its original assistant role.
+    Provider adapters can coalesce adjacent user context on copies without changing durable rows.
+    """
+    projected: List[Dict] = []
+    repairs = 0
+    for msg in messages:
+        prev = projected[-1] if projected and isinstance(projected[-1], dict) else None
+        if (prev is not None and prev.get("role") == "assistant"
+                and isinstance(msg, dict) and msg.get("role") == "assistant"
+                and msg.get("display_kind") == "passive_conversation"
+                and not msg.get("tool_calls")):
+            msg = dict(msg)
+            text = msg.pop("api_content", None) or msg.get("content", "")
+            msg["role"] = "user"
+            msg["content"] = f"[External assistant transcript]\n{text}"
+            repairs += 1
+        projected.append(msg)
+    return projected, repairs
+
+
 _SEQUENCE_REPAIR_PASSES = (
+    _project_passive_assistant_continuations,
     _merge_consecutive_assistants, _drop_stray_tool_results, _prune_unanswered_tool_calls,
     _merge_consecutive_users,
 )
@@ -563,7 +592,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     responses or 400s); this is the pre-call belt for host-fed, resumed or replayed histories.
     Passes in order: merge consecutive assistant turns (BEFORE orphan detection so the merged
     tool_call-id union is known); drop stray tool results; prune unanswered tool_calls; merge
-    consecutive user turns. A user turn directly after an assistant turn is valid and left alone.
+    consecutive unpersisted user turns. Durable user rows retain their identity and cached sidecars;
+    ``drop_thinking_only_and_merge_users`` enforces user alternation on the provider request copy.
+    A user turn directly after an assistant turn is valid and left alone.
     """
     if not messages:
         return 0
@@ -1022,6 +1053,12 @@ def drop_thinking_only_and_merge_users(
             merged.append(m)
         else:
             merged[-1] = {**prev, "content": content}  # copy so caller dicts are never mutated
+            # Exact receipt-owned steering retains only the outer boundary flags:
+            # internal whitespace is already preserved by the concatenation.
+            if m.get("_exact_steer_trailing"):
+                merged[-1]["_exact_steer_trailing"] = True
+            else:
+                merged[-1].pop("_exact_steer_trailing", None)
             merges += 1
     if dropped == 0 and merges == 0:
         return messages
@@ -3153,16 +3190,14 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
     # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
     # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
     # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
+    from agent.steer_origin import combine_steer_text
     _lock = getattr(agent, "_pending_steer_lock", None)
     if _lock is not None:
         with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
+            agent._pending_steer = combine_steer_text(agent._pending_steer, steer_text)
     else:
         existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+        agent._pending_steer = combine_steer_text(existing, steer_text)
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -3199,7 +3234,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         _requeue_pending_steer(agent, steer_text)
         return
-    messages.append(steer_user_row(steer_text))
+    messages.extend(steer_user_rows(steer_text))
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

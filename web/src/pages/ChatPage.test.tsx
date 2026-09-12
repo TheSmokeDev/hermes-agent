@@ -157,6 +157,7 @@ type CloseEventLike = {
 
 let container: HTMLDivElement;
 let root: Root;
+let ChatPage: typeof import("./ChatPage").default;
 
 // jsdom runs without an origin here (per-file @vitest-environment jsdom on a
 // node-default config), so localStorage is undefined. Stub it so components
@@ -189,7 +190,7 @@ async function render(ui: ReactNode) {
   await act(async () => root.render(ui));
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
@@ -246,6 +247,8 @@ beforeEach(() => {
   sessionStorage.clear();
   vi.stubGlobal("localStorage", localStorageMock);
   localStorageMock.clear();
+  // Keep cold module transforms outside the interaction timeout.
+  ({ default: ChatPage } = await import("./ChatPage"));
 });
 
 afterEach(async () => {
@@ -256,8 +259,6 @@ afterEach(async () => {
 
 describe("ChatPage", () => {
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPage isActive />
@@ -286,8 +287,6 @@ describe("ChatPage", () => {
       configurable: true,
       value: { addEventListener, removeEventListener, width: 1280 },
     });
-
-    const { default: ChatPage } = await import("./ChatPage");
 
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
@@ -325,7 +324,6 @@ describe("ChatPage", () => {
 
 describe("ChatPage side panel collapse", () => {
   async function renderChat() {
-    const { default: ChatPage } = await import("./ChatPage");
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPage isActive />
@@ -386,7 +384,6 @@ describe("ChatPage PTY ticket connect deadline", () => {
   });
 
   async function renderChat() {
-    const { default: ChatPage } = await import("./ChatPage");
     await render(
       <MemoryRouter initialEntries={["/chat"]}>
         <ChatPage isActive />

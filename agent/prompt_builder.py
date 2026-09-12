@@ -528,6 +528,12 @@ def steer_user_row(steer_text: str) -> Dict[str, Any]:
             "display_kind": STEER_DISPLAY_KIND}
 
 
+def steer_user_rows(steer_text: str) -> list[Dict[str, Any]]:
+    from agent.steer_origin import bound_steer_rows
+    bound = bound_steer_rows(steer_text)
+    return bound if bound is not None else [steer_user_row(steer_text)]
+
+
 STEER_CHANNEL_NOTE = (
     # Only what the marker cannot say about itself: it is the ONLY trusted shape and carries full user authority.
     # Dieted (#95681, maintainer-directed). History: #40240 added this note when the marker was bare and

@@ -42,6 +42,10 @@ _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
 _ROW_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items")
 
 
+class _ExecutionOriginFlushClaim(dict):
+    """Host-created, JSON-safe flush unit; an untrusted plain dict is not a writer claim."""
+
+
 def _is_ephemeral_scaffolding(msg: Any) -> bool:
     """True when ``msg`` is internal recovery scaffolding that must never reach the durable transcript."""
     return isinstance(msg, dict) and any(msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
@@ -204,6 +208,15 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
         if id(msg) in history_ids or id(msg) in seed_ids:
             msg[_DB_PERSISTED_MARKER] = True
             continue
+        claim = getattr(agent, "_execution_origin_claim", None)
+        metadata = msg.get("display_metadata")
+        if isinstance(claim, dict) and isinstance(metadata, dict) and msg.get("role") == "user":
+            from hermes_state_execution_origins import origin_metadata
+            if metadata.get("execution_origin") == origin_metadata(claim):
+                # Keep failed/deferred writes bound to this input after the executor exits or
+                # a later run changes the agent's ambient claim. Never stamp unrelated input.
+                if not isinstance(msg.get("_execution_origin_flush_claim"), _ExecutionOriginFlushClaim):
+                    msg["_execution_origin_flush_claim"] = _ExecutionOriginFlushClaim(claim)
         batch_rows.append(_db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message))
         batch_msgs.append(msg)
     return batch_rows, batch_msgs
@@ -213,11 +226,16 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
     """One transaction for the turn's new rows: on failure nothing lands and no markers are stamped."""
     if not batch_rows:
         return
+    claims = [unit for msg in batch_msgs
+              if isinstance((unit := msg.get("_execution_origin_flush_claim")), _ExecutionOriginFlushClaim)]
+    if claims and any(claim != claims[0] for claim in claims[1:]):
+        raise ValueError("A flush cannot combine different execution-origin claims")
     agent._session_db.append_messages_batch(
         session_id=agent.session_id, messages=batch_rows,
         compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
         turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
         turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+        **({"_execution_origin": dict(claims[0])} if claims else {}),
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
 

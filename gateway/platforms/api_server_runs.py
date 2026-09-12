@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from contextlib import suppress
@@ -100,8 +101,10 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
+        ("GET", "/v1/runs/{run_id}/approval", self._handle_run_approvals),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+        ("GET", "/v1/runs/{run_id}/steer", self._handle_get_run_steering),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
 
 
@@ -135,7 +138,7 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     should_persist = (
         status != previous_status
         or status in TERMINAL_STATUSES
-        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"}))
+        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id", "child_id", "child_session_id"}))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -302,6 +305,10 @@ def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _op
             code="idempotency_key_conflict", status=409)
     original_id = str(record["run_id"])
     status = self._durable_run_status(request, original_id) or record["status"]
+    admission_error = status.get("admission_error")
+    if isinstance(admission_error, dict):
+        return web.json_response(admission_error["body"], status=admission_error["http_status"],
+                                 headers={"Idempotency-Replayed": "true"})
     return _accepted_response(original_id, status.get("status", "queued"), gateway_session_key, replayed=True)
 
 
@@ -327,6 +334,10 @@ class _RunLaunch:
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    origin_claim: Optional[dict] = None
+    child_request: Optional[dict] = None
+    child_dispatch: Optional[dict] = None
+    discord_task_context: Optional[dict] = None
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -397,6 +408,49 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
+    origin = body.get("origin")
+    child_request = body.get("child")
+    if child_request is not None:
+        from gateway.platforms.api_server_children import validate_child_request
+        try:
+            if origin is None:
+                raise ValueError("Linked child work requires its original utterance identity")
+            validate_child_request(child_request)
+            if "worker" in child_request and room_dispatch is not None:
+                raise ValueError("External workers require an explicitly authorized gateway job")
+        except ValueError as exc:
+            return _json_error(_openai_error, str(exc), code="invalid_child_dispatch", status=400)
+    if origin is not None:
+        from hermes_state_execution_origins import validate_origin_input
+        try:
+            if not self._expected_api_key() or self._room_grant_token(request):
+                return _json_error(_openai_error, "Origin input requires gateway bearer authentication",
+                                   code="origin_auth_required", status=401)
+            if (not idempotency_key or not self._run_idempotency_store.durable
+                    or not isinstance(body.get("session_id"), str) or not body["session_id"]
+                    or body.get("previous_response_id") or body.get("conversation_history")
+                    or room_dispatch is not None or room_execution_policy is not None):
+                raise ValueError("Origin input requires durable idempotency and an existing conversation")
+            if child_request is not None and isinstance(origin, dict) and "receipt_id" in origin:
+                if type(origin["receipt_id"]) is not int or origin["receipt_id"] < 1:
+                    raise ValueError("receipt_id must be positive")
+                validate_origin_input({key: value for key, value in origin.items() if key != "receipt_id"}, body.get("input"))
+            else:
+                validate_origin_input(origin, body.get("input"))
+        except ValueError:
+            return _json_error(_openai_error, "Invalid authoritative origin request",
+                               code="invalid_origin", status=400)
+    discord_context = None
+    if "discord_task_context" in body or request.headers.get("X-Hermes-Discord-Task-Proof") is not None:
+        from gateway.platforms.api_server_discord_context import verify_request, error_response
+        from gateway.discord_task_context import DiscordTaskContextError
+        try:
+            if origin is None or child_request is None or "discord_task_context" not in body:
+                raise DiscordTaskContextError("discord_context_requires_linked_child", 400)
+            discord_context = verify_request(self, request, session_id=body.get("session_id"),
+                                             binding=body["discord_task_context"])
+        except DiscordTaskContextError as exc:
+            return error_response(exc)
     idempotency_scope = idempotency_fingerprint = ""
     if idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
@@ -484,6 +538,38 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
                 self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    origin_claim = child_dispatch = None
+    if origin is not None:
+        from passive_history_ingress import PRODUCER, IngressError, error_response
+        try:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                raise IngressError("store_unavailable", 503)
+            if child_request is not None:
+                child_dispatch = await asyncio.to_thread(
+                    db.prepare_child_dispatch, body["session_id"], producer=PRODUCER,
+                    **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope,
+                    correlation_id=child_request["correlation_id"], fingerprint=idempotency_fingerprint)
+                session_id = child_dispatch["parent_session_id"]
+                self._set_run_status(run_id, "queued", session_id=session_id,
+                                     parent_message_id=child_dispatch["parent_message_id"],
+                                     origin_event_id=origin["event_id"], origin_turn_id=origin["origin_turn_id"],
+                                     child_correlation_id=child_request["correlation_id"])
+            else:
+                origin_claim = await asyncio.to_thread(
+                    db.reserve_execution_origin, body["session_id"], producer=PRODUCER,
+                    **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope)
+                session_id = origin_claim["session_id"]
+        except (ValueError, RuntimeError, sqlite3.Error) as exc:
+            error, status = error_response(exc)
+            # No task was scheduled. Do not replay this durable admission as 202, or release
+            # it across an uncertain canonical write and risk dispatching the origin twice.
+            error = {**error, "retryable": False}
+            self._set_run_status(run_id, "failed", error=error["error"],
+                                 admission_error={"http_status": status, "body": error})
+            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
+                        self._run_approval_sessions, self._run_statuses, self._run_owners)
+            return web.json_response(error, status=status)
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
@@ -494,6 +580,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
+        origin_claim=origin_claim, child_request=child_request, child_dispatch=child_dispatch,
+        discord_task_context=discord_context,
         turn_author=turn_author)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
@@ -521,6 +609,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
+    had_origin_claim = hasattr(agent, "_execution_origin_claim")
+    prior_origin_claim = getattr(agent, "_execution_origin_claim", None)
     with self._profile_scope(run.request_profile):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
@@ -550,12 +640,32 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
-            # Passed only when set: a human turn keeps today's call shape.
+            origin_kwargs = {}
+            if run.origin_claim is not None:
+                from hermes_state_execution_origins import origin_metadata
+                agent._execution_origin_claim = run.origin_claim
+                origin_kwargs = {
+                    "persist_user_message": run.user_message,
+                    "persist_user_platform_id": "origin:" + run.origin_claim["event_id"],
+                    "persist_user_display_metadata": {"execution_origin": origin_metadata(run.origin_claim)},
+                }
+            # Author labels remain attribution-only, including alongside origin metadata.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+            if run.child_request is not None:
+                from gateway.platforms.api_server_children import run_child_sync
+                from tools.approval_context import bind_api_run_approval_transport
+                with bind_api_run_approval_transport(run.approval_session_key, approval_notify):
+                    r = run_child_sync(self, run, agent)
+            else:
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id, **origin_kwargs, **author_kwargs)
         finally:
+            if run.origin_claim is not None:
+                if had_origin_claim:
+                    agent._execution_origin_claim = prior_origin_claim
+                elif hasattr(agent, "_execution_origin_claim"):
+                    del agent._execution_origin_claim
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
@@ -624,19 +734,34 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage = await loop.run_in_executor(
+        execution = loop.run_in_executor(
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        if run.child_request is not None:
+            from gateway.platforms.api_server_children import cancel_linked_child
+            while True:
+                try:
+                    result, usage = await asyncio.shield(execution)
+                    break
+                except asyncio.CancelledError:
+                    self._stopping_run_ids.add(run_id)
+                    cancel_linked_child(agent, approval_key=run.approval_session_key)
+                    with suppress(Exception):
+                        _api_server.request_hard_interrupt(agent, "API run task cancelled")
+        else:
+            result, usage = await execution
         if not isinstance(result, dict):
             result = {}
+        artifact_fields = {"artifacts": result["artifacts"]} if result.get("artifacts") else {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
-            _finish("cancelled")
+            _finish("cancelled", artifact_fields, output=result.get("final_response", ""))
         elif result.get("failed"):
             # Non-retryable client errors (401/400) return failed=True rather than raising.
-            _finish("failed", error=_redact_api_error_text(result.get("error") or "agent run failed"))
+            _finish("failed", artifact_fields, output=result.get("final_response", ""),
+                    error=_redact_api_error_text(result.get("error") or "agent run failed"))
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
-            _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
+            _finish("completed", {**extra, **artifact_fields}, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
         _finish("cancelled")
         raise
@@ -704,6 +829,12 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
         status = self._set_run_status(run_id, "running")
     if status is None:
         return run_id, None, agent, task, _run_not_found(_openai_error, run_id)
+    from gateway.platforms.api_server_discord_context import verify_request, error_response
+    from gateway.discord_task_context import DiscordTaskContextError
+    try:
+        verify_request(self, request, session_id=status.get("parent_session_id") or status.get("session_id"))
+    except DiscordTaskContextError as exc:
+        return run_id, None, None, None, error_response(exc)
     return run_id, status, agent, task, None
 
 
@@ -733,6 +864,17 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         await asyncio.sleep(0.05)
     else:
         return _run_not_found(_api_server._openai_error, run_id)
+    from gateway.platforms.api_server_discord_context import verify_request, error_response
+    from gateway.discord_task_context import DiscordTaskContextError
+
+    def check_voice_delivery():
+        status = self._durable_run_status(request, run_id) or {}
+        return verify_request(self, request, session_id=status.get("parent_session_id") or status.get("session_id"))
+
+    try:
+        check_voice_delivery()
+    except DiscordTaskContextError as exc:
+        return error_response(exc)
     q = self._run_streams[run_id]
     self._run_stream_subscribers.add(run_id)
     response = web.StreamResponse(status=200, headers={
@@ -743,8 +885,10 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
             try:
                 event = await asyncio.wait_for(q.get(), timeout=30.0)
             except asyncio.TimeoutError:
+                check_voice_delivery()
                 await response.write(b": keepalive\n\n")
                 continue
+            check_voice_delivery()
             if event is None:  # run finished
                 await response.write(b": stream closed\n\n")
                 break
@@ -769,10 +913,38 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
 _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
 
 
+async def _handle_run_approvals(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Read the owning run's live approval queue; cached status metadata is never actionable."""
+    if not self._expected_api_key() and not self._room_grant_token(request):
+        return self._auth_failed_response()
+    run_id, status, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="approve", active_fallback=False)
+    if err is not None:
+        return err
+    state = self._run_statuses.get(run_id, status).get("status", "unknown")
+    if run_id in self._stopping_run_ids and state not in TERMINAL_STATUSES:
+        state = "stopping"
+    from gateway.platforms.api_server_task_workers import current_worker
+    worker = current_worker(self._active_run_agents.get(run_id), run_id)
+    pending = []
+    if worker is not None and state not in TERMINAL_STATUSES and state != "stopping":
+        pending = worker.session.approvals()
+        for item in pending:
+            item["description"] = _api_server.redact_sensitive_text(str(item.get("description", "")))
+        return web.json_response({"object": "hermes.run.approvals", "run_id": run_id,
+                                  "status": state, "approvals": pending}, headers={"Cache-Control": "no-store"})
+    approval_key = self._run_approval_sessions.get(run_id)
+    if approval_key and state != "stopping" and state not in TERMINAL_STATUSES:
+        from tools.approval import list_gateway_approvals
+        pending = list_gateway_approvals(approval_key)
+    return web.json_response({"object": "hermes.run.approvals", "run_id": run_id,
+                              "status": state, "approvals": pending}, headers={"Cache-Control": "no-store"})
+
+
 async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, run_status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -780,14 +952,33 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    from gateway.platforms.api_server_discord_context import verify_request, error_response
+    from gateway.discord_task_context import DiscordTaskContextError
+    try:
+        verify_request(self, request, session_id=run_status.get("parent_session_id") or run_status.get("session_id"))
+    except DiscordTaskContextError as exc:
+        return error_response(exc)
     raw_choice = str(body.get("choice", "")).strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
-    room_scoped = bool(self._room_grant_token(request))
+    room_scoped = bool(self._room_grant_token(request) or request.headers.get("X-Hermes-Discord-Task-Proof"))
     raw_request_id = body.get("request_id")
     request_id = raw_request_id.strip() if isinstance(raw_request_id, str) else ""
     # Room grants may resolve exactly one request and never widen to session/always.
     allowed = {"once", "deny"} if room_scoped else {"once", "session", "always", "deny"}
     resolve_all = any(_api_server._coerce_request_bool(body.get(k), default=False) for k in ("all", "resolve_all"))
+    from gateway.platforms.api_server_task_workers import current_worker
+    worker = current_worker(self._active_run_agents.get(run_id), run_id)
+    if worker is not None:
+        if (not request_id or resolve_all or choice not in {"once", "session", "deny"}
+            or (room_scoped and choice == "session") or run_id in self._stopping_run_ids
+            or self._run_statuses.get(run_id, run_status).get("status") in TERMINAL_STATUSES):
+            return _json_error(_openai_error, "Exact active worker approval required", status=409)
+        try:
+            receipt = await asyncio.to_thread(worker.approve, request_id, choice)
+        except ValueError:
+            return _json_error(_openai_error, "Worker approval is no longer current", status=409)
+        return web.json_response({"object": "hermes.run.approval_response", "run_id": run_id,
+                                  **receipt}, headers={"Cache-Control": "no-store"})
     approval_session_key = self._run_approval_sessions.get(run_id)
     for failed, message, code, status in (
         (raw_request_id is not None and (not request_id or len(request_id) > 256),
@@ -805,6 +996,11 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
             return _json_error(_openai_error, message, code=code, status=status)
     try:
         from tools.approval import resolve_gateway_approval
+        # Body parsing awaited after authorization; stop/completion may have landed since.
+        current_status = self._run_statuses.get(run_id, run_status).get("status")
+        if run_id in self._stopping_run_ids or current_status == "stopping" or current_status in TERMINAL_STATUSES:
+            return _json_error(_openai_error, "Run no longer accepts approval decisions",
+                               code="approval_not_active", status=409)
         resolved = resolve_gateway_approval(
             approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
     except Exception as exc:
@@ -827,15 +1023,23 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
-    # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
-    # agent ref) is what rejects stop-then-steer.
-    if status.get("status") != "running" or not hasattr(agent, "steer"):
-        return _json_error(
-            _openai_error, f"Run is not currently accepting steer input: {run_id}",
-            code="run_not_accepting_steer", status=409)
     body, err = await self._read_json_body(request)
     if err:
         return err
+    if isinstance(body, dict) and "control" in body:
+        from gateway.platforms.api_server_steering import handle
+        return await handle(self, request, _api_server=_api_server, body=body)
+    from gateway.platforms.api_server_task_workers import current_worker
+    if current_worker(agent, run_id) is not None:
+        return _json_error(_openai_error, "Worker steering requires an origin-linked control", status=409)
+    # Recheck after body I/O: a concurrent stop must not leave a usable parent reference.
+    status = self._run_statuses.get(run_id, status)
+    # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
+    # agent ref) is what rejects stop-then-steer.
+    if run_id in self._stopping_run_ids or status.get("status") != "running" or not hasattr(agent, "steer"):
+        return _json_error(
+            _openai_error, f"Run is not currently accepting steer input: {run_id}",
+            code="run_not_accepting_steer", status=409)
     raw_text = body.get("input") or body.get("message") or body.get("text") or ""
     steer_text = _api_server._normalize_chat_content(raw_text).strip()
     if not steer_text:
@@ -843,7 +1047,14 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
             _openai_error, "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
             code="invalid_steer_input", status=400)
     try:
-        accepted = bool(agent.steer(steer_text))
+        if "child_correlation_id" in status or "child_id" in status:
+            from gateway.platforms.api_server_steering import live_target
+            target, child = live_target(self, run_id, agent, status)
+            accepted = bool(child and target["supported"] and child[0].steer(
+                child[1], steer_text, expected_session_id=target["session_id"],
+                expected_turn_id=target["turn_id"]) == "queued")
+        else:
+            accepted = bool(agent.steer(steer_text))
     except Exception as exc:
         logger.exception("[api_server] steer failed for run %s", run_id)
         return _json_error(_openai_error, _api_server._redact_api_error_text(exc), code="steer_failed", status=500)
@@ -852,6 +1063,11 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)
     _mark_run_event(self, run_id, "run.steered", accepted=True)
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
+
+
+async def _handle_get_run_steering(self, request: "web.Request", *, _api_server) -> "web.Response":
+    from gateway.platforms.api_server_steering import handle
+    return await handle(self, request, _api_server=_api_server)
 
 
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
@@ -869,6 +1085,8 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
             code="run_not_active", status=409)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     self._stopping_run_ids.add(run_id)
+    from gateway.platforms.api_server_children import cancel_linked_child
+    cancel_linked_child(agent, approval_key=self._run_approval_sessions.get(run_id))
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")

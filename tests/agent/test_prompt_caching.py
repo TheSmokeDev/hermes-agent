@@ -1,6 +1,9 @@
 """Tests for agent/prompt_caching.py — Anthropic cache control injection."""
 
 import copy
+import logging
+
+import pytest
 
 from agent.prompt_caching import (
     _apply_cache_marker,
@@ -422,25 +425,71 @@ class TestNormalizationOrdering:
 
         assert in_window == out_of_window
 
-    def test_cache_marking_runs_after_every_message_mutation(self):
-        """Ordering invariant, locked against regression."""
-        import inspect
+    @pytest.mark.parametrize("native", [False, True])
+    @pytest.mark.parametrize("exact_steer", [False, True])
+    def test_assembled_cache_prefix_survives_normalization_and_window_rollover(self, native, exact_steer):
+        from agent.turn_request_assembly import assemble_api_request
+        from run_agent import AIAgent
 
-        from agent import turn_request_assembly
+        agent = object.__new__(AIAgent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "openrouter"
+        agent.model = "anthropic/fixture"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.prefill_messages = []
+        agent.ephemeral_system_prompt = None
+        agent.context_compressor = None
+        agent.tools = []
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = native
+        agent._cache_ttl = "5m"
+        agent._needs_thinking_reasoning_pad = lambda: False
 
-        src = inspect.getsource(turn_request_assembly)
-        # Anchor on the call-block request plan, not the retry helper.
-        anchor = src.index("Build the request-local cache sections")
-        mark = src.index("build_prompt_cache_plan(\n", anchor)
-        for earlier in (
-            'am["content"].strip()',              # whitespace normalization
-            "_sanitize_api_messages(api_messages)",       # orphan sweep
-            "_drop_thinking_only_and_merge_users(",       # drop / merge
-            "_sanitize_messages_surrogates(api_messages)",
-        ):
-            assert src.index(earlier) < mark, (
-                f"{earlier!r} must run before cache breakpoints are injected"
-            )
+        raw = "  file1\nfile2\ud800\n  "
+        correction = "  correction\nexact  "
+        messages = [
+            {"role": "user", "content": "first ask", "_db_persisted": True, "_row_id": 1},
+            {"role": "assistant", "content": "first reply", "_db_persisted": True, "_row_id": 2},
+            {"role": "user", "content": "display text", "api_content": raw,
+             "_db_persisted": True, "_row_id": 3},
+            {"role": "tool", "content": "orphan", "tool_call_id": "missing"},
+            {"role": "assistant", "content": None,
+             "reasoning_details": [{"type": "reasoning.encrypted", "data": "private"}]},
+            {"role": "user", "content": correction, "_db_persisted": True, "_row_id": 4},
+        ]
+        if exact_steer:
+            messages[2]["content"] = messages[2].pop("api_content")
+            messages[2]["_exact_steer_leading"] = True
+            messages[-1]["_exact_steer_trailing"] = True
+        before = copy.deepcopy(messages)
+
+        def assemble(history):
+            return assemble_api_request(
+                agent, messages=history, current_turn_user_idx=-1,
+                _ext_prefetch_cache=None, _plugin_user_context=None, moa_config=None,
+                active_system_prompt="stable system", original_user_message="",
+                pending_moa_prepared_request=None, request_logger=logging.getLogger(__name__),
+            ).api_messages
+
+        initial = assemble(messages)
+        assert [m["role"] for m in initial] == ["system", "user", "assistant", "user"], initial
+        expected = raw.replace("\ud800", "\ufffd") + "\n\n" + correction
+        if not exact_steer:
+            expected = expected.strip()
+        assert initial[-1]["content"] == [{"type": "text", "text": expected, "cache_control": MARKER}]
+        assert all(not any(k.startswith("_exact_steer_") for k in m) for m in initial)
+        assert messages == before
+
+        # Moving the same durable rows outside the marker window must keep their wire bytes.
+        later = assemble(messages + [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "follow-up"},
+            {"role": "assistant", "content": "next answer"},
+            {"role": "user", "content": "last follow-up"},
+        ])
+        assert later[3]["content"] == expected
+        assert later[0] == initial[0]
+        assert messages == before
 
 
 class TestStripAnthropicCacheControl:

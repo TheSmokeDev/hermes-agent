@@ -232,11 +232,22 @@ def _previous_tool_round(messages: Any) -> list:
 def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
     """Append the steer marker as a standalone user row after the newest tool message; with no
     tool message, put the text back so the post-tool-execution drain delivers it later."""
+    from agent.steer_origin import has_bound_steer
+    if has_bound_steer(steer_text):
+        # A historical tool row can be in the cached prefix. Bound delivery may append only;
+        # wait for a fresh tool boundary rather than inserting before already-sent context.
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "tool":
+            from agent.prompt_builder import steer_user_rows
+            messages.extend(steer_user_rows(steer_text))
+        else:
+            from agent.agent_runtime_helpers import _requeue_pending_steer
+            _requeue_pending_steer(agent, steer_text)
+        return
     for _si in range(len(messages) - 1, -1, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
-            from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
+            from agent.prompt_builder import steer_user_rows
+            messages[_si + 1:_si + 1] = steer_user_rows(steer_text)
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer

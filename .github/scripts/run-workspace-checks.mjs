@@ -82,7 +82,8 @@ async function main() {
     console.error(
       '::error::No workspace package declares a check script — refusing to report green having run nothing.',
     )
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
 
   if (argv.includes('--list')) {
@@ -133,7 +134,8 @@ async function main() {
   if (failed.length > 0) {
     for (const r of failed) console.error(`::error::${r.unit.pkg} :: ${r.unit.script} failed`)
     console.error(`::error::${failed.length} of ${results.length} checks failed`)
-    process.exit(1)
+    process.exitCode = 1
+    return
   }
   console.log(`\nall ${results.length} checks passed`)
 }

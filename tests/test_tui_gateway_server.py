@@ -16437,6 +16437,7 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    monkeypatch.setattr("hermes_cli.inventory._anthropic_oauth_credentials_present", lambda: False)
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -22016,19 +22017,20 @@ def test_prompt_submit_consecutive_rewinds_with_returned_survivor_row_ids(
         server._sessions.pop(sid, None)
 
 
-def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("fragment_role", ["user", "assistant"])
+def test_prompt_submit_rebind_map_preserves_durable_users_and_clears_merged_rows(
+    monkeypatch, tmp_path, fragment_role
 ):
-    """The bounded map classifies physical active IDs before user;user repair."""
+    """Rebinding retains durable users but clears assistant IDs hidden by repair."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=tmp_path / "rowid-repaired-wedge.db")
     session_key = "real-db-rowid-repaired-wedge"
     db.create_session(session_key, "cli")
     physical = [
-        {"role": "user", "content": "first fragment"},
-        {"role": "user", "content": "second fragment"},
-        {"role": "assistant", "content": "combined reply"},
+        {"role": fragment_role, "content": "first fragment"},
+        {"role": fragment_role, "content": "second fragment"},
+        {"role": "assistant" if fragment_role == "user" else "user", "content": "combined reply"},
         {"role": "user", "content": "target"},
         {"role": "assistant", "content": "target reply"},
     ]
@@ -22039,11 +22041,9 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
     repaired = db.get_messages_as_conversation(
         session_key, repair_alternation=True, include_row_ids=True
     )
-    # Provider repair merges the wedge and necessarily drops the second
-    # physical user's row identity from the replay view.
-    assert physical_ids[1] not in {
-        server._message_row_id(message) for message in repaired
-    }
+    # Canonical users stay separate; assistant repair still hides a physical ID.
+    replay_ids = {server._message_row_id(message) for message in repaired}
+    assert (physical_ids[1] in replay_ids) is (fragment_role == "user")
 
     sess = _session(
         history=[dict(message) for message in repaired], session_key=session_key
@@ -22070,7 +22070,10 @@ def test_prompt_submit_rebind_map_clears_active_row_hidden_by_sequence_repair(
         )
         assert response.get("error") is None, response
         row_id_map = response["result"]["survivor_row_id_map"]
-        assert row_id_map[str(physical_ids[1])] is None
+        assert (row_id_map[str(physical_ids[1])] is not None) is (fragment_role == "user")
+        assert row_id_map[str(physical_ids[0])] is not None
+        assert row_id_map[str(physical_ids[3])] is None
+        assert row_id_map[str(physical_ids[4])] is None
         assert "999999" not in row_id_map
     finally:
         server._sessions.pop(sid, None)
