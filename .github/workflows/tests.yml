@@ -195,3 +195,21 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  recipient-bridge:
+    name: Recipient bridge and real Discord SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+      - name: Install locked runtime and real messaging SDKs
+        run: uv sync --locked --python 3.11 --extra dev --extra messaging
+      - name: Verify the Discord SDK is installed
+        run: .venv/bin/python -c "import discord; from discord import VoiceChannel; print(discord.__version__, VoiceChannel.__module__)"
+      - name: Run recipient and Discord boundary regressions
+        run: scripts/run_tests.sh tests/tools/test_recipient_bridge.py tests/tools/test_recipient_native_transport.py tests/gateway/test_recipient_bridge_api.py tests/gateway/test_discord_task_context.py tests/gateway/test_discord_task_worker_policy.py
+        env:
+          HERMES_TEST_WORKERS: 2

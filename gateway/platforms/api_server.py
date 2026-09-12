@@ -1555,6 +1555,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes.extend(http_routes(self))
         from gateway.platforms.api_server_discord_context import http_routes as discord_context_routes
         routes.extend(discord_context_routes(self))
+        from gateway.platforms.api_server_recipient_bridge import http_routes as recipient_routes
+        routes.extend(recipient_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -2253,6 +2255,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from passive_history_ingress import capabilities as passive_capabilities
         from gateway.platforms.api_server_children import capabilities as child_capabilities
         from gateway.platforms.api_server_steering import capabilities as steer_capabilities
+        from tools.computer_use.recipient_bridge import capabilities as recipient_capabilities
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2267,6 +2270,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "passive_history": passive_capabilities(),
                 "linked_child_dispatch": child_capabilities(),
                 "run_steering": steer_capabilities(),
+                "recipient_bridge": recipient_capabilities(),
+                "delegated_computer_use": {"state": "probe_required", "capture": "on_demand",
+                                          "probe_path": "/v1/recipient-bridge/probe"},
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
