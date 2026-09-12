@@ -178,8 +178,8 @@ function CopyTaskDeeplink($window,$target) {
   return $answer
  } finally {
   if($backup){try {$restored=$backup.RestoreIfUnchanged();if($answer){$answer.clipboard_restored=$restored}}finally{$backup.Dispose()}}
-  if($copy){try{$copy.Collapse()}catch{}}
-  if($actions){try{$actions.Collapse()}catch{}}
+  if($copy){try{if($copy.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded){$copy.Collapse()}}catch{}}
+  if($actions){try{if($actions.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded){$actions.Collapse()}}catch{}}
  }
 }
 function CodexTaskBinding($window,$target) {

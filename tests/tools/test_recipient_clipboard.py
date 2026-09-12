@@ -140,10 +140,10 @@ function Element($id,$name,$role){
 }
 function TaskMenuPopupElement($handle){$script:opened+=[long]$handle;return $script:popups[[long]$handle]}
 function Pattern($expanded){
- $p=[pscustomobject]@{Current=[pscustomobject]@{ExpandCollapseState=$(if($expanded){[System.Windows.Automation.ExpandCollapseState]::Expanded}else{[System.Windows.Automation.ExpandCollapseState]::Collapsed})};Expands=0;Invokes=0}
+ $p=[pscustomobject]@{Current=[pscustomobject]@{ExpandCollapseState=$(if($expanded){[System.Windows.Automation.ExpandCollapseState]::Expanded}else{[System.Windows.Automation.ExpandCollapseState]::Collapsed})};Expands=0;Invokes=0;Collapses=0;AutoClose=@()}
  $p|Add-Member ScriptMethod Expand {$this.Expands++;$this.Current.ExpandCollapseState=[System.Windows.Automation.ExpandCollapseState]::Expanded}
- $p|Add-Member ScriptMethod Collapse {}
- $p|Add-Member ScriptMethod Invoke {$this.Invokes++}
+ $p|Add-Member ScriptMethod Collapse {$this.Collapses++;$this.Current.ExpandCollapseState=[System.Windows.Automation.ExpandCollapseState]::Expanded}
+ $p|Add-Member ScriptMethod Invoke {$this.Invokes++;foreach($menu in $this.AutoClose){$menu.Current.ExpandCollapseState=[System.Windows.Automation.ExpandCollapseState]::Collapsed}}
  return $p
 }
 $menuType=[System.Windows.Automation.ControlType]::MenuItem
@@ -173,9 +173,10 @@ foreach($expanded in @($false,$true)){
  $button=Element 10 'Chat actions' ([System.Windows.Automation.ControlType]::Button);$button.Pattern=Pattern $expanded
  $copy=Element 11 'Copy' $menuType;$copy.Pattern=Pattern $expanded
  $link=Element 12 'Copy deeplink Alt+Ctrl+L' $menuType;$link.Pattern=Pattern $false
+ $link.Pattern.AutoClose=@($button.Pattern,$copy.Pattern)
  $script:main.Nodes=@($button);$script:popups[[long]200].Nodes=@($copy,$link)
  $result=CopyTaskDeeplink $script:main $target
- $expansions+=@{actions=$button.Pattern.Expands;copy=$copy.Pattern.Expands;invoked=$link.Pattern.Invokes;restored=$result.clipboard_restored}
+ $expansions+=@{actions=$button.Pattern.Expands;copy=$copy.Pattern.Expands;invoked=$link.Pattern.Invokes;restored=$result.clipboard_restored;actions_collapses=$button.Pattern.Collapses;copy_collapses=$copy.Pattern.Collapses}
 }
 @{lookups=$answers;expansions=$expansions}|ConvertTo-Json -Depth 4 -Compress
 ''')
@@ -194,5 +195,5 @@ foreach($expanded in @($false,$true)){
                                 "ambiguous": "task_deeplink_ambiguous",
                                 "foreign": "task_deeplink_unavailable_Copy"}
     assert value["expansions"] == [
-        {"actions": 1, "copy": 1, "invoked": 1, "restored": True},
-        {"actions": 0, "copy": 0, "invoked": 1, "restored": True}]
+        {"actions": 1, "copy": 1, "invoked": 1, "restored": True, "actions_collapses": 0, "copy_collapses": 0},
+        {"actions": 0, "copy": 0, "invoked": 1, "restored": True, "actions_collapses": 0, "copy_collapses": 0}]
