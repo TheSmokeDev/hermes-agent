@@ -14,7 +14,9 @@ from gateway.platforms import api_server_runs
 _HTTP_HANDLER_DELEGATES = (
     ("_handle_get_run", "_handle_get_run"),
     ("_handle_run_events", "_handle_run_events"),
+    ("_handle_run_approvals", "_handle_run_approvals"),
     ("_handle_run_approval", "_handle_run_approval"),
+    ("_handle_get_run_steering", "_handle_get_run_steering"),
     ("_handle_steer_run", "_handle_steer_run"),
     ("_handle_stop_run", "_handle_stop_run"),
 )
@@ -174,9 +176,35 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("POST", "/v1/runs"),
         ("GET", "/v1/runs/{run_id}"),
         ("GET", "/v1/runs/{run_id}/events"),
+        ("GET", "/v1/runs/{run_id}/approval"),
         ("POST", "/v1/runs/{run_id}/approval"),
         ("POST", "/v1/runs/{run_id}/steer"),
+        ("GET", "/v1/runs/{run_id}/steer"),
         ("POST", "/v1/runs/{run_id}/stop"),
     ]
     assert all(handler.__self__ is adapter for _, _, handler in room_routes)
     assert all(handler.__self__ is adapter for _, _, handler in run_routes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["approval", "steer"])
+async def test_run_control_read_routes_require_auth_and_run_ownership(surface):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import PlatformConfig
+
+    adapter = api_server.APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "fixture-key"}))
+    app = web.Application()
+    app.router.add_routes([
+        web.route(method, path, handler)
+        for method, path, handler in api_server_runs._http_routes(adapter)
+    ])
+    adapter._run_statuses["foreign-run"] = {"run_id": "foreign-run", "status": "running"}
+    route = f"/v1/runs/foreign-run/{surface}"
+    try:
+        async with TestClient(TestServer(app)) as client:
+            assert (await client.get(route)).status == 401
+            assert (await client.get(route, headers={"Authorization": "Bearer invalid"})).status == 401
+            assert (await client.get(route, headers={"Authorization": "Bearer fixture-key"})).status == 404
+    finally:
+        api_server_runs._close_run_state(adapter)

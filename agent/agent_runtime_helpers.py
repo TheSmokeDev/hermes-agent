@@ -592,7 +592,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     responses or 400s); this is the pre-call belt for host-fed, resumed or replayed histories.
     Passes in order: merge consecutive assistant turns (BEFORE orphan detection so the merged
     tool_call-id union is known); drop stray tool results; prune unanswered tool_calls; merge
-    consecutive user turns. A user turn directly after an assistant turn is valid and left alone.
+    consecutive unpersisted user turns. Durable user rows retain their identity and cached sidecars;
+    ``drop_thinking_only_and_merge_users`` enforces user alternation on the provider request copy.
+    A user turn directly after an assistant turn is valid and left alone.
     """
     if not messages:
         return 0
