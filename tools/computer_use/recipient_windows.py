@@ -85,7 +85,7 @@ class WindowsRecipients:
             known = {"recipient_window_changed", "recipient_control_stale", "recipient_pane_changed",
                      "wrong_composer", "composer_not_editable", "composer_text_changed",
                      "approval_surface_active", "submit_control_changed", "submit_control_unsupported",
-                     "accessibility_truncated", "recipient_task_changed", "task_deeplink_unavailable",
+                     "accessibility_truncated", "unsupported_accessibility", "recipient_task_changed", "task_deeplink_unavailable",
                      "clipboard_busy", "clipboard_changed", "clipboard_format_not_preservable",
                      "clipboard_backup_failed", "clipboard_restore_failed", "clipboard_owner_unavailable",
                      "task_deeplink_ambiguous", "task_deeplink_unavailable_Do_anything",

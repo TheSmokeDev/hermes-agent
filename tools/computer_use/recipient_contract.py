@@ -50,6 +50,9 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
     nodes = snapshot.get("nodes", [])
     if snapshot.get("truncated"):
         raise RecipientError("accessibility_truncated")
+    if any(n.get("role") == "Unknown" and (n.get("invoke_supported") or n.get("value_supported"))
+           for n in nodes):
+        raise RecipientError("unsupported_accessibility")
     # Host-reviewed selectors are installation configuration, never request/model input.
     names = (profile or {}).get("composer_names", ["Do anything"] if app == "codex_desktop" else [])
     if app == "claude_code" and not any(n.get("selected") and n.get("name") == "Code" for n in nodes):

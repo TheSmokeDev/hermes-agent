@@ -302,3 +302,20 @@ def test_unproven_task_can_only_offer_available_window_capture(tmp_path):
     catalog = service.list_recipients(app="codex_desktop")
     assert catalog["capabilities"]["computer_use"]["mode"] == "unavailable"
     assert "inspect" not in catalog["recipients"][0]["operations"]
+
+
+@pytest.mark.parametrize("surface", ["decoration", "composer", "submit", "modal"])
+def test_unknown_accessibility_nodes_never_grant_control(surface):
+    state = snapshot()
+    if surface == "decoration":
+        state["nodes"].append({"id": "unknown", "role": "Unknown", "name": ""})
+        assert recipient_view(state)["submit_id"] == "send"
+    else:
+        if surface == "composer":
+            state["nodes"][1]["role"] = "Unknown"
+        elif surface == "submit":
+            state["nodes"][2]["role"] = "Unknown"
+        else:
+            state["nodes"].append({"id": "unknown-modal", "role": "Unknown", "modal": True})
+        with pytest.raises(RecipientError):
+            recipient_view(state)

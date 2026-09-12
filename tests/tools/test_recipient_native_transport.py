@@ -55,3 +55,23 @@ def test_native_ready_handshake_checks_authority_before_commit(monkeypatch, revo
         assert desktop.submit({"composer_id": "exact-editor"}, "hello", "exact-send",
                               authorize=authorize) == {"submitted": True}
         assert process.committed
+
+
+@pytest.mark.windows_only
+def test_null_native_control_types_have_no_action_role():
+    import base64
+    import os
+    from pathlib import Path
+    import subprocess
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.computer_use.recipient_windows_script import CONTROL_ROLE_SCRIPT
+    command = CONTROL_ROLE_SCRIPT + """
+$roles=@((ControlRole $null),(ControlRole ([pscustomobject]@{ProgrammaticName=$null})),(ControlRole ([pscustomobject]@{ProgrammaticName='ControlType.Edit'})))
+ConvertTo-Json -InputObject $roles -Compress
+"""
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run([str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+                             base64.b64encode(command.encode("utf-16le")).decode()], capture_output=True,
+                            text=True, encoding="utf-8", timeout=10, creationflags=windows_hide_flags())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["Unknown", "Unknown", "Edit"]

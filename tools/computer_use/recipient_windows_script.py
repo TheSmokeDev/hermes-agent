@@ -2,6 +2,13 @@
 
 from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_SCRIPT
 
+CONTROL_ROLE_SCRIPT = r'''
+function ControlRole($controlType) {
+ if($null -eq $controlType -or [string]::IsNullOrEmpty($controlType.ProgrammaticName)){return 'Unknown'}
+ return $controlType.ProgrammaticName.Replace('ControlType.','')
+}
+'''
+
 SCRIPT = r'''
 $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -46,7 +53,7 @@ function NodeFacts($element) {
  if($element.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern,[ref]$win)){$modal=$win.Current.IsModal}
  $text=$null;$textSupported=$element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern,[ref]$text)
  $name=$c.Name
- return @{id=(Rid $element);parent=$(if($parent){Rid $parent}else{''});role=$c.ControlType.ProgrammaticName.Replace('ControlType.','');
+ return @{id=(Rid $element);parent=$(if($parent){Rid $parent}else{''});role=(ControlRole $c.ControlType);
   name=$name;automation_id=$c.AutomationId;enabled=$c.IsEnabled;offscreen=$c.IsOffscreen;selected=$selected;modal=$modal;
   value_supported=($valueSupported -and -not $value.Current.IsReadOnly);invoke_supported=$invokeSupported;
   text_supported=$textSupported;text=$name;value=$(if($valueSupported -and $c.ControlType -eq [System.Windows.Automation.ControlType]::Edit){ComposerValue $element $value}elseif($valueSupported){$value.Current.Value}else{''})}
@@ -75,12 +82,18 @@ function VerifyComposer($window,$target,$expected) {
  $composer=FindRuntime $nodes $target.composer_id
  $pane=FindRuntime $nodes $target.pane_id
  if((Rid ($walker.GetParent($composer))) -cne (Rid $pane)){throw 'recipient_pane_changed'}
+ if((ControlRole $composer.Current.ControlType) -ne 'Edit' -or (ControlRole $pane.Current.ControlType) -notin @('Group','Pane','Document')){throw 'wrong_composer'}
  if($composer.Current.Name -cne $target.composer_name -or -not $composer.Current.IsEnabled -or $composer.Current.IsOffscreen){throw 'wrong_composer'}
  $value=$null
  if(-not $composer.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$value) -or $value.Current.IsReadOnly){throw 'composer_not_editable'}
  if((ComposerValue $composer $value) -cne $expected){throw 'composer_text_changed'}
  foreach($n in $nodes){
   $c=$n.Current;$modal=$null
+  if((ControlRole $c.ControlType) -eq 'Unknown'){
+   $unknownInvoke=$null;$unknownValue=$null
+   if($n.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$unknownInvoke) -or
+    ($n.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$unknownValue) -and -not $unknownValue.Current.IsReadOnly)){throw 'unsupported_accessibility'}
+  }
   if(($n.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern,[ref]$modal) -and $modal.Current.IsModal) -or
    ($c.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $c.Name -in @('Approve','Allow once','Allow this session','Run command','Yes, proceed'))){throw 'approval_surface_active'}
  }
@@ -123,7 +136,7 @@ try {
    $w=ExactWindow $request.target
    $verified=VerifyComposer $w $request.target ([string]$request.message)
    $button=FindRuntime $verified.nodes $request.submit_id
-   if((Rid ($walker.GetParent($button))) -cne $request.target.pane_id -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
+   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne $request.target.pane_id -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
    $invoke=$null
    if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
    [Console]::Out.WriteLine('{"ready":true}'); [Console]::Out.Flush()
@@ -131,7 +144,7 @@ try {
    $w=ExactWindow $request.target
    $verified=VerifyComposer $w $request.target ([string]$request.message)
    $button=FindRuntime $verified.nodes $request.submit_id
-   if((Rid ($walker.GetParent($button))) -cne $request.target.pane_id -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
+   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne $request.target.pane_id -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
    $invoke=$null
    if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
    # Invoke the exact submit control: no foreground-global keyboard/Enter fallback.
@@ -148,4 +161,4 @@ try {
 '''
 
 
-SCRIPT = SCRIPT.replace("$request=[Console]", CLIPBOARD_SCRIPT + "\n$request=[Console]")
+SCRIPT = SCRIPT.replace("$request=[Console]", CLIPBOARD_SCRIPT + CONTROL_ROLE_SCRIPT + "\n$request=[Console]")
