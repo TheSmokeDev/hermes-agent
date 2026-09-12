@@ -62,8 +62,8 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
-      # them finish. There are two reasons this is not ``npm run --ws check``.
+      # The step fails only after all checks finish. There are two reasons
+      # this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
       #     run then reports one failure, where the matrix this replaced
@@ -79,5 +79,7 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
+      # Each check sizes its own worker pool to the runner. On the smaller
+      # fork runner, avoid stacking multiple full-machine pools at once.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository != 'NousResearch/hermes-agent' && '--concurrency 1' || '' }}
