@@ -8,7 +8,7 @@ import {
   $newChatRoute,
   resolveNewChatOwnerRoute
 } from '@/store/profile'
-import { $connection, $sessions } from '@/store/session'
+import { $connection, $selectedStoredSessionId, $sessions } from '@/store/session'
 import {
   $sessionStates,
   $sessionTiles,
@@ -55,6 +55,7 @@ export function composerVoiceOwnerKey(sessionId: string | null | undefined, allo
       $sessionStates,
       $sessionTiles,
       $sessions,
+      $selectedStoredSessionId,
       $gateway,
       $connection,
       $activeGatewayProfile,
@@ -64,11 +65,12 @@ export function composerVoiceOwnerKey(sessionId: string | null | undefined, allo
     ],
     () => {
       if (!sessionId && allowDraft) {
-        const route = resolveNewChatOwnerRoute()
+        const storedSessionId = $selectedStoredSessionId.get()
+        const route = storedSessionId ? knownOwnerForSession(storedSessionId) : resolveNewChatOwnerRoute()
 
         return JSON.stringify(
-          route?.connectionId && route.profile
-            ? { connectionId: route.connectionId, profile: route.profile, sessionId: null, storedSessionId: null }
+          route && typeof route === 'object' && route.connectionId?.trim() && route.profile?.trim()
+            ? { connectionId: route.connectionId, profile: route.profile, sessionId: null, storedSessionId }
             : null
         )
       }

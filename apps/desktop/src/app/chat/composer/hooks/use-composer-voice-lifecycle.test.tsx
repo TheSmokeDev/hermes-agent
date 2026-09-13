@@ -26,7 +26,12 @@ vi.mock('@/lib/tts-lease', () => ({
 }))
 vi.mock('@/store/wake-word', () => ({ resumeWakeAfterVoice: async () => {} }))
 
-import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import {
+  $selectedStoredSessionId,
+  $sessions,
+  _resetSessionOwnerHintsForTests,
+  setSessionOwnerHint
+} from '@/store/session'
 import { $newChatRoute } from '@/store/profile'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 
@@ -59,6 +64,7 @@ function bind() {
 }
 
 afterEach(() => {
+  $selectedStoredSessionId.set(null)
   $newChatRoute.set(null)
   $sessionTiles.set([])
   $sessionStates.set({})
@@ -68,6 +74,27 @@ afterEach(() => {
 })
 
 describe('native and plugin composer capture', () => {
+  it('keeps a historical main conversation attached before its runtime resumes', async () => {
+    $newChatRoute.set({ connectionId: 'other-host', profile: 'other-profile' })
+    setSessionOwnerHint('historical-one', { connectionId: 'history-host', profile: 'coder' })
+    $selectedStoredSessionId.set('historical-one')
+    const hook = renderHook(() => useComposerVoice({ ...args(), sessionId: null }))
+    expect(hook.result.current.voiceController.owner).toEqual({
+      connectionId: 'history-host',
+      profile: 'coder',
+      sessionId: null,
+      storedSessionId: 'historical-one'
+    })
+    const tile = renderHook(() => useComposerVoice({ ...args(), sessionId: null, target: 'tile:unresolved' }))
+    expect(tile.result.current.voiceController.owner).toBeNull()
+    await act(async () => {
+      $selectedStoredSessionId.set('unknown-history')
+    })
+    expect(hook.result.current.voiceController.owner).toBeNull()
+    hook.unmount()
+    tile.unmount()
+  })
+
   it('coalesces draft preparation and requires the published controller for microphone ownership', async () => {
     $newChatRoute.set({ connectionId: 'original', profile: 'coder' })
     let finish!: (runtimeId: string) => void
