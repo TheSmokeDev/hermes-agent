@@ -31,7 +31,12 @@ import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 import { acquireMicrophoneLease, type ComposerVoiceLease } from './composer-microphone-lease'
-import { type ComposerVoiceOwner, composerVoiceOwnerKey } from './composer-voice-owner'
+import {
+  type ComposerVoiceOwner,
+  composerVoiceOwner,
+  composerVoiceOwnerKey,
+  type ComposerVoiceTarget
+} from './composer-voice-owner'
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
@@ -49,6 +54,7 @@ interface UseComposerVoiceArgs {
   /** Interrupt the in-flight agent turn (Stop-button seam) — fired when the
    *  user speaks over the model while it is still generating. */
   onInterrupt?: () => Promise<void> | void
+  onPrepareVoiceSession?: () => Promise<string>
   onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
   sessionId: string | null | undefined
@@ -64,8 +70,13 @@ export interface ComposerVoiceAssistant {
 }
 
 export interface ComposerVoiceController {
-  capabilities: { microphoneLease: 1; pinnedRest: 1 }
-  owner: ComposerVoiceOwner | null
+  capabilities: { microphoneLease: 1; pinnedRest: 1; prepareSession: 1 }
+  /** Drafts expose only their verified connection/profile until preparation. */
+  owner: ComposerVoiceTarget | null
+  /** Persist/rebind this conversation without sending text or opening the mic.
+   *  After a draft is created, wait for the current controller's owner to match
+   *  this receipt before acquiring its lease; the draft controller is retired. */
+  prepareSession: () => Promise<ComposerVoiceOwner>
   acquire: (options?: { signal?: AbortSignal }) => Promise<ComposerVoiceLease | null>
   interrupt: () => boolean
   latestAssistant: () => ComposerVoiceAssistant | null
@@ -120,6 +131,7 @@ export function useComposerVoice({
   insertText,
   maxRecordingSeconds,
   onInterrupt,
+  onPrepareVoiceSession,
   onSubmit,
   onTranscribeAudio,
   sessionId,
@@ -129,8 +141,8 @@ export function useComposerVoice({
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
   const [activeVoiceContextEpoch, setActiveVoiceContextEpoch] = useState<number | null>(null)
-  const ownerKey = useStore(useMemo(() => composerVoiceOwnerKey(sessionId), [sessionId]))
-  const composerOwner = useMemo(() => JSON.parse(ownerKey) as ComposerVoiceOwner | null, [ownerKey])
+  const ownerKey = useStore(useMemo(() => composerVoiceOwnerKey(sessionId, target === 'main'), [sessionId, target]))
+  const composerOwner = useMemo(() => JSON.parse(ownerKey) as ComposerVoiceTarget | null, [ownerKey])
   const ownsWakeIndicatorRef = useRef(false)
   const previousSessionIdRef = useRef(sessionId)
   const busyRef = useRef(busy)
@@ -139,6 +151,7 @@ export function useComposerVoice({
   disabledRef.current = disabled
   const voiceContextEpochRef = useRef(0)
   const mountedRef = useRef(true)
+  const preparationRef = useRef<Promise<ComposerVoiceOwner> | null>(null)
   const voiceContextIdentityRef = useRef({ disabled, sessionId, target, ownerKey })
 
   if (
@@ -456,10 +469,52 @@ export function useComposerVoice({
     return true
   }, [onInterrupt, voiceContextIsCurrent])
 
+  const prepareSession = useCallback((): Promise<ComposerVoiceOwner> => {
+    if (!voiceContextIsCurrent()) {
+      return Promise.reject(new Error('The selected conversation changed. Open Talk again.'))
+    }
+
+    if (preparationRef.current) {
+      return preparationRef.current
+    }
+
+    if (!onPrepareVoiceSession) {
+      return Promise.reject(new Error('This conversation cannot prepare voice. Update Hermes Desktop.'))
+    }
+
+    const preparation = onPrepareVoiceSession()
+      .then(runtimeId => {
+        const current = voiceContextIdentityRef.current
+        const preparedOwner = composerVoiceOwner(runtimeId)
+
+        if (
+          !mountedRef.current ||
+          disabledRef.current ||
+          current.target !== target ||
+          !preparedOwner ||
+          (current.sessionId !== sessionId && current.sessionId !== runtimeId)
+        ) {
+          throw new Error('The selected conversation changed while voice was preparing.')
+        }
+
+        return preparedOwner
+      })
+      .finally(() => {
+        if (preparationRef.current === preparation) {
+          preparationRef.current = null
+        }
+      })
+
+    preparationRef.current = preparation
+
+    return preparation
+  }, [onPrepareVoiceSession, sessionId, target, voiceContextIsCurrent])
+
   const voiceController = useMemo<ComposerVoiceController>(
     () => ({
-      capabilities: { microphoneLease: 1, pinnedRest: 1 },
+      capabilities: { microphoneLease: 1, pinnedRest: 1, prepareSession: 1 },
       owner: composerOwner,
+      prepareSession,
       acquire,
       interrupt,
       latestAssistant,
@@ -485,7 +540,7 @@ export function useComposerVoice({
         return dispose
       }
     }),
-    [$messages, acquire, composerOwner, interrupt, latestAssistant, submitText, voiceContextIsCurrent]
+    [$messages, acquire, composerOwner, interrupt, latestAssistant, prepareSession, submitText, voiceContextIsCurrent]
   )
 
   useEffect(

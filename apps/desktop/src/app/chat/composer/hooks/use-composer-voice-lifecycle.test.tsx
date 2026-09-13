@@ -27,6 +27,7 @@ vi.mock('@/lib/tts-lease', () => ({
 vi.mock('@/store/wake-word', () => ({ resumeWakeAfterVoice: async () => {} }))
 
 import { $sessions, _resetSessionOwnerHintsForTests, setSessionOwnerHint } from '@/store/session'
+import { $newChatRoute } from '@/store/profile'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 
 import { useComposerVoice } from './use-composer-voice'
@@ -58,6 +59,7 @@ function bind() {
 }
 
 afterEach(() => {
+  $newChatRoute.set(null)
   $sessionTiles.set([])
   $sessionStates.set({})
   $sessions.set([])
@@ -66,6 +68,48 @@ afterEach(() => {
 })
 
 describe('native and plugin composer capture', () => {
+  it('coalesces draft preparation and requires the published controller for microphone ownership', async () => {
+    $newChatRoute.set({ connectionId: 'original', profile: 'coder' })
+    let finish!: (runtimeId: string) => void
+    const onPrepareVoiceSession = vi.fn(
+      () =>
+        new Promise<string>(resolve => {
+          finish = resolve
+        })
+    )
+    const input = args()
+    const hook = renderHook(
+      ({ sessionId }: { sessionId: string | null }) =>
+        useComposerVoice({
+          ...input,
+          sessionId,
+          onPrepareVoiceSession
+        }),
+      { initialProps: { sessionId: null as string | null } }
+    )
+    const oldController = hook.result.current.voiceController
+    expect(oldController.owner).toEqual({
+      connectionId: 'original',
+      profile: 'coder',
+      sessionId: null,
+      storedSessionId: null
+    })
+    const first = oldController.prepareSession()
+    expect(oldController.prepareSession()).toBe(first)
+    expect(onPrepareVoiceSession).toHaveBeenCalledOnce()
+    await act(async () => {
+      bind()
+      hook.rerender({ sessionId: 'runtime-one' })
+      finish('runtime-one')
+      await first
+    })
+    await expect(first).resolves.toEqual(hook.result.current.voiceController.owner)
+    expect(await oldController.acquire()).toBeNull()
+    expect(input.onSubmit).not.toHaveBeenCalled()
+    expect(native.start).not.toHaveBeenCalled()
+    hook.unmount()
+  })
+
   it('makes plugin capture and both native starts mutually exclusive', async () => {
     bind()
     const hook = renderHook(() => useComposerVoice(args()))

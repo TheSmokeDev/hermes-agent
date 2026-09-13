@@ -158,6 +158,7 @@ import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
 import { resolveDesktopRemoteRoute, v1SshTerminalPoolKey } from './desktop-remote-route'
+import { createDesktopTalkAuth } from './desktop-talk-auth'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -821,6 +822,7 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+const desktopTalkAuth = createDesktopTalkAuth()
 
 function pathWithHermesManagedNode(...entries) {
   const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
@@ -12661,6 +12663,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   const backendNonce = crypto.randomBytes(16).toString('hex')
   const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
   assertPoolEntryStillOwned(poolKey, entry)
+  const nativeTalk = desktopTalkAuth.issue()
 
   const child = spawn(
     backend.command,
@@ -12676,6 +12679,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
         // can still point at the install dir even when spawn cwd is home.
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
+        ...nativeTalk.env,
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
@@ -12693,6 +12697,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   entry.process = child
   entry.token = token
+  child.once('error', () => nativeTalk.revoke())
+  child.once('exit', () => nativeTalk.revoke())
   // Buffer stdout+stderr from the instant of spawn (#93608): an early crash's
   // traceback must survive into the claim error and the before-ready exit
   // message instead of a bare exit code. rememberLog attaches later, after
@@ -12785,6 +12791,12 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
       `Hermes backend for profile "${profile}" is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
     )
   }
+
+  nativeTalk.bind(
+    baseUrl,
+    authToken,
+    () => backendPool.get(poolKey) === entry && entry.process === child && child.exitCode === null && !child.killed
+  )
 
   return {
     baseUrl,
@@ -13078,6 +13090,7 @@ async function startHermes() {
     const parentStartMarker = await desktopParentStartMarker()
     const backendNonce = crypto.randomBytes(16).toString('hex')
     const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
+    const nativeTalk = desktopTalkAuth.issue()
 
     const hermesProcess = spawn(
       backend.command,
@@ -13098,6 +13111,7 @@ async function startHermes() {
           ...backend.env,
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
+          ...nativeTalk.env,
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',
@@ -13119,6 +13133,8 @@ async function startHermes() {
     // later, after the claim, and would miss anything printed before it.
     const primaryOutputTail = createBackendOutputTail()
     primaryOutputTail.attach(hermesProcess)
+    hermesProcess.once('error', () => nativeTalk.revoke())
+    hermesProcess.once('exit', () => nativeTalk.revoke())
 
     // Start watching for the READY announcement BEFORE any await (#60323):
     // claimBackendChild can take seconds (its Windows Get-Process probe cold
@@ -13268,6 +13284,16 @@ async function startHermes() {
     // The backend's plugin discovery just ran and refreshed HERMES_HOME/.plugin-compat-report.json.
     // Surface it once (per distinct set of affected plugins) after the window is up; never block boot.
     setTimeout(() => void showPluginCompatNoticeOnce(), 1500)
+
+    nativeTalk.bind(
+      baseUrl,
+      authToken,
+      () =>
+        backendConnectionState.isCurrentAttempt(connectionAttempt) &&
+        backendConnectionState.getProcess() === hermesProcess &&
+        hermesProcess.exitCode === null &&
+        !hermesProcess.killed
+    )
 
     return {
       baseUrl,
@@ -16622,13 +16648,15 @@ async function dispatchRegistryApiRequest(
 
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
 
-  const response = await fetchJsonForBackend(connection, requestPath, {
-    pluginHeaders: pluginRequestHeaders(request),
-    method: request?.method,
-    body: request?.body,
-    upload: request?.upload,
-    timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-  })
+  const response = await desktopTalkAuth.dispatch(connection, requestPath, nativeHeaders =>
+    fetchJsonForBackend(connection, requestPath, {
+      pluginHeaders: { ...pluginRequestHeaders(request), ...nativeHeaders },
+      method: request?.method,
+      body: request?.body,
+      upload: request?.upload,
+      timeoutMs: resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+    })
+  )
 
   return (request?.method || 'GET').toUpperCase() === 'GET'
     ? tagRegistrySessionResponse(requestPath, response, registryConnectionId)
@@ -16747,13 +16775,15 @@ async function handleHermesApiRequest(request) {
         })
       }
     } else {
-      response = await fetchJson(url, connection.token, {
-        headers: pluginRequestHeaders(request),
-        method: request?.method,
-        body: request?.body,
-        upload: request?.upload,
-        timeoutMs
-      })
+      response = await desktopTalkAuth.dispatch(connection, apiRoute.requestPath, nativeHeaders =>
+        fetchJson(url, connection.token, {
+          headers: { ...pluginRequestHeaders(request), ...nativeHeaders },
+          method: request?.method,
+          body: request?.body,
+          upload: request?.upload,
+          timeoutMs
+        })
+      )
     }
   } catch (error) {
     // A failed rename PATCH must not strand the app on the temporary primary:

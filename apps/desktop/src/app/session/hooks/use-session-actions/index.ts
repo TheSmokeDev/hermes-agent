@@ -39,6 +39,7 @@ import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
+  $freshSessionRequest,
   $gatewaySwapTarget,
   $newChatProfile,
   $profiles,
@@ -112,6 +113,7 @@ import {
   closeSessionTile,
   dropSessionState,
   holdSessionOwnerUntilForeground,
+  knownOwnerForSession,
   openSessionTile,
   patchSessionTile,
   publishSessionState,
@@ -137,6 +139,7 @@ import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
 
+import { prepareCurrentSession } from './prepare-current-session'
 import { pendingClarifyToolPayload, restorePendingClarifyFromSnapshot } from './restore-pending-clarify'
 import {
   createPersistedDisplayTranscriptProvenance,
@@ -383,6 +386,7 @@ export function useSessionActions({
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
   const branchCreateFlightsRef = useRef(new Map<string, Promise<SessionCreateResponse>>())
+  const voicePreparationRef = useRef<Promise<string> | null>(null)
 
   // Follow auto-compression's stored-id rotation only while the exact runtime,
   // selection, and route intent still belong to the rotating conversation.
@@ -702,6 +706,72 @@ export function useSessionActions({
       updateSessionState
     ]
   )
+
+  const prepareVoiceSession = useCallback((): Promise<string> => {
+    if (voicePreparationRef.current) {
+      return voicePreparationRef.current
+    }
+
+    const storedSessionId = getRoutedStoredSessionId() ?? selectedStoredSessionIdRef.current
+    const owner = storedSessionId ? knownOwnerForSession(storedSessionId) : resolveNewChatOwnerRoute()
+    const freshRequest = $freshSessionRequest.get()
+
+    if (!owner || typeof owner !== 'object' || !owner.connectionId || !owner.profile) {
+      return Promise.reject(new Error('The conversation connection is not ready. Reconnect and try again.'))
+    }
+
+    const preparation = prepareCurrentSession({
+      activeRuntimeId: activeSessionIdRef.current,
+      createSession: () => createBackendSessionForSend(null),
+      getRuntimeIdForStoredSession: storedId => runtimeIdByStoredSessionIdRef.current.get(storedId) ?? null,
+      owner: { ...owner },
+      isCurrent: () => {
+        const currentOwner = storedSessionId ? knownOwnerForSession(storedSessionId) : resolveNewChatOwnerRoute()
+
+        return (
+          $freshSessionRequest.get() === freshRequest &&
+          Boolean(
+            currentOwner &&
+            typeof currentOwner === 'object' &&
+            currentOwner.connectionId === owner.connectionId &&
+            currentOwner.profile === owner.profile
+          )
+        )
+      },
+      requestGateway: (method, params) => requestForSessionProfile(owner, requestGateway, method, params),
+      routedStoredSessionId: getRoutedStoredSessionId(),
+      selectedStoredSessionId: selectedStoredSessionIdRef.current,
+      routeToken: getRouteToken(),
+      current: () => ({
+        activeRuntimeId: activeSessionIdRef.current,
+        routeToken: getRouteToken(),
+        selectedStoredSessionId: selectedStoredSessionIdRef.current
+      }),
+      publish: (runtimeId, storedId, route) => {
+        setSessionOwnerHint(storedId, route)
+        ensureSessionState(runtimeId, storedId)
+        activeSessionIdRef.current = runtimeId
+        setActiveSessionId(runtimeId)
+      }
+    }).finally(() => {
+      if (voicePreparationRef.current === preparation) {
+        voicePreparationRef.current = null
+      }
+    })
+
+    voicePreparationRef.current = preparation
+
+    return preparation
+  }, [
+    activeSessionIdRef,
+    createBackendSessionForSend,
+    ensureSessionState,
+    getRouteToken,
+    getRoutedStoredSessionId,
+    requestGateway,
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionIdRef
+  ])
 
   const selectSidebarItem = useCallback(
     (item: SidebarNavItem) => {
@@ -2627,6 +2697,7 @@ export function useSessionActions({
     createBackendSessionForSend,
     openNewSessionTile,
     openSettings,
+    prepareVoiceSession,
     removeSession,
     resumeSession,
     selectSidebarItem,

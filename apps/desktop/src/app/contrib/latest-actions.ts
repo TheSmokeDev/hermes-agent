@@ -43,6 +43,7 @@ export function latestChatActions(actions: ChatActions): ChatActions {
     onPickFiles: (...args) => actions.onPickFiles(...args),
     onPickFolders: (...args) => actions.onPickFolders(...args),
     onPickImages: (...args) => actions.onPickImages(...args),
+    onPrepareVoiceSession: latestOptional(() => actions.onPrepareVoiceSession),
     onReload: (...args) => actions.onReload(...args),
     onRemoveAttachment: (...args) => actions.onRemoveAttachment(...args),
     onRestoreToMessage: latestOptional(() => actions.onRestoreToMessage),

@@ -1,6 +1,14 @@
 import { computed } from 'nanostores'
 
-import { $sessions } from '@/store/session'
+import { $gateway } from '@/store/gateway'
+import {
+  $activeGatewayProfile,
+  $newChatConnectionId,
+  $newChatProfile,
+  $newChatRoute,
+  resolveNewChatOwnerRoute
+} from '@/store/profile'
+import { $connection, $sessions } from '@/store/session'
 import {
   $sessionStates,
   $sessionTiles,
@@ -13,6 +21,11 @@ export interface ComposerVoiceOwner {
   profile: string
   sessionId: string
   storedSessionId: string
+}
+
+export interface ComposerVoiceTarget extends Pick<ComposerVoiceOwner, 'connectionId' | 'profile'> {
+  sessionId: string | null
+  storedSessionId: string | null
 }
 
 export function composerVoiceOwner(sessionId: string | null | undefined): ComposerVoiceOwner | null {
@@ -36,6 +49,31 @@ export function composerVoiceOwner(sessionId: string | null | undefined): Compos
   return { connectionId: route.connectionId, profile: route.profile, sessionId, storedSessionId }
 }
 
-export function composerVoiceOwnerKey(sessionId: string | null | undefined) {
-  return computed([$sessionStates, $sessionTiles, $sessions], () => JSON.stringify(composerVoiceOwner(sessionId)))
+export function composerVoiceOwnerKey(sessionId: string | null | undefined, allowDraft = false) {
+  return computed(
+    [
+      $sessionStates,
+      $sessionTiles,
+      $sessions,
+      $gateway,
+      $connection,
+      $activeGatewayProfile,
+      $newChatConnectionId,
+      $newChatProfile,
+      $newChatRoute
+    ],
+    () => {
+      if (!sessionId && allowDraft) {
+        const route = resolveNewChatOwnerRoute()
+
+        return JSON.stringify(
+          route?.connectionId && route.profile
+            ? { connectionId: route.connectionId, profile: route.profile, sessionId: null, storedSessionId: null }
+            : null
+        )
+      }
+
+      return JSON.stringify(composerVoiceOwner(sessionId))
+    }
+  )
 }

@@ -316,6 +316,7 @@ function TileChat({
           onPickFiles={onPickFiles}
           onPickFolders={onPickFolders}
           onPickImages={onPickImages}
+          onPrepareVoiceSession={actions.prepareVoiceSession}
           onReload={actions.reloadFromMessage}
           onRemoveAttachment={onRemoveAttachment}
           onRestoreToMessage={actions.restoreToMessage}
