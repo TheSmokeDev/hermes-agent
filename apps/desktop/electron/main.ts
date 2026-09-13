@@ -285,6 +285,7 @@ import {
   localRouteFallbackProfiles,
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
+import { pluginRequestHeaders, withPluginRequestAuth } from './plugin-request-auth'
 import { selectPoolEvictions } from './pool-eviction'
 import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
 import {
@@ -305,7 +306,6 @@ import {
   runPrimaryBackendStartup
 } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
-import { pluginRequestHeaders, withPluginRequestAuth } from './plugin-request-auth'
 import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
