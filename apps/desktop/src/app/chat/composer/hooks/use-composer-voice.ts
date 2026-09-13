@@ -1,5 +1,16 @@
 import { useStore } from '@nanostores/react'
-import { createContext, createElement, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  createContext,
+  createElement,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState
+} from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
@@ -19,9 +30,14 @@ import { onComposerVoiceToggleRequest } from '../focus'
 import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
+import { acquireMicrophoneLease, type ComposerVoiceLease } from './composer-microphone-lease'
+import { type ComposerVoiceOwner, composerVoiceOwnerKey } from './composer-voice-owner'
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
+
+export { acquireMicrophoneLease } from './composer-microphone-lease'
+export type { ComposerVoiceLease } from './composer-microphone-lease'
 
 interface UseComposerVoiceArgs {
   busy: boolean
@@ -47,12 +63,10 @@ export interface ComposerVoiceAssistant {
   text: string
 }
 
-export interface ComposerVoiceLease {
-  release: () => void
-}
-
 export interface ComposerVoiceController {
-  acquire: (signal?: AbortSignal) => Promise<ComposerVoiceLease | null>
+  capabilities: { microphoneLease: 1; pinnedRest: 1 }
+  owner: ComposerVoiceOwner | null
+  acquire: (options?: { signal?: AbortSignal }) => Promise<ComposerVoiceLease | null>
   interrupt: () => boolean
   latestAssistant: () => ComposerVoiceAssistant | null
   submitText: (text: string) => boolean
@@ -81,71 +95,6 @@ export function ComposerVoiceControllerProvider({
   controller: ComposerVoiceController
 }) {
   return createElement(ComposerVoiceControllerContext.Provider, { value: controller }, children)
-}
-
-let microphoneOwner: symbol | null = null
-
-async function waitForPause(signal: AbortSignal | undefined, pause: () => Promise<void>): Promise<boolean> {
-  if (signal?.aborted) {
-    return false
-  }
-
-  try {
-    // Abort cancels eligibility, not the device-release barrier. The owner must
-    // remain held until pause settles so cleanup can never resume wake early.
-    await pause()
-
-    return !signal?.aborted
-  } catch {
-    return false
-  }
-}
-
-export async function acquireMicrophoneLease({
-  voiceContextIsCurrent,
-  owner,
-  pause,
-  resume,
-  signal
-}: {
-  voiceContextIsCurrent: () => boolean
-  owner: symbol
-  pause: () => Promise<void>
-  resume: () => void
-  signal?: AbortSignal
-}): Promise<ComposerVoiceLease | null> {
-  if (!voiceContextIsCurrent() || signal?.aborted || microphoneOwner !== null) {
-    return null
-  }
-
-  microphoneOwner = owner
-  const paused = await waitForPause(signal, pause)
-
-  if (!paused || !voiceContextIsCurrent() || signal?.aborted || microphoneOwner !== owner) {
-    if (microphoneOwner === owner) {
-      microphoneOwner = null
-      resume()
-    }
-
-    return null
-  }
-
-  let released = false
-
-  return {
-    release: () => {
-      if (released) {
-        return
-      }
-
-      released = true
-
-      if (microphoneOwner === owner) {
-        microphoneOwner = null
-        resume()
-      }
-    }
-  }
 }
 
 export async function runVoiceControllerCallback(
@@ -180,6 +129,8 @@ export function useComposerVoice({
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
   const [activeVoiceContextEpoch, setActiveVoiceContextEpoch] = useState<number | null>(null)
+  const ownerKey = useStore(useMemo(() => composerVoiceOwnerKey(sessionId), [sessionId]))
+  const composerOwner = useMemo(() => JSON.parse(ownerKey) as ComposerVoiceOwner | null, [ownerKey])
   const ownsWakeIndicatorRef = useRef(false)
   const previousSessionIdRef = useRef(sessionId)
   const busyRef = useRef(busy)
@@ -187,21 +138,23 @@ export function useComposerVoice({
   const disabledRef = useRef(disabled)
   disabledRef.current = disabled
   const voiceContextEpochRef = useRef(0)
-  const voiceContextIdentityRef = useRef({ disabled, sessionId, target })
+  const mountedRef = useRef(true)
+  const voiceContextIdentityRef = useRef({ disabled, sessionId, target, ownerKey })
 
   if (
     voiceContextIdentityRef.current.disabled !== disabled ||
     voiceContextIdentityRef.current.sessionId !== sessionId ||
-    voiceContextIdentityRef.current.target !== target
+    voiceContextIdentityRef.current.target !== target ||
+    voiceContextIdentityRef.current.ownerKey !== ownerKey
   ) {
     voiceContextEpochRef.current += 1
-    voiceContextIdentityRef.current = { disabled, sessionId, target }
+    voiceContextIdentityRef.current = { disabled, sessionId, target, ownerKey }
   }
 
   const voiceContextEpoch = voiceContextEpochRef.current
 
   const voiceContextIsCurrent = useCallback(
-    () => !disabledRef.current && voiceContextEpochRef.current === voiceContextEpoch,
+    () => mountedRef.current && !disabledRef.current && voiceContextEpochRef.current === voiceContextEpoch,
     [voiceContextEpoch]
   )
 
@@ -215,6 +168,11 @@ export function useComposerVoice({
   }
 
   const owner = ownerRef.current.token
+  const [lifetimeGeneration, renewLifetime] = useReducer(value => value + 1, 0)
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- identity and StrictMode replay renew this resource
+  const ownerLifetime = useMemo(() => new AbortController(), [owner, lifetimeGeneration])
+  const nativeLeaseRef = useRef<ComposerVoiceLease | null>(null)
+  const nativeStartRef = useRef<AbortController | null>(null)
   const voiceConversationActive = activeVoiceContextEpoch === voiceContextEpoch && voiceContextIsCurrent()
   const voiceStartRequest = useStore($voiceConversationStartRequest)
 
@@ -223,13 +181,6 @@ export function useComposerVoice({
     adoptSpokenReplySession(previousSessionIdRef.current, sessionId)
     previousSessionIdRef.current = sessionId
   }, [sessionId])
-
-  const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
-    focusInput,
-    maxRecordingSeconds,
-    onTranscript: insertText,
-    onTranscribeAudio
-  })
 
   /** Auto-speak selector: the latest unspoken reply only — a backlog collapses to the newest. */
   const pendingResponse = () => {
@@ -296,7 +247,6 @@ export function useComposerVoice({
   // capture device while the wake listener still holds it makes getUserMedia
   // fail and the conversation never starts listening.
   const wakePauseBarrierRef = useRef<Promise<void> | null>(null)
-  const wakeResumeScheduledRef = useRef<Promise<void> | null>(null)
   const assistantSubscriptionDisposersRef = useRef(new Set<() => void>())
 
   const conversation = useVoiceConversation({
@@ -349,76 +299,22 @@ export function useComposerVoice({
     []
   )
 
-  // The `composer.voice` hotkey (Ctrl+B) toggles the conversation. Starting
-  // with STT unconfigured lets the conversation surface its own "configure
-  // speech-to-text" notice rather than silently no-opping.
-  const toggleVoiceConversation = useCallback(() => {
-    if (disabled) {
-      return
-    }
-
-    if (voiceConversationActive) {
-      setActiveVoiceContextEpoch(null)
-      void conversation.end()
-
-      return
-    }
-
-    if (microphoneOwner === null) {
-      setActiveVoiceContextEpoch(voiceContextEpoch)
-    }
-  }, [conversation, disabled, voiceContextEpoch, voiceConversationActive])
-
-  useEffect(
-    () => onComposerVoiceToggleRequest(toggled => toggled === target && toggleVoiceConversation()),
-    [target, toggleVoiceConversation]
-  )
-
-  useEffect(() => {
-    if (
-      target === 'main' &&
-      !disabled &&
-      takeVoiceConversationStart(voiceStartRequest) &&
-      !voiceConversationActive
-    ) {
-      if (microphoneOwner === null) {
-        setActiveVoiceContextEpoch(voiceContextEpoch)
-      }
-    }
-  }, [disabled, target, voiceContextEpoch, voiceConversationActive, voiceStartRequest])
-
-  const resumeWakeIfPaused = useCallback(() => {
+  const resumeWakeIfPaused = useCallback(async () => {
     const barrier = wakePauseBarrierRef.current
 
     if (!wakePausedRef.current && !barrier) {
       return
     }
 
-    if (barrier && wakeResumeScheduledRef.current === barrier) {
+    wakePausedRef.current = false
+    await barrier
+
+    if (wakePauseBarrierRef.current !== barrier) {
       return
     }
 
-    wakePausedRef.current = false
-    wakeResumeScheduledRef.current = barrier
-
-    const resume = () => {
-      if (wakePauseBarrierRef.current !== barrier) {
-        return
-      }
-
-      wakePauseBarrierRef.current = null
-      wakeResumeScheduledRef.current = null
-      // Reconcile, don't just resume: the wake word is a persistent setting, so
-      // ending a voice chat must re-arm the listener whenever config says
-      // enabled — including when the raw resume loses the mic-release race.
-      void resumeWakeAfterVoice()
-    }
-
-    if (barrier) {
-      void barrier.then(resume, resume)
-    } else {
-      resume()
-    }
+    wakePauseBarrierRef.current = null
+    await resumeWakeAfterVoice()
   }, [])
 
   // The ref is a request token (did WE issue wake.pause?), not an atom mirror —
@@ -438,6 +334,91 @@ export function useComposerVoice({
 
     return barrier
   }, [])
+
+  const acquire = useCallback(
+    (options: { signal?: AbortSignal } = {}) =>
+      acquireMicrophoneLease({
+        owner,
+        pause: pauseWakeForVoice,
+        resume: resumeWakeIfPaused,
+        signal: options.signal,
+        ownerSignal: ownerLifetime.signal,
+        voiceContextIsCurrent
+      }),
+    [owner, ownerLifetime, pauseWakeForVoice, resumeWakeIfPaused, voiceContextIsCurrent]
+  )
+
+  const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
+    acquire,
+    signal: ownerLifetime.signal,
+    focusInput,
+    maxRecordingSeconds,
+    onTranscript: text => {
+      if (voiceContextIsCurrent()) {
+        insertText(text)
+      }
+    },
+    onTranscribeAudio
+  })
+
+  const startConversation = useCallback(async () => {
+    if (!voiceContextIsCurrent() || nativeStartRef.current || nativeLeaseRef.current) {
+      return
+    }
+
+    const attempt = new AbortController()
+    nativeStartRef.current = attempt
+    const lease = await acquire({ signal: attempt.signal })
+
+    if (nativeStartRef.current === attempt) {
+      nativeStartRef.current = null
+    }
+
+    if (!lease) {
+      return
+    }
+
+    if (!voiceContextIsCurrent() || lease.signal.aborted) {
+      lease.release()
+
+      return
+    }
+
+    nativeLeaseRef.current = lease
+    setActiveVoiceContextEpoch(voiceContextEpoch)
+  }, [acquire, voiceContextEpoch, voiceContextIsCurrent])
+
+  const endConversation = useCallback(() => {
+    nativeStartRef.current?.abort()
+    nativeStartRef.current = null
+    setActiveVoiceContextEpoch(null)
+    void conversation.end()
+    nativeLeaseRef.current?.release()
+    nativeLeaseRef.current = null
+  }, [conversation])
+
+  const toggleVoiceConversation = useCallback(() => {
+    if (disabled) {
+      return
+    }
+
+    if (voiceConversationActive || nativeStartRef.current) {
+      endConversation()
+    } else {
+      void startConversation()
+    }
+  }, [disabled, endConversation, startConversation, voiceConversationActive])
+
+  useEffect(
+    () => onComposerVoiceToggleRequest(toggled => toggled === target && toggleVoiceConversation()),
+    [target, toggleVoiceConversation]
+  )
+
+  useEffect(() => {
+    if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest) && !voiceConversationActive) {
+      void startConversation()
+    }
+  }, [disabled, startConversation, target, voiceConversationActive, voiceStartRequest])
 
   const latestAssistant = useCallback((): ComposerVoiceAssistant | null => {
     if (!voiceContextIsCurrent()) {
@@ -477,14 +458,9 @@ export function useComposerVoice({
 
   const voiceController = useMemo<ComposerVoiceController>(
     () => ({
-      acquire: (signal?: AbortSignal) =>
-        acquireMicrophoneLease({
-          owner,
-          pause: pauseWakeForVoice,
-          resume: resumeWakeIfPaused,
-          signal,
-          voiceContextIsCurrent: () => voiceContextIsCurrent() && !voiceConversationActive
-        }),
+      capabilities: { microphoneLease: 1, pinnedRest: 1 },
+      owner: composerOwner,
+      acquire,
       interrupt,
       latestAssistant,
       submitText,
@@ -509,17 +485,7 @@ export function useComposerVoice({
         return dispose
       }
     }),
-    [
-      $messages,
-      interrupt,
-      latestAssistant,
-      owner,
-      pauseWakeForVoice,
-      resumeWakeIfPaused,
-      submitText,
-      voiceContextIsCurrent,
-      voiceConversationActive
-    ]
+    [$messages, acquire, composerOwner, interrupt, latestAssistant, submitText, voiceContextIsCurrent]
   )
 
   useEffect(
@@ -529,23 +495,36 @@ export function useComposerVoice({
     [voiceContextEpoch]
   )
 
-  useEffect(
-    () => () => {
-      if (microphoneOwner === owner) {
-        microphoneOwner = null
-        resumeWakeIfPaused()
-      }
-    },
-    [owner, resumeWakeIfPaused]
-  )
-
+  // eslint-disable-next-line no-restricted-syntax -- mount and acquisition lifetime tokens, not mirrored atoms
   useEffect(() => {
-    if (voiceConversationActive) {
-      pauseWakeForVoice()
-    } else {
-      resumeWakeIfPaused()
+    mountedRef.current = true
+
+    // React StrictMode replays setup after disposal without a new render.
+    // Renew that disposed lifetime; stale handles stay aborted.
+    if (ownerLifetime.signal.aborted) {
+      renewLifetime()
+
+      return
     }
-  }, [pauseWakeForVoice, resumeWakeIfPaused, voiceConversationActive])
+
+    return () => {
+      mountedRef.current = false
+      ownerLifetime.abort()
+      nativeStartRef.current?.abort()
+      nativeStartRef.current = null
+      nativeLeaseRef.current?.release()
+      nativeLeaseRef.current = null
+    }
+  }, [ownerLifetime])
+
+  // eslint-disable-next-line no-restricted-syntax -- releasing an owned capture resource, not mirroring an atom
+  useEffect(() => {
+    if (!voiceConversationActive && nativeLeaseRef.current) {
+      void conversation.end()
+      nativeLeaseRef.current.release()
+      nativeLeaseRef.current = null
+    }
+  }, [conversation, voiceConversationActive])
 
   // 'Say "stop" to end the voice chat.' notice when the conversation starts.
   // Phrase comes from voice.stop_phrases (first entry) so a custom phrase
@@ -567,8 +546,6 @@ export function useComposerVoice({
     }
   }, [t, voiceConversationActive])
 
-  useEffect(() => resumeWakeIfPaused, [resumeWakeIfPaused])
-
   // Speech-output toggles are TTS warm-up / release signals. Entering a voice
   // conversation acquires this window's lease (pre-loads the engine so the
   // first spoken reply doesn't start with dead air); ending it releases the
@@ -588,19 +565,6 @@ export function useComposerVoice({
   useEffect(() => {
     void syncTtsLease(READ_ALOUD_LEASE, autoSpeakReplies)
   }, [autoSpeakReplies])
-
-  // Explicit start/end for the on-screen conversation controls (the hotkey uses
-  // the gated toggle above).
-  const startConversation = useCallback(() => {
-    if (microphoneOwner === null) {
-      setActiveVoiceContextEpoch(voiceContextEpoch)
-    }
-  }, [voiceContextEpoch])
-
-  const endConversation = useCallback(() => {
-    setActiveVoiceContextEpoch(null)
-    void conversation.end()
-  }, [conversation])
 
   const handleToggleAutoSpeak = useCallback(() => {
     void setAutoSpeakReplies(!$autoSpeakReplies.get()).catch(error =>

@@ -68,6 +68,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const [recording, setRecording] = useState(false)
 
   const recorderRef = useRef<MediaRecorder | null>(null)
+  const captureEpochRef = useRef(0)
   const streamRef = useRef<MediaStream | null>(null)
   const chunksRef = useRef<Blob[]>([])
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -79,6 +80,8 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
 
   const cleanup = () => {
+    captureEpochRef.current += 1
+
     if (animationRef.current) {
       window.cancelAnimationFrame(animationRef.current)
       animationRef.current = null
@@ -175,7 +178,12 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       throw new Error(copy.microphoneUnsupported)
     }
 
+    const captureEpoch = ++captureEpochRef.current
     const permitted = await window.hermesDesktop?.requestMicrophoneAccess?.()
+
+    if (captureEpoch !== captureEpochRef.current) {
+      return
+    }
 
     if (permitted === false) {
       throw new Error(copy.microphoneAccessDenied)
@@ -189,6 +197,12 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       })
     } catch (error) {
       throw micError(error, copy)
+    }
+
+    if (captureEpoch !== captureEpochRef.current) {
+      stream.getTracks().forEach(track => track.stop())
+
+      return
     }
 
     const mimeType =

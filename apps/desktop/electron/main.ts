@@ -305,6 +305,7 @@ import {
   runPrimaryBackendStartup
 } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
+import { pluginRequestHeaders, withPluginRequestAuth } from './plugin-request-auth'
 import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
@@ -16016,7 +16017,7 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
 async function fetchJsonForBackend(
   descriptor,
   path,
-  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number } = {}
+  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number; pluginHeaders?: Record<string, string> } = {}
 ) {
   const url = `${descriptor.baseUrl}${path}`
 
@@ -16035,7 +16036,7 @@ async function fetchJsonForBackend(
         body: opts.body,
         timeoutMs: opts.timeoutMs,
         bearer: nativeAt,
-        headers: descriptor.headers
+        headers: { ...descriptor.headers, ...opts.pluginHeaders }
       })
     }
 
@@ -16043,7 +16044,7 @@ async function fetchJsonForBackend(
       method: opts.method,
       body: opts.body,
       timeoutMs: opts.timeoutMs,
-      headers: descriptor.headers
+      headers: { ...descriptor.headers, ...opts.pluginHeaders }
     })
   }
 
@@ -16052,7 +16053,7 @@ async function fetchJsonForBackend(
     body: opts.body,
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
-    headers: descriptor.headers
+    headers: { ...descriptor.headers, ...opts.pluginHeaders }
   })
 }
 
@@ -16622,6 +16623,7 @@ async function dispatchRegistryApiRequest(
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
 
   const response = await fetchJsonForBackend(connection, requestPath, {
+    pluginHeaders: pluginRequestHeaders(request),
     method: request?.method,
     body: request?.body,
     upload: request?.upload,
@@ -16730,6 +16732,7 @@ async function handleHermesApiRequest(request) {
 
       if (restAuth.kind === 'bearer') {
         response = await fetchJson(url, null, {
+          headers: pluginRequestHeaders(request),
           method: request?.method,
           body: request?.body,
           timeoutMs,
@@ -16737,6 +16740,7 @@ async function handleHermesApiRequest(request) {
         })
       } else {
         response = await fetchJsonViaOauthSession(url, {
+          headers: pluginRequestHeaders(request),
           method: request?.method,
           body: request?.body,
           timeoutMs
@@ -16744,6 +16748,7 @@ async function handleHermesApiRequest(request) {
       }
     } else {
       response = await fetchJson(url, connection.token, {
+        headers: pluginRequestHeaders(request),
         method: request?.method,
         body: request?.body,
         upload: request?.upload,
@@ -16769,7 +16774,7 @@ async function handleHermesApiRequest(request) {
   return response
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+async function dispatchHermesApiRequest(request) {
   // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
   // renderer reconnect entering ensureBackend() mid-mutation would otherwise
   // respawn the old-name backend and recreate its HERMES_HOME (#45474).
@@ -16797,7 +16802,9 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const releaseProfileDeletion = profileDeletionGate.acquire(mutatingProfile)
 
   return handleHermesApiRequest(request).finally(releaseProfileDeletion)
-})
+}
+
+ipcMain.handle('hermes:api', (_event, request) => withPluginRequestAuth(request, () => dispatchHermesApiRequest(request)))
 
 // Main serializes cross-window ambient claims (see event-dedupe.ts for why a
 // spoken reply holds its claim far longer than a beep).
