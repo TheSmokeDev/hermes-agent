@@ -26,13 +26,13 @@ vi.mock('@/lib/tts-lease', () => ({
 }))
 vi.mock('@/store/wake-word', () => ({ resumeWakeAfterVoice: async () => {} }))
 
+import { $newChatRoute } from '@/store/profile'
 import {
   $selectedStoredSessionId,
   $sessions,
   _resetSessionOwnerHintsForTests,
   setSessionOwnerHint
 } from '@/store/session'
-import { $newChatRoute } from '@/store/profile'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 
 import { useComposerVoice } from './use-composer-voice'
