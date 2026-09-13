@@ -981,6 +981,23 @@ def _title_read(session: dict, db, key: str) -> str:
     return resolved_title
 
 
+@_session_method("session.prepare")
+def _(rid, params: dict, session: dict) -> dict:
+    """Persist an explicitly selected empty conversation without adding messages or starting a turn."""
+    key = session.get("session_key")
+    if not key or params.get("stored_session_id") != key:
+        return _err(rid, 4001, "session identity does not match the selected conversation")
+    try:
+        if _ensure_session_db_row(session) is False:
+            return _db_unavailable_error(rid, code=5007)
+        with _session_db(session) as db:
+            if db is None or not db.get_session(key):
+                return _db_unavailable_error(rid, code=5007)
+    except Exception as exc:
+        return _err(rid, 5007, f"could not prepare session: {exc}")
+    return _ok(rid, {"session_id": params["session_id"], "stored_session_id": key})
+
+
 @method("session.title")
 @_with_db(5007, session_scoped=True)
 def _(rid, params: dict, session: dict, db) -> dict:

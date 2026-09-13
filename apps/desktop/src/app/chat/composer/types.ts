@@ -53,6 +53,7 @@ export interface ChatBarProps {
   onPickFiles?: () => void
   onPickFolders?: () => void
   onPickImages?: () => void
+  onPrepareVoiceSession?: () => Promise<string>
   onRemoveAttachment?: (id: string) => void
   onSteer?: (text: string) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean

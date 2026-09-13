@@ -99,12 +99,28 @@ export function registerFsIpc({
   // and loaded whichever profile / gateway / machine the window is pointed at.
   // Earlier builds scoped it per profile; anything left in those folders is
   // moved up once so it does not silently vanish on a profile switch.
-  async function desktopPluginsRoot(): Promise<string> {
-    const root = await ensureDir(path.join(hermesHome, DESKTOP_PLUGINS_DIR))
-    await migrateProfileScopedDesktopPlugins(hermesHome, root)
-    await reconcileUnifiedDesktopHalves(hermesHome, root)
+  let desktopSyncTail: Promise<void> = Promise.resolve()
 
-    return root
+  function reconcileDesktopPlugins(): Promise<{ root: string; touched: string[] }> {
+    // Root discovery and explicit refresh share the same destructive copy pass.
+    const next = desktopSyncTail.then(async () => {
+      const root = await ensureDir(path.join(hermesHome, DESKTOP_PLUGINS_DIR))
+      await migrateProfileScopedDesktopPlugins(hermesHome, root)
+      const touched = await reconcileUnifiedDesktopHalves(hermesHome, root)
+
+      return { root, touched }
+    })
+
+    desktopSyncTail = next.then(
+      () => undefined,
+      () => undefined
+    )
+
+    return next
+  }
+
+  async function desktopPluginsRoot(): Promise<string> {
+    return (await reconcileDesktopPlugins()).root
   }
 
   ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => desktopPluginsRoot())
@@ -112,11 +128,7 @@ export function registerFsIpc({
   // Re-run the unified-half reconcile on demand (after an agent-plugin install /
   // update / uninstall through the gateway) so the app-level copy tracks the
   // package without waiting for the next root resolution.
-  ipcMain.handle('hermes:fs:reconcileDesktopPlugins', async () => {
-    const root = await ensureDir(path.join(hermesHome, DESKTOP_PLUGINS_DIR))
-
-    return reconcileUnifiedDesktopHalves(hermesHome, root)
-  })
+  ipcMain.handle('hermes:fs:reconcileDesktopPlugins', async () => (await reconcileDesktopPlugins()).touched)
 
   // The LOCAL logs root (`<HERMES_HOME>/logs`, profile-aware) — the error
   // card's "Open Logs" action reveals agent.log/gateway.log without the user

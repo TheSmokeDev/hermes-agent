@@ -41,6 +41,9 @@ export async function activeConnection(): Promise<HermesConnection> {
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
  *  shape, minus the path (which is namespace-derived). */
 export interface PluginRestOptions {
+  scope?: { connectionId: string; profile: string }
+  /** Optional second gate owned by this plugin; never replaces gateway auth. */
+  pluginToken?: string
   method?: string
   body?: unknown
   /** Single-file multipart upload (see HermesApiRequest.upload). */
@@ -74,6 +77,11 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
   }
 
   const suffix = pluginPathSuffix('pluginRest', path)
+  const scope = opts.scope
+
+  if (scope && (!scope.connectionId?.trim() || !scope.profile?.trim())) {
+    throw new Error('pluginRest: scope requires connectionId and profile')
+  }
 
   return hermesApi<T>({
     path: `/api/plugins/${pluginId}${suffix}`,
@@ -81,7 +89,8 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
     body: opts.body,
     upload: opts.upload,
     timeoutMs: opts.timeoutMs,
-    ...profileScoped()
+    pluginToken: opts.pluginToken,
+    ...(scope ? { connectionId: scope.connectionId, profile: scope.profile } : profileScoped())
   })
 }
 

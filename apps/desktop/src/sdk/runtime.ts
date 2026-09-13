@@ -13,21 +13,27 @@ import * as jsxRuntime from 'react/jsx-runtime'
 
 import * as sdk from './index'
 
-const GLOBALS = {
-  __HERMES_PLUGIN_SDK__: sdk,
-  __HERMES_REACT__: React,
-  __HERMES_REACT_JSX__: jsxRuntime,
-  __HERMES_REACT_JSX_DEV__: jsxDevRuntime
-} as const
+// The SDK re-exports SkillsView, whose plugin inventory imports this loader.
+// Bundling that cycle can initialize the namespace after this module runs.
+// Read it at installation time, once the module graph has finished evaluating.
+const namespaces = () =>
+  ({
+    __HERMES_PLUGIN_SDK__: sdk,
+    __HERMES_REACT__: React,
+    __HERMES_REACT_JSX__: jsxRuntime,
+    __HERMES_REACT_JSX_DEV__: jsxDevRuntime
+  }) as const
 
 export function installPluginSdk(): void {
-  Object.assign(globalThis, GLOBALS)
+  Object.assign(globalThis, namespaces())
 }
 
 /** Build a shim ESM blob that re-exports a global namespace's live members.
  *  Export names come from the namespace itself, so the list can't drift. */
-function shimUrl(globalKey: keyof typeof GLOBALS): string {
-  const names = Object.keys(GLOBALS[globalKey]).filter(name => name !== 'default' && /^[A-Za-z_$][\w$]*$/.test(name))
+function shimUrl(globalKey: keyof ReturnType<typeof namespaces>): string {
+  const names = Object.keys(namespaces()[globalKey]).filter(
+    name => name !== 'default' && /^[A-Za-z_$][\w$]*$/.test(name)
+  )
 
   const source =
     `const m = globalThis.${globalKey};\n` +

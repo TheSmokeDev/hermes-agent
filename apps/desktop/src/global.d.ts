@@ -1216,6 +1216,8 @@ export type DesktopBootstrapEvent =
     }
 
 export interface HermesApiRequest {
+  /** Only forwarded within /api/plugins/<id>; gateway credentials remain native-owned. */
+  pluginToken?: string
   path: string
   method?: string
   body?: unknown

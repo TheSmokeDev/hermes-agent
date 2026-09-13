@@ -489,6 +489,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     branchStoredSession,
     createBackendSessionForSend,
     openNewSessionTile,
+    prepareVoiceSession,
     removeSession,
     resumeSession,
     selectSidebarItem,
@@ -1058,6 +1059,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       openSession(sessionId, navigate)
     },
     onRetryResume: sessionId => void resumeSession(sessionId, true),
+    onPrepareVoiceSession: prepareVoiceSession,
     onSteer: steerPrompt,
     onSubmit: submitText,
     onThreadMessagesChange: handleThreadMessagesChange,

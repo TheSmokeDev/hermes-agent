@@ -64,6 +64,7 @@ import {
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from '../session/hooks/use-prompt-actions/utils'
+import { prepareCurrentSession } from '../session/hooks/use-session-actions/prepare-current-session'
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
 
 import type { ComposerScope } from './composer/scope'
@@ -189,6 +190,45 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     },
     [requestGateway]
   )
+
+  const prepareVoiceSession = useCallback(async (): Promise<string> => {
+    const storedId = storedIdRef.current
+    const owner = sessionTileOwnerRoute(storedId) ?? knownSessionOwner(ownerLookupSessionRows(), storedId)
+
+    if (!owner || typeof owner !== 'object' || !owner.connectionId || !owner.profile) {
+      throw new Error('The conversation connection is not ready. Reconnect and try again.')
+    }
+
+    return prepareCurrentSession({
+      activeRuntimeId: runtimeIdRef.current,
+      createSession: async () => null,
+      getRuntimeIdForStoredSession: id => runtimeIdByStoredSessionIdRef.current.get(id) ?? null,
+      owner: { ...owner },
+      isCurrent: () => {
+        const currentOwner = sessionTileOwnerRoute(storedId) ?? knownSessionOwner(ownerLookupSessionRows(), storedId)
+
+        return (
+          storedIdRef.current === storedId &&
+          Boolean(
+            currentOwner &&
+            typeof currentOwner === 'object' &&
+            currentOwner.connectionId === owner.connectionId &&
+            currentOwner.profile === owner.profile
+          )
+        )
+      },
+      requestGateway: (method, params) => requestForSessionProfile(owner, requestGateway, method, params),
+      routedStoredSessionId: storedId,
+      selectedStoredSessionId: storedId,
+      routeToken: storedId,
+      current: () => ({
+        activeRuntimeId: runtimeIdRef.current,
+        routeToken: storedIdRef.current,
+        selectedStoredSessionId: storedIdRef.current
+      }),
+      publish: recoveredId => bindRecoveredRuntime(recoveredId)
+    })
+  }, [bindRecoveredRuntime, requestGateway])
 
   // A ⌘T tab's session is unlisted until its first turn persists — seed the
   // row from the user's first message so the tab and sidebar name it right
@@ -652,6 +692,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       dismissError,
       editMessage,
       handleThreadMessagesChange,
+      prepareVoiceSession,
       reloadFromMessage,
       restoreToMessage,
       steerPrompt,
@@ -662,6 +703,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       dismissError,
       editMessage,
       handleThreadMessagesChange,
+      prepareVoiceSession,
       reloadFromMessage,
       restoreToMessage,
       steerPrompt,
