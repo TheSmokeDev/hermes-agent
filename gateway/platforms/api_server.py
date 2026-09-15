@@ -99,7 +99,8 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
-    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
+    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
+    ("input_attachment_upload", ("POST", "/v1/input-attachments")))
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
@@ -801,6 +802,15 @@ if AIOHTTP_AVAILABLE:
             response.headers.update(cors_headers)
         return response
 
+    def _request_body_limit(request) -> int:
+        """Ordinary API request limits are unchanged; the input-attachment ingress declares its
+        own explicit bound (one base64-encoded max-size file plus envelope) and enforces it
+        itself while streaming, because ``client_max_size`` only guards ``read()``/``json()``."""
+        from gateway.platforms import api_server_input_attachments as _attachments
+        if request.path.endswith(_attachments.UPLOAD_PATH):
+            return _attachments.input_attachments.MAX_UPLOAD_BODY_BYTES
+        return MAX_REQUEST_BYTES
+
     @web.middleware
     async def body_limit_middleware(request, handler):
         """Reject overly large request bodies early based on Content-Length."""
@@ -808,7 +818,7 @@ if AIOHTTP_AVAILABLE:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    if int(cl) > _request_body_limit(request):
                         return _error_response("Request body too large.", 413, code="body_too_large")
                 except ValueError:
                     return _error_response("Invalid Content-Length header.", 400, code="invalid_content_length")
@@ -1557,6 +1567,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         routes.extend(discord_context_routes(self))
         from gateway.platforms.api_server_recipient_bridge import http_routes as recipient_routes
         routes.extend(recipient_routes(self))
+        from gateway.platforms.api_server_input_attachments import http_routes as input_attachment_routes
+        routes.extend(input_attachment_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -2256,6 +2268,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from gateway.platforms.api_server_children import capabilities as child_capabilities
         from gateway.platforms.api_server_steering import capabilities as steer_capabilities
         from tools.computer_use.recipient_bridge import capabilities as recipient_capabilities
+        from gateway.platforms.api_server_input_attachments import capabilities as attachment_capabilities
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2269,6 +2282,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "features": {
                 "passive_history": passive_capabilities(),
                 "linked_child_dispatch": child_capabilities(),
+                "input_attachments": attachment_capabilities(),
                 "run_steering": steer_capabilities(),
                 "recipient_bridge": recipient_capabilities(),
                 "delegated_computer_use": {"state": "probe_required", "capture": "on_demand",

@@ -546,10 +546,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             if db is None:
                 raise IngressError("store_unavailable", 503)
             if child_request is not None:
+                from hermes_state_input_attachments import audience_key
+                # References are verified (owner, profile, conversation, bytes, hash, audience)
+                # and atomically frozen against this action before any child is launched.
                 child_dispatch = await asyncio.to_thread(
                     db.prepare_child_dispatch, body["session_id"], producer=PRODUCER,
                     **origin, content=user_message, run_id=run_id, run_scope=idempotency_scope,
-                    correlation_id=child_request["correlation_id"], fingerprint=idempotency_fingerprint)
+                    correlation_id=child_request["correlation_id"], fingerprint=idempotency_fingerprint,
+                    attachments=child_request.get("attachments"),
+                    attachment_audience=audience_key(discord_context))
                 session_id = child_dispatch["parent_session_id"]
                 self._set_run_status(run_id, "queued", session_id=session_id,
                                      parent_message_id=child_dispatch["parent_message_id"],

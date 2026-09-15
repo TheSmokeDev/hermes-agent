@@ -17,7 +17,8 @@ def capabilities():
 
 
 def validate_child_request(child):
-    required, optional = {"goal", "correlation_id"}, {"context", "allowed_toolsets", "worker"}
+    required = {"goal", "correlation_id"}
+    optional = {"context", "allowed_toolsets", "worker", "attachments"}
     if not isinstance(child, dict) or not required <= set(child) or set(child) - required - optional:
         raise ValueError("child requires goal/correlation_id and supported optional fields only")
     if not isinstance(child["goal"], str) or not child["goal"].strip() or len(child["goal"]) > 16000:
@@ -26,6 +27,14 @@ def validate_child_request(child):
     context = child.get("context")
     if context is not None and (not isinstance(context, str) or len(context) > 32000):
         raise ValueError("child context must be at most 32000 characters")
+    if "attachments" in child:
+        from gateway.platforms.api_server_input_attachments import delivery_refusal
+        from hermes_state_input_attachments import normalize_references
+        # Shape/duplicate rejection is the store's own contract; reuse it rather than restating it.
+        normalize_references(child["attachments"])
+        refusal = delivery_refusal(child)
+        if refusal is not None:
+            raise ValueError("Attachment delivery is unavailable for this child: " + refusal)
     if "worker" in child:
         from agent.task_worker_registry import configured_worker
         _validated_identifier(child["worker"], "worker", 128)
@@ -64,8 +73,16 @@ def run_child_sync(adapter, run, parent):
     db = getattr(parent, "_session_db", None)
     if db is None or str(getattr(parent, "session_id", "")) != dispatch["parent_session_id"]:
         raise ValueError("Linked child dispatch requires the authorized parent and its durable store")
-    db.claim_child_dispatch(dispatch)
+    from hermes_state_input_attachments import audience_key
+    from gateway.platforms.api_server_input_attachments import manifest_context
+    # Revalidates immutable bytes, ownership and the current Discord audience before launch;
+    # the frozen set must match this request's references exactly.
+    verified = db.claim_child_dispatch(
+        dispatch, attachments=request.get("attachments"),
+        attachment_audience=audience_key(getattr(run, "discord_task_context", None)))
     if "worker" in request:
+        if verified:
+            raise ValueError("Installed task workers expose no host-file delivery contract")
         from gateway.platforms.api_server_task_workers import run_worker_sync
         return run_worker_sync(adapter, run, parent)
     service = SubagentLifecycleService(lambda: parent)
@@ -74,7 +91,7 @@ def run_child_sync(adapter, run, parent):
     parent._current_turn_id = run.run_id
     try:
         handle = service.launch(SubagentLaunchRequest(
-            goal=request["goal"], context=request.get("context"),
+            goal=request["goal"], context=manifest_context(request.get("context"), verified),
             allowed_toolsets=tuple(request["allowed_toolsets"]) if request.get("allowed_toolsets") else None,
             parent_session_id=dispatch["parent_session_id"], correlation_id=run.run_id,
             metadata={"run_id": run.run_id, "event_id": dispatch["event_id"],

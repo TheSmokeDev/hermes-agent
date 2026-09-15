@@ -226,6 +226,11 @@ class InputAttachmentStore:
         conn.execute("INSERT OR IGNORE INTO input_attachment_origins (producer,event_id,refs_json) VALUES (?,?,?)",
                      (*origin, encoded))
         for ref in refs:
+            # One receipt belongs to one original input: a reference already frozen against
+            # another action cannot be re-presented as this input's attachment.
+            if conn.execute("SELECT 1 FROM input_attachment_bindings WHERE attachment_id=? AND run_id<>? "
+                            "LIMIT 1", (ref["attachment_id"], dispatch["run_id"])).fetchone():
+                raise IngressError("attachment_already_bound")
             conn.execute("INSERT INTO input_attachment_bindings (run_id,attachment_id,sha256) VALUES (?,?,?)",
                          (dispatch["run_id"], ref["attachment_id"], ref["sha256"]))
 
