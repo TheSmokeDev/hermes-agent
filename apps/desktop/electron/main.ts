@@ -253,6 +253,7 @@ import {
 } from './managed-ssh-update'
 import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
+import { registerMicrophoneIpc } from './microphone-ipc'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -288,7 +289,6 @@ import {
 } from './plugin-profile-routes'
 import { pluginRequestHeaders, withPluginRequestAuth } from './plugin-request-auth'
 import { createPluginVoiceHud } from './plugin-voice-hud'
-import { registerMicrophoneIpc } from './microphone-ipc'
 import { registerPluginVoiceIpc } from './plugin-voice-ipc'
 import { selectPoolEvictions } from './pool-eviction'
 import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'

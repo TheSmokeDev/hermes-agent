@@ -16,10 +16,10 @@
 import { atom } from 'nanostores'
 
 import { requestComposerDraftSync } from '@/store/composer'
+import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $sessions, rememberedSessionProfile } from '@/store/session'
 import { isHudWindow } from '@/store/windows'
-import { notifyError } from '@/store/notifications'
 
 /** Whether a HUD window is currently up. In the HUD's own renderer this is
  *  always true (it IS the HUD); in the main window it tracks the child so the
