@@ -1723,6 +1723,12 @@ export {
   type TranscriptDirectiveProps
 } from '@/lib/transcript-directives'
 export { cn } from '@/lib/utils'
+export type {
+  PluginVoice,
+  PluginVoiceController,
+  PluginVoiceOwner,
+  PluginVoiceSurfaceProps
+} from '@/store/plugin-voice'
 /** THE unread store behind `SessionStatusDot`'s emerald dot. A plugin that
  *  learns out-of-band that a session produced something the user hasn't seen
  *  (a roster poll's activity watermark, say) writes HERE rather than keeping

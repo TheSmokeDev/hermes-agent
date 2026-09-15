@@ -85,6 +85,18 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // sized as a floating bar, so it mounts the real composer. Main owns the
   // window; `onChanged` keeps every window's toggle truthful.
   hud: {
+    voice: {
+      open: request => ipcRenderer.invoke('hermes:hud:voice:open', request),
+      get: () => ipcRenderer.invoke('hermes:hud:voice:get'),
+      unregister: pluginId => ipcRenderer.send('hermes:hud:voice:unregister', pluginId),
+      stop: id => ipcRenderer.send('hermes:hud:voice:stop', id),
+      onStopped: callback => {
+        const listener = (_event, id) => callback(id)
+        ipcRenderer.on('hermes:hud:voice:stopped', listener)
+
+        return () => ipcRenderer.removeListener('hermes:hud:voice:stopped', listener)
+      }
+    },
     nativeDrag: hudNativeDrag,
     windowing: {
       clientPlacement: hudWindowing?.clientPlacement !== false,
@@ -140,6 +152,22 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
       return () => ipcRenderer.removeListener('hermes:hud:game-overlay', listener)
     }
+  },
+  microphone: {
+    onWakeHandoff: callback => {
+      const listener = (_event, request) => {
+        void Promise.resolve().then(() => callback(request.action)).then(
+          () => ipcRenderer.send('hermes:microphone:wake-settled', request.id, true),
+          () => ipcRenderer.send('hermes:microphone:wake-settled', request.id, false)
+        )
+      }
+      ipcRenderer.on('hermes:microphone:wake', listener)
+      ipcRenderer.send('hermes:microphone:watch-wake')
+
+      return () => ipcRenderer.removeListener('hermes:microphone:wake', listener)
+    },
+    acquire: token => ipcRenderer.invoke('hermes:microphone:acquire', token),
+    release: token => ipcRenderer.send('hermes:microphone:release', token)
   },
   // Quick Entry: the global-hotkey mini composer window. Main owns the OS
   // shortcut + the persisted preference; the quick window only captures text

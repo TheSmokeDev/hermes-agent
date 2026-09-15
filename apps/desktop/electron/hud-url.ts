@@ -22,11 +22,12 @@ export function buildHudWindowUrl(
   {
     devServer,
     profile,
+    pluginVoice,
     rendererIndexPath
-  }: { devServer?: null | string; profile?: null | string; rendererIndexPath?: string } = {}
+  }: { devServer?: null | string; profile?: null | string; pluginVoice?: boolean; rendererIndexPath?: string } = {}
 ): string {
   const profileKey = typeof profile === 'string' ? profile.trim() : ''
-  const query = `?win=hud${profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''}`
+  const query = `?win=hud${pluginVoice ? '&voice=1' : ''}${profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''}`
   const route = sessionId ? `#/${encodeURIComponent(sessionId)}` : '#/'
 
   if (devServer) {

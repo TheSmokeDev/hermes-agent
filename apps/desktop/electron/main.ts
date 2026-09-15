@@ -287,6 +287,9 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { pluginRequestHeaders, withPluginRequestAuth } from './plugin-request-auth'
+import { createPluginVoiceHud } from './plugin-voice-hud'
+import { registerMicrophoneIpc } from './microphone-ipc'
+import { registerPluginVoiceIpc } from './plugin-voice-ipc'
 import { selectPoolEvictions } from './pool-eviction'
 import { clampPoolLimits, parsePoolLimits, POOL_LIMITS_DEFAULTS } from './pool-limits'
 import {
@@ -11412,6 +11415,12 @@ function sendConnectionApplied() {
 // its renderer WebSocket open and streaming as a ghost, and an edited one
 // keeps talking to the OLD endpoint until idle-reap.
 function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'removed' | 'saved' | 'updated' }) {
+  const voice = pluginVoiceHud.current()
+
+  if (voice?.owner.connectionId === payload.connectionId) {
+    pluginVoiceHud.stop(voice.id)
+  }
+
   for (const win of BrowserWindow.getAllWindows()) {
     const { webContents } = win
 
@@ -14200,7 +14209,7 @@ function hudBounds() {
   return defaultHudBounds(area)
 }
 
-function hudUrl(sessionId, profile) {
+function hudUrl(sessionId, profile, pluginVoice = false) {
   // The profile rides the query string next to `win=hud` (BEFORE the '#', so
   // HashRouter never sees it). The HUD renderer's gateway boot reads it and
   // adopts that backend instead of the primary — without it, a HUD opened on a
@@ -14209,6 +14218,7 @@ function hudUrl(sessionId, profile) {
   return buildHudWindowUrl(sessionId, {
     devServer: DEV_SERVER,
     profile,
+    pluginVoice,
     rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
   })
 }
@@ -14227,7 +14237,7 @@ function broadcastHudState(open) {
   }
 }
 
-function spawnHudWindow(sessionId, profile) {
+function spawnHudWindow(sessionId, profile, pluginVoice = false) {
   const win = new BrowserWindow({
     ...hudBounds(),
     minWidth: 380,
@@ -14313,6 +14323,10 @@ function spawnHudWindow(sessionId, profile) {
   })
 
   win.on('closed', () => {
+    if (pluginVoice) {
+      pluginVoiceHud.closed()
+    }
+
     if (hudWindow === win) {
       hudWindow = null
     } else if (hudWindow && !hudWindow.isDestroyed()) {
@@ -14327,14 +14341,27 @@ function spawnHudWindow(sessionId, profile) {
     // left with no surface, and correct every window's toggle.
     hudSnapShortcut.dispose()
     restoreMainWindowFromHud()
-    broadcastHudState(false)
+
+    if (!pluginVoice) {
+      broadcastHudState(false)
+    }
   })
 
   attachRendererConsoleCapture(win, 'hud', rememberLog)
   // Log-only lifecycle (#81290): the HUD is a compact auxiliary surface the
   // user can re-toggle; a dead renderer should be diagnosable, not resurrected.
   installWindowRendererLifecycle(win, { kind: 'hud', callbacks: { log: rememberLog } })
-  loadWindowUrl(win, hudUrl(sessionId, profile), 'HUD')
+  loadWindowUrl(win, hudUrl(sessionId, profile, pluginVoice), 'HUD')
+
+  if (pluginVoice) {
+    win.webContents.once('render-process-gone', () => {
+      const current = pluginVoiceHud.current()
+
+      if (current) {
+        pluginVoiceHud.stop(current.id)
+      }
+    })
+  }
 
   return win
 }
@@ -14367,6 +14394,10 @@ function destroyHudWindow(win: BrowserWindow) {
 }
 
 function openHudWindow(sessionId, profile) {
+  if (pluginVoiceHud.current()) {
+    throw new Error('Close the plugin voice HUD before opening a chat HUD')
+  }
+
   const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
 
   if (hudWindow && !hudWindow.isDestroyed()) {
@@ -15237,6 +15268,35 @@ const hudIpc = registerHudIpc({
     hudSessionId = value
   }
 })
+
+const pluginVoiceHud = createPluginVoiceHud({
+  getWindow: () => hudWindow,
+  spawn: () => {
+    hudRestoreMainWindow = false
+    hudSessionId = null
+    hudProfile = null
+    hudWindow = spawnHudWindow(null, null, true)
+    registerHudSnapShortcut()
+  },
+  focus: () => focusWindow(hudWindow),
+  close: closeHudWindow,
+  validateOwner: async owner => {
+    const row = await dispatchRegistryApiRequest(
+      {
+        path: `/api/sessions/${encodeURIComponent(owner.storedSessionId)}?profile=${encodeURIComponent(owner.profile)}`,
+        profile: owner.profile
+      },
+      owner.connectionId
+    )
+
+    if (row?.id !== owner.storedSessionId) {
+      throw new Error('Voice conversation owner is no longer available')
+    }
+  }
+})
+
+registerPluginVoiceIpc(pluginVoiceHud)
+registerMicrophoneIpc()
 
 ipcMain.handle('hermes:backend:recycle', async (_event, profile) => {
   // Models-page recovery after a code-skew 503 (#97046): kill the owned
