@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import secrets
+import time
 from contextlib import asynccontextmanager
 from io import BytesIO
 from types import SimpleNamespace
@@ -513,6 +514,41 @@ async def test_dispatch_freezes_the_set_and_the_child_context_carries_readable_m
             refused, payload = await dispatch(box, reused, idempotency_key="k3")
             assert refused.status == 409 and payload["error"] == "attachment_already_bound"
             assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_retention_never_reclaims_bytes_bound_to_durable_accepted_work(tmp_path, monkeypatch):
+    image, orphan = png_bytes(size=(11, 5), color=(60, 60, 200)), png_bytes(size=(3, 3))
+    payloads, children, parents = [], [], []
+    child_only_provider(monkeypatch, payloads, children)
+    async with host(tmp_path, monkeypatch) as box:
+        parent_builder(box.adapter, box.db, monkeypatch, parents)
+        _, bound = await upload(box, image, upload_id="u1")
+        _, unbound = await upload(box, orphan, upload_id="u2", filename="stray.png")
+        with (patch("model_tools.get_tool_definitions", return_value=[]),
+              patch("model_tools.check_toolset_requirements", return_value={}),
+              patch("agent.process_bootstrap.OpenAI")):
+            response, admitted = await dispatch(box, run_body([reference(bound)]))
+            assert response.status == 202, admitted
+            assert (await wait_terminal(box, admitted["run_id"]))["status"] == "completed"
+        kept = box.root / "images" / (bound["attachment_id"] + ".png")
+        stray = box.root / "images" / (unbound["attachment_id"] + ".png")
+        assert kept.exists() and stray.exists()
+        # Sweep far past the unbound TTL: only work nothing durable owns is reclaimed.
+        store = input_attachments.InputAttachmentStore(box.db)
+        removed = store.expire_unbound(now=time.time() + 10 * input_attachments.UNBOUND_TTL_SECONDS)
+        assert removed == 1
+        assert kept.read_bytes() == image
+        assert not stray.exists()
+        # The tombstoned id stays refused; the bound one is still a verified reference.
+        refused, payload = await dispatch(
+            box, run_body([reference(unbound)], correlation_id="d2", event_id="speech-two"),
+            idempotency_key="k2")
+        assert refused.status == 410 and payload["error"] == "attachment_expired"
+        with box.db._read_ctx() as conn:
+            row = conn.execute("SELECT expired FROM input_attachments WHERE attachment_id=?",
+                               (bound["attachment_id"],)).fetchone()
+        assert row["expired"] == 0
 
 
 @pytest.mark.asyncio
