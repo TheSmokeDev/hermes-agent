@@ -16,6 +16,7 @@ from tools.computer_use.recipient_contract import (
 )
 from tools.computer_use.recipient_windows import WindowsRecipients
 from tools.computer_use.recipient_lease import desktop_lease
+from tools.computer_use.recipient_history import RecipientHistory, history_capabilities
 
 
 def timestamp():
@@ -34,8 +35,9 @@ def authorization_guard(callback):
 
 
 def capabilities(computer_use=None):
-    return {"version": 1, "operations": ["list", "select", "send", "reconcile", "inspect"],
+    return {"version": 1, "operations": ["list", "select", "send", "reconcile", "inspect", "catalog", "history", "status"],
             "two_phase_send": True, "existing_tasks_only": True,
+            "history": history_capabilities(),
             "task_identity": "application_deeplink_or_verified_process_session", "completion_tracking": False,
             "computer_use": computer_use or {"mode": "unknown", "verified": False,
                                            "tool": "inspect_screen", "reason": "host_not_probed"}}
@@ -90,7 +92,7 @@ class RecipientBridge:
         return self.claude
 
     def _snapshot(self, target):
-        if target.get("backend") == "claude_peer":
+        if target.get("backend") in {"claude_peer", "native_history"}:
             raise RecipientError("recipient_inspection_unavailable")
         snapshot = self.desktop.snapshot(target["identity"])
         if window_identity(snapshot["window"]) != window_identity(target["identity"]):
@@ -134,7 +136,7 @@ class RecipientBridge:
                           "title": window.get("title", actual_app), "target_token": token,
                           "proven_control": control,
                           "operations": ["select"] + (["inspect"] if can_capture else [])
-                          + (["send", "reconcile"] if control == "ui_bridge" else []),
+                          + (["send", "reconcile", "history", "status"] if control == "ui_bridge" else []),
                           "reason": reason}
                 self._put(db, "target", token, {"identity": identity, "public": public})
                 recipients.append(public)
@@ -146,7 +148,8 @@ class RecipientBridge:
                     records, peer_reason = [], exc.code
                 for record in records:
                     token = secrets.token_urlsafe(32)
-                    public = {**record["public"], "target_token": token}
+                    public = {**record["public"], "target_token": token,
+                              "operations": [*record["public"]["operations"], "history", "status"]}
                     self._put(db, "target", token, {**record, "public": public, "backend": "claude_peer"})
                     recipients.append(public)
         result = {"recipients": recipients, "capabilities": capabilities(computer)}
@@ -157,13 +160,24 @@ class RecipientBridge:
     def select(self, target_token):
         with self._locked() as db:
             target = self._target(db, target_token)
-            if target.get("backend") == "claude_peer":
+            if target.get("backend") == "native_history":
+                RecipientHistory(self)._read_history_target(target, prefix_only=True)
+            elif target.get("backend") == "claude_peer":
                 self._claude_adapter().select(target["identity"])
             elif target["public"]["proven_control"] == "ui_bridge":
                 self._view(target)
             else:
                 self._snapshot(target)
             return {**target["public"], "selected": True, "status": "selected"}
+
+    def catalog(self, app=None, limit=20, cursor=None):
+        return RecipientHistory(self).catalog(app=app, limit=limit, cursor=cursor)
+
+    def history(self, *, target_token, limit=20, cursor=None):
+        return RecipientHistory(self).history(target_token=target_token, limit=limit, cursor=cursor)
+
+    def status(self, *, target_token):
+        return RecipientHistory(self).status(target_token=target_token)
 
     @staticmethod
     def _receipt(operation):
