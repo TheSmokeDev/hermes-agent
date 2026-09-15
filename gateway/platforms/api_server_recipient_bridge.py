@@ -14,6 +14,8 @@ OPERATIONS = {
     "probe": set(), "list": {"app"}, "select": {"target_token"},
     "send": {"operation_id", "target_token", "message", "commit_token"},
     "reconcile": {"operation_id", "target_token"}, "inspect": {"target_token", "capture"},
+    "catalog": {"app", "limit", "cursor"}, "history": {"target_token", "limit", "cursor"},
+    "status": {"target_token"},
 }
 
 
@@ -45,13 +47,15 @@ async def handle(adapter, request, *, action):
             current_profile, current_peer = authority(adapter, request)
             if (current_profile, current_peer) != (profile, peer):
                 raise RecipientError("recipient_authority_changed", 403)
+            if db.get_session(session_id) is None:
+                raise RecipientError("recipient_session_not_found", 404)
             verify_request(adapter, request, session_id=session_id, binding=body.get("discord_binding"))
 
         authorize()
         bridge = RecipientBridge(session_id=session_id, owner=digest([profile, peer, actor_scope]),
                                  authorize=authorize)
         arguments = {key: value for key, value in body.items() if key in OPERATIONS[action]}
-        required = OPERATIONS[action] - {"app", "commit_token", "capture"}
+        required = OPERATIONS[action] - {"app", "commit_token", "capture", "limit", "cursor"}
         if required - arguments.keys():
             raise RecipientError("invalid_recipient_request", 400)
         method = bridge.list_recipients if action == "list" else getattr(bridge, action)
