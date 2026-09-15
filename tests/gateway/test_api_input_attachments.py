@@ -586,6 +586,36 @@ async def test_the_total_input_byte_bound_is_enforced_across_references(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_the_profile_mirror_keeps_each_profiles_bytes_in_its_own_store(tmp_path, monkeypatch):
+    """/p/{profile}/v1/input-attachments is served, and two profiles never share a receipt."""
+    from tests.gateway.test_dashboard_consumption import gateway
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    data = png_bytes(size=(7, 7), color=(120, 15, 180))
+    async with gateway(tmp_path, monkeypatch) as (root, keys, _, _, client):
+        receipts = {}
+        for name in ("alpha", "beta"):
+            response = await client.post(
+                f"/p/{name}/v1/input-attachments",
+                headers={"Authorization": "Bearer " + keys[name]},
+                json=upload_body(data, upload_id="shared-upload-id", session_id="same-session"))
+            assert response.status == 200, await response.text()
+            receipts[name] = await response.json()
+        # Identical bytes, identical upload id, two profiles: two independent receipts.
+        assert receipts["alpha"]["attachment_id"] != receipts["beta"]["attachment_id"]
+        assert receipts["alpha"]["sha256"] == receipts["beta"]["sha256"]
+        for name, receipt in receipts.items():
+            home = root / "profiles" / name
+            assert (home / "images" / (receipt["attachment_id"] + ".png")).read_bytes() == data
+            other = "beta" if name == "alpha" else "alpha"
+            assert not (home / "images" / (receipts[other]["attachment_id"] + ".png")).exists()
+        # A profile's bearer token is refused on another profile's mirror.
+        crossed = await client.post(
+            "/p/beta/v1/input-attachments", headers={"Authorization": "Bearer " + keys["alpha"]},
+            json=upload_body(data, upload_id="u2", session_id="same-session"))
+        assert crossed.status == 401
+
+
+@pytest.mark.asyncio
 async def test_no_response_ever_renders_a_private_path_or_the_gateway_key(tmp_path, monkeypatch):
     async with host(tmp_path, monkeypatch) as box:
         _, receipt = await upload(box, png_bytes(), upload_id="u1")
