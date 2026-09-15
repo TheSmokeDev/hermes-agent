@@ -416,6 +416,23 @@ CREATE TABLE IF NOT EXISTS child_dispatches (
     UNIQUE(conversation_id,correlation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_child_dispatches_parent_message ON child_dispatches(parent_message_id);
+CREATE TABLE IF NOT EXISTS input_attachments (
+    attachment_id TEXT PRIMARY KEY, owner_scope TEXT NOT NULL, conversation_id TEXT NOT NULL,
+    upload_id TEXT NOT NULL, filename TEXT NOT NULL, declared_type TEXT NOT NULL,
+    content_type TEXT NOT NULL, suffix TEXT NOT NULL, bytes INTEGER NOT NULL, sha256 TEXT NOT NULL,
+    audience TEXT NOT NULL, expires_at REAL NOT NULL, expired INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(owner_scope,conversation_id,upload_id)
+);
+CREATE TABLE IF NOT EXISTS input_attachment_origins (
+    producer TEXT NOT NULL, event_id TEXT NOT NULL, refs_json TEXT NOT NULL,
+    PRIMARY KEY(producer,event_id)
+);
+CREATE TABLE IF NOT EXISTS input_attachment_bindings (
+    run_id TEXT NOT NULL REFERENCES child_dispatches(run_id),
+    attachment_id TEXT NOT NULL REFERENCES input_attachments(attachment_id), sha256 TEXT NOT NULL,
+    supplied_at REAL, PRIMARY KEY(run_id,attachment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_input_attachment_bindings_attachment ON input_attachment_bindings(attachment_id);
 CREATE TRIGGER IF NOT EXISTS child_dispatch_message_delete AFTER DELETE ON messages
 BEGIN
     UPDATE child_dispatches SET state='retired' WHERE parent_message_id=OLD.id;

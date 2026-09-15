@@ -73,7 +73,10 @@ class SessionChildDispatchMixin:
         return users[0]["id"]
 
     def prepare_child_dispatch(self, session_id, *, producer, event_id, origin_turn_id, content,
-                               run_id, run_scope, correlation_id, fingerprint, receipt_id=None):
+                               run_id, run_scope, correlation_id, fingerprint, receipt_id=None,
+                               attachments=None, attachment_audience=""):
+        from hermes_state_input_attachments import InputAttachmentStore, normalize_references
+        references = normalize_references([] if attachments is None else attachments)
         rows = _validated_messages([{"role": "user", "content": content}])
         for key, value in {"event_id": event_id, "origin_turn_id": origin_turn_id,
                            "run_id": run_id, "correlation_id": correlation_id}.items():
@@ -100,6 +103,7 @@ class SessionChildDispatchMixin:
                     "conversation_id": owner, "correlation_id": correlation_id,
                 }.items()):
                     raise PassiveHistoryConflictError("Child correlation already names another action")
+                InputAttachmentStore(self).claim(conn, prior, references, audience=attachment_audience)
                 return dict(prior)
             tip = self._resolve_passive_history_tip(conn, owner, requested_session_id=session_id)
             user_id = self._child_origin_user(conn, session_id, producer, event_id, origin_turn_id, content, receipt_id)
@@ -113,7 +117,9 @@ class SessionChildDispatchMixin:
                          "parent_message_id,state,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'admitted',?)",
                          (run_id, run_scope, fingerprint, correlation_id, producer, event_id, origin_turn_id,
                           owner, session_id, tip, user_id, time.time()))
-            return dict(conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (run_id,)).fetchone())
+            dispatch = dict(conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (run_id,)).fetchone())
+            InputAttachmentStore(self).bind(conn, dispatch, references, audience=attachment_audience)
+            return dispatch
         return self._execute_write(write, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def child_dispatch_is_current(self, run_id, *, run_scope, child_id, lease_holder=None):
@@ -131,7 +137,7 @@ class SessionChildDispatchMixin:
                                  (owner,)).fetchone()
             return lease is not None and lease["holder"] == lease_holder and lease["expires_at"] > time.time()
 
-    def claim_child_dispatch(self, dispatch):
+    def claim_child_dispatch(self, dispatch, *, attachments=None, attachment_audience=""):
         def write(conn):
             row = conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (dispatch["run_id"],)).fetchone()
             if row is None or row["state"] == "retired":
@@ -151,7 +157,11 @@ class SessionChildDispatchMixin:
                 conn, row["conversation_id"], requested_session_id=row["requested_session_id"])
             if tip != row["parent_session_id"]:
                 raise PassiveHistoryConflictError("Child parent changed before dispatch")
+            from hermes_state_input_attachments import InputAttachmentStore
+            verified = InputAttachmentStore(self).claim(
+                conn, row, [] if attachments is None else attachments, audience=attachment_audience)
             conn.execute("UPDATE child_dispatches SET state='launching' WHERE run_id=?", (row["run_id"],))
+            return verified
         return self._execute_write(write)
 
     def record_child_dispatch_handle(self, dispatch, *, child_id, child_session_id):
@@ -161,4 +171,6 @@ class SessionChildDispatchMixin:
                                    (child_id, child_session_id, dispatch["run_id"], dispatch["run_scope"])).rowcount
             if changed != 1:
                 raise PassiveHistoryRetiredError("Child dispatch was invalidated during launch")
+            conn.execute("UPDATE input_attachment_bindings SET supplied_at=? WHERE run_id=?",
+                         (time.time(), dispatch["run_id"]))
         return self._execute_write(write)
