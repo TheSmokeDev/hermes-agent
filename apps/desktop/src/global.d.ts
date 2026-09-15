@@ -2,6 +2,7 @@ import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { HermesNotification } from '../electron/notification-types'
+import type { PluginVoiceDescriptor, PluginVoiceRequest } from '../electron/plugin-voice-contract'
 import type { PoolLimits } from '../electron/pool-limits'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
@@ -114,6 +115,13 @@ declare global {
       // bar — so it mounts the real composer rather than a lookalike. Main
       // owns the window; `onChanged` keeps every window's toggle truthful.
       hud?: {
+        voice?: {
+          open: (request: PluginVoiceRequest) => Promise<void>
+          get: () => Promise<PluginVoiceDescriptor | null>
+          unregister: (pluginId: string) => void
+          stop: (id: string) => void
+          onStopped: (callback: (id: string) => void) => () => void
+        }
         nativeDrag: boolean
         windowing?: {
           clientPlacement: boolean
@@ -137,6 +145,11 @@ declare global {
         onChanged: (callback: (state: { open: boolean; sessionId: null | string }) => void) => () => void
         onCursor: (callback: (point: { x: number; y: number } | null) => void) => () => void
         onGameOverlay: (callback: (state: { active: boolean; app: string }) => void) => () => void
+      }
+      microphone?: {
+        onWakeHandoff?: (callback: (action: 'pause' | 'resume') => Promise<void>) => () => void
+        acquire: (token: string) => Promise<boolean>
+        release: (token: string) => void
       }
       // Quick Entry: a global-hotkey mini composer window. Main owns the OS
       // shortcut registration + the persisted preference (it must restore the

@@ -36,6 +36,33 @@ export const $wakeWord = atom<WakeWordState>(INITIAL_WAKE_WORD_STATE)
 
 /** Active client mic stream for remote wake (capture: client). */
 let clientCapture: ClientWakeCaptureHandle | null = null
+let peerMicrophonePaused = false
+
+export function installWakeMicrophoneHandoff(): () => void {
+  let resume: (() => Promise<void>) | null = null
+
+  return window.hermesDesktop?.microphone?.onWakeHandoff?.(async action => {
+    if (action === 'resume') {
+      peerMicrophonePaused = false
+      const restore = resume
+      resume = null
+      await restore?.()
+
+      return
+    }
+
+    peerMicrophonePaused = true
+    const hadCapture = Boolean(clientCapture?.active)
+    stopClientCapture()
+    const gateway = $gateway.get()
+
+    if (gateway && (hadCapture || $wakeWord.get().listening)) {
+      // Restore on the socket that owned wake, even if the main window navigates during voice.
+      resume = () => resumeWakeAfterVoice((method, params) => gateway.request(method, params))
+      await gateway.request('wake.pause', {})
+    }
+  }) ?? (() => {})
+}
 
 /** Stop client-side PCM capture (also called on wake.detected before voice). */
 export function stopClientCapture(): void {
@@ -46,7 +73,7 @@ export function stopClientCapture(): void {
 async function maybeStartClientCapture(result: WakeStartResponse | null | undefined): Promise<void> {
   stopClientCapture()
 
-  if (!result?.started) {
+  if (!result?.started || peerMicrophonePaused) {
     return
   }
 
@@ -249,6 +276,10 @@ export function applyWakeStopResult(result: WakeStopResponse | null | undefined)
  * hidden default.
  */
 export async function armWakeWord(request: WakeRequester = gatewayRequester): Promise<void> {
+  if (peerMicrophonePaused) {
+    return
+  }
+
   try {
     const status = await request<WakeStatusResponse>('wake.status', {
       client_capture: true,
@@ -289,7 +320,7 @@ export async function armWakeWord(request: WakeRequester = gatewayRequester): Pr
 export async function toggleWakeWord(request: WakeRequester = gatewayRequester): Promise<void> {
   const state = $wakeWord.get()
 
-  if (state.pending) {
+  if (state.pending || peerMicrophonePaused) {
     return
   }
 

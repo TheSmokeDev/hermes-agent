@@ -19,6 +19,7 @@ import { requestComposerDraftSync } from '@/store/composer'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $sessions, rememberedSessionProfile } from '@/store/session'
 import { isHudWindow } from '@/store/windows'
+import { notifyError } from '@/store/notifications'
 
 /** Whether a HUD window is currently up. In the HUD's own renderer this is
  *  always true (it IS the HUD); in the main window it tracks the child so the
@@ -66,9 +67,12 @@ export function openHud(sessionId?: null | string): void {
     rememberedSessionProfile($sessions.get(), sessionId ?? null, $activeGatewayProfile.get())
   )
 
-  $hudActive.set(true)
-  $hudSession.set(sessionId ?? null)
-  void api.open({ sessionId: sessionId ?? null, profile })
+  void api.open({ sessionId: sessionId ?? null, profile }).then(result => {
+    if (result.ok) {
+      $hudActive.set(true)
+      $hudSession.set(sessionId ?? null)
+    }
+  }).catch(error => notifyError(error, 'Could not open HUD'))
 }
 
 /** Leave HUD mode. Callable from either window — main closes the child, the

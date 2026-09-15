@@ -29,6 +29,10 @@ export async function acquireMicrophoneLease({
   const acquisition = Symbol(owner.description)
   microphoneOwner = acquisition
   const lifetime = new AbortController()
+  const native = typeof window === 'undefined' ? undefined : window.hermesDesktop?.microphone
+  const nativeToken = crypto.randomUUID()
+  let nativeGranted = false
+  let paused = false
   let pauseSettled = false
   let released = false
 
@@ -44,6 +48,11 @@ export async function acquireMicrophoneLease({
     ownerSignal?.removeEventListener('abort', release)
 
     const clear = () => {
+      if (nativeGranted) {
+        native?.release(nativeToken)
+        nativeGranted = false
+      }
+
       if (microphoneOwner === acquisition) {
         microphoneOwner = null
       }
@@ -51,7 +60,7 @@ export async function acquireMicrophoneLease({
 
     // Wake re-arm must settle before a competing start can pause it again.
     try {
-      const resumed = resume()
+      const resumed = paused ? resume() : undefined
 
       if (resumed) {
         void resumed.then(clear, clear)
@@ -67,7 +76,18 @@ export async function acquireMicrophoneLease({
   ownerSignal?.addEventListener('abort', release, { once: true })
 
   try {
-    await pause()
+    if (native) {
+      nativeGranted = await native.acquire(nativeToken)
+
+      if (!nativeGranted) {
+        lifetime.abort()
+      }
+    }
+
+    if (!lifetime.signal.aborted) {
+      paused = true
+      await pause()
+    }
   } catch {
     lifetime.abort()
   }

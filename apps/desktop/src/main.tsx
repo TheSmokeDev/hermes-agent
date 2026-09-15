@@ -21,6 +21,7 @@ import { createRoot } from 'react-dom/client'
 import { HashRouter } from 'react-router'
 
 import App from './app'
+import { PluginVoiceHud } from './app/hud/plugin-voice-hud'
 import { RootErrorBoundary } from './components/error-boundary'
 import { HapticsProvider } from './components/haptics-provider'
 import { RootTooltipProvider } from './components/ui/tooltip'
@@ -29,9 +30,12 @@ import { installClipboardShim } from './lib/clipboard'
 import { queryClient } from './lib/query-client'
 import { installRendererAnimationPauseState } from './lib/renderer-loop-pause'
 import { installSelectionCopyColorGuard } from './lib/selection-copy-colors'
+import { isPluginVoiceWindow } from './store/plugin-voice'
+import { installWakeMicrophoneHandoff } from './store/wake-word'
 import { ThemeProvider } from './themes/context'
 
 installClipboardShim()
+installWakeMicrophoneHandoff()
 // Chromium serializes selection copies (Cmd+C, right-click Copy) with the
 // theme's computed colors inlined; without this guard a dark-theme selection
 // pastes as near-white text into light-background targets.
@@ -85,9 +89,7 @@ if (winParam === 'overlay') {
                     the route change commit. The session sidebar highlight + main pane
                     both freeze for seconds despite the main thread being free.
                     Disabling transitions makes navigate() commit at default priority. */}
-                  <HashRouter useTransitions={false}>
-                    <App />
-                  </HashRouter>
+                  <HashRouter useTransitions={false}>{isPluginVoiceWindow() ? <PluginVoiceHud /> : <App />}</HashRouter>
                 </RootTooltipProvider>
               </HapticsProvider>
             </ThemeProvider>
