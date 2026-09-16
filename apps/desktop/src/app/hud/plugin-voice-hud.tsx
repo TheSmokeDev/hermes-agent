@@ -93,10 +93,11 @@ export function PluginVoiceHud() {
 
   return (
     <div className="h-screen w-screen overflow-hidden text-foreground" ref={rootRef}>
-      <div className="inline-flex max-h-screen max-w-full flex-col overflow-hidden rounded-lg bg-background">
-        {/* data-hud-grabbing keeps the window solid while it chases the cursor (click-through.ts). */}
-        <div className={`flex shrink-0 items-center justify-end ${windowing?.nativeDrag ? '[-webkit-app-region:drag]' : ''}`}
-          data-hud-grabbing={grabbing ? '' : undefined} onPointerDown={onPointerDown}>
+      {/* The surface paints its own panels; press-and-hold anywhere on it moves the window.
+          data-hud-grabbing keeps the window solid while it chases the cursor (click-through.ts). */}
+      <div className="inline-flex max-h-screen max-w-full flex-col overflow-hidden" data-hud-grabbing={grabbing ? '' : undefined}
+        onPointerDown={onPointerDown}>
+        <div className={`flex shrink-0 items-center justify-end ${windowing?.nativeDrag ? '[-webkit-app-region:drag]' : ''}`}>
           <Button aria-label={t.common.close} onClick={() => mounted ? mounted.controller.stop() : void window.hermesDesktop?.hud?.close()} size="icon-sm"
             variant="ghost">
             <X />
