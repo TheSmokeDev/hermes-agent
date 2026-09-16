@@ -37,7 +37,10 @@ const nativeDeps: PluginVoiceControllerDeps = {
     }
 
     // Live activation adds a viewer without displacing the main window's subscription.
-    return request('session.activate', { session_id: owner.sessionId, omit_messages: true })
+    // Its reply is the live session payload (no stored_session_id); the prepared ids are the owner.
+    await request('session.activate', { session_id: owner.sessionId, omit_messages: true })
+
+    return prepared
   },
   pause: owner => scopedWake(owner, 'wake.pause'),
   resume: owner => scopedWake(owner, 'wake.resume'),
