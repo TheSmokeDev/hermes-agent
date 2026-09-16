@@ -282,6 +282,13 @@ async def test_a_reference_cannot_cross_into_another_conversation(tmp_path, monk
         refused, payload = await dispatch(box, crossed)
         assert refused.status == 404 and payload["error"] == "attachment_not_found"
         assert box.db.get_messages("other") == [] and box.db.get_messages("parent") == []
+        # An upload against a session that does not exist stores nothing at all.
+        unknown = await box.client.post("/v1/input-attachments", headers=box.auth,
+                                        json=upload_body(png_bytes(), upload_id="u2",
+                                                         session_id="no-such-session"))
+        assert unknown.status == 409
+        assert (await unknown.json())["error"] == "target_unavailable"
+        assert len(list((box.root / "images").glob("*"))) == 1
         # The same receipt still works for the conversation that owns it.
         accepted, admitted = await dispatch(box, run_body([reference(receipt)]), idempotency_key="k2")
         assert accepted.status == 202, admitted
