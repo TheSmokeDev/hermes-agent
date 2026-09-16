@@ -93,12 +93,14 @@ def run_child_sync(adapter, run, parent):
     db = getattr(parent, "_session_db", None)
     if db is None or str(getattr(parent, "session_id", "")) != dispatch["parent_session_id"]:
         raise ValueError("Linked child dispatch requires the authorized parent and its durable store")
-    from gateway.platforms.api_server_input_attachments import manifest_context
+    from gateway.platforms.api_server_input_attachments import manifest_context, resolve_agent_visible
     # Revalidates immutable bytes, ownership and the current Discord audience before launch;
-    # the frozen set must match this request's references exactly.
+    # the frozen set must match this request's references exactly. Path resolution rides the
+    # same transaction, so an undeliverable path refuses without consuming the action.
     verified = db.claim_child_dispatch(
         dispatch, attachments=request.get("attachments"),
-        attachment_audience=launch_attachment_audience(adapter, run))
+        attachment_audience=launch_attachment_audience(adapter, run),
+        resolve=resolve_agent_visible)
     if "worker" in request:
         if verified:
             raise ValueError("Installed task workers expose no host-file delivery contract")

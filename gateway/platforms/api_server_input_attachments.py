@@ -106,15 +106,29 @@ def agent_visible_path(host_path: str) -> str:
     return mapped
 
 
+def resolve_agent_visible(verified):
+    """Swap each verified host path for the path the child will open.
+
+    Runs inside the claim transaction, so a path this host cannot deliver rolls the
+    claim back: the action stays ``admitted`` and its receipts stay bound, rather than
+    being consumed by a delivery that was never going to happen. Pure by contract — a
+    write-lock collision replays the whole callback.
+    """
+    return [{**row, "path": agent_visible_path(row["path"])} for row in verified]
+
+
 def manifest_context(context, verified):
-    """Append one bounded server-created manifest; a text-only dispatch is returned unchanged."""
+    """Append one bounded server-created manifest; a text-only dispatch is returned unchanged.
+
+    Every path here was already proven agent-visible by ``resolve_agent_visible``.
+    """
     if not verified:
         return context
     items = [{
         "attachment_id": row["attachment_id"], "filename": row["filename"],
         "content_type": row["content_type"], "bytes": row["bytes"], "sha256": row["sha256"],
         "kind": "image" if row["content_type"].startswith("image/") else "file",
-        "path": agent_visible_path(row["path"])} for row in verified]
+        "path": row["path"]} for row in verified]
     block = MANIFEST_HEADING + "\n" + json.dumps(
         {"version": 1, "attachments": items, "guidance": _MANIFEST_GUIDANCE},
         sort_keys=True, separators=(",", ":"))

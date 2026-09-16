@@ -765,6 +765,30 @@ async def test_a_path_the_child_cannot_open_is_refused_not_leaked(tmp_path, monk
         assert "attachment_path_not_agent_visible" in terminal["error"]
         blob = json.dumps(terminal) + json.dumps(payloads)
         assert stored not in blob and str(box.root) not in blob
+        # The refusal rolled the claim back: the action is still claimable and still owns
+        # its receipts, so the operator loses neither the action nor the uploads.
+        with box.db._read_ctx() as conn:
+            assert conn.execute("SELECT state FROM child_dispatches").fetchone()["state"] == "admitted"
+            bound = conn.execute("SELECT attachment_id, supplied_at FROM input_attachment_bindings").fetchall()
+        assert [row["attachment_id"] for row in bound] == [shot["attachment_id"]]
+        assert bound[0]["supplied_at"] is None
+        # Corrected environment, same action, same receipts: the claim now succeeds and
+        # the manifest renders a path the child can open.
+        monkeypatch.setenv("HERMES_HOME", str(box.root))
+        with box.db._read_ctx() as conn:
+            row = dict(conn.execute("SELECT * FROM child_dispatches").fetchone())
+        claimed = box.db.claim_child_dispatch(
+            row, attachments=[reference(shot)],
+            resolve=attachment_routes.resolve_agent_visible)
+        manifest = parse_manifest(attachment_routes.manifest_context(None, claimed))
+        assert manifest["attachments"][0]["attachment_id"] == shot["attachment_id"]
+        assert manifest["attachments"][0]["path"].startswith("/root/.hermes/images/")
+        assert stored not in json.dumps(manifest)
+        box.db.record_child_dispatch_handle(row, child_id="c1", child_session_id="cs1")
+        with box.db._read_ctx() as conn:
+            assert conn.execute("SELECT state FROM child_dispatches").fetchone()["state"] == "started"
+            assert conn.execute(
+                "SELECT supplied_at FROM input_attachment_bindings").fetchone()["supplied_at"] is not None
 
 
 def test_the_mount_table_and_the_store_agree_on_a_junctioned_home(tmp_path, monkeypatch):

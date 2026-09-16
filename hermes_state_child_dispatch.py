@@ -137,7 +137,11 @@ class SessionChildDispatchMixin:
                                  (owner,)).fetchone()
             return lease is not None and lease["holder"] == lease_holder and lease["expires_at"] > time.time()
 
-    def claim_child_dispatch(self, dispatch, *, attachments=None, attachment_audience=""):
+    def claim_child_dispatch(self, dispatch, *, attachments=None, attachment_audience="", resolve=None):
+        """Consume an admitted dispatch. *resolve* runs on the verified attachments INSIDE
+        the transaction, so a delivery this host cannot perform rolls the claim back and
+        leaves the action claimable with its receipts still bound. It must stay pure: a
+        lock collision replays the whole callback."""
         def write(conn):
             row = conn.execute("SELECT * FROM child_dispatches WHERE run_id=?", (dispatch["run_id"],)).fetchone()
             if row is None or row["state"] == "retired":
@@ -160,6 +164,8 @@ class SessionChildDispatchMixin:
             from hermes_state_input_attachments import InputAttachmentStore
             verified = InputAttachmentStore(self).claim(
                 conn, row, [] if attachments is None else attachments, audience=attachment_audience)
+            if resolve is not None:
+                verified = resolve(verified)
             conn.execute("UPDATE child_dispatches SET state='launching' WHERE run_id=?", (row["run_id"],))
             return verified
         return self._execute_write(write)
