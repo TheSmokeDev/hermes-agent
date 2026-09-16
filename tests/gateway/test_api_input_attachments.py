@@ -272,6 +272,22 @@ async def test_a_reference_owned_by_another_credential_is_refused(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_a_reference_cannot_cross_into_another_conversation(tmp_path, monkeypatch):
+    """Same credential, same profile, different canonical conversation."""
+    async with host(tmp_path, monkeypatch) as box:
+        box.db.create_session("other", source="test")
+        _, receipt = await upload(box, png_bytes(), upload_id="u1", session_id="parent")
+        crossed = run_body([reference(receipt)])
+        crossed["session_id"] = "other"
+        refused, payload = await dispatch(box, crossed)
+        assert refused.status == 404 and payload["error"] == "attachment_not_found"
+        assert box.db.get_messages("other") == [] and box.db.get_messages("parent") == []
+        # The same receipt still works for the conversation that owns it.
+        accepted, admitted = await dispatch(box, run_body([reference(receipt)]), idempotency_key="k2")
+        assert accepted.status == 202, admitted
+
+
+@pytest.mark.asyncio
 async def test_a_reference_with_a_wrong_hash_is_refused(tmp_path, monkeypatch):
     async with host(tmp_path, monkeypatch) as box:
         _, receipt = await upload(box, png_bytes(), upload_id="u1")
@@ -514,6 +530,49 @@ async def test_dispatch_freezes_the_set_and_the_child_context_carries_readable_m
             refused, payload = await dispatch(box, reused, idempotency_key="k3")
             assert refused.status == 409 and payload["error"] == "attachment_already_bound"
             assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_restarted_gateway_replays_the_admission_without_a_second_child(tmp_path, monkeypatch):
+    """Restart/reconciliation: durable identity survives, and never launches a replacement."""
+    image = png_bytes(size=(8, 6), color=(200, 120, 20))
+    payloads, children, parents = [], [], []
+    child_only_provider(monkeypatch, payloads, children)
+    async with host(tmp_path, monkeypatch) as box:
+        parent_builder(box.adapter, box.db, monkeypatch, parents)
+        _, shot = await upload(box, image, upload_id="u1")
+        body = run_body([reference(shot)])
+        headers = {**box.auth, "Idempotency-Key": "one-action"}
+        with (patch("model_tools.get_tool_definitions", return_value=[]),
+              patch("model_tools.check_toolset_requirements", return_value={}),
+              patch("agent.process_bootstrap.OpenAI")):
+            response, admitted = await dispatch(box, body)
+            assert response.status == 202, admitted
+            run_id = admitted["run_id"]
+            assert (await wait_terminal(box, run_id))["status"] == "completed"
+            assert len(children) == 1
+            # A fresh adapter holds no live child state; the durable record still owns it.
+            restarted = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": box.key}))
+            restarted._session_db = box.db
+            app = web.Application()
+            app.router.add_post("/v1/runs", restarted._handle_runs)
+            peer = TestClient(TestServer(app))
+            await peer.start_server()
+            try:
+                replay = await peer.post("/v1/runs", headers=headers, json=body)
+                assert replay.status == 202 and (await replay.json())["run_id"] == run_id
+                assert replay.headers["Idempotency-Replayed"] == "true"
+                assert not restarted._active_run_tasks
+                # A new key over the same action cannot re-present the frozen references.
+                retried = await peer.post(
+                    "/v1/runs", headers={**box.auth, "Idempotency-Key": "new-key-same-action"}, json=body)
+                assert retried.status == 409
+            finally:
+                await peer.close()
+                await restarted.disconnect()
+        assert len(children) == 1
+        assert [(row["role"], row["content"]) for row in box.db.get_messages("parent")] == [("user", ORIGINAL)]
+        assert (box.root / "images" / (shot["attachment_id"] + ".png")).read_bytes() == image
 
 
 @pytest.mark.asyncio
