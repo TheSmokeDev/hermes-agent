@@ -196,6 +196,106 @@ describe('useHudComposerDrag', () => {
     expect(selection.toString()).toBe('selected text')
   })
 
+  it('grabs a drag-on-move control from travel alone, with no hold', () => {
+    const target = pressTarget()
+    const handle = document.createElement('button')
+    handle.dataset.hudDrag = 'move'
+    target.append(handle)
+    const { result } = renderHook(() => useHudComposerDrag(true, { dragOnMoveWithin: '[data-hud-drag="move"]' }))
+
+    act(() =>
+      result.current.onPointerDown({
+        button: 0,
+        currentTarget: target,
+        pointerId: 3,
+        screenX: 100,
+        screenY: 200,
+        target: handle
+      } as never)
+    )
+    act(() => void window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 3, screenX: 102, screenY: 201 })))
+
+    expect(beginMove).not.toHaveBeenCalled()
+
+    act(() => void window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 3, screenX: 110, screenY: 203 })))
+
+    expect(beginMove).toHaveBeenCalledTimes(1)
+    expect(moveBy).toHaveBeenCalledWith({ width: 620, height: 320 })
+    expect(result.current.grabbing).toBe(true)
+
+    // The hold timer never took part.
+    act(() => void vi.advanceTimersByTime(LONG_PRESS_MS * 2))
+    expect(beginMove).toHaveBeenCalledTimes(1)
+
+    const clicks = vi.fn()
+    window.addEventListener('click', clicks)
+    act(() => void window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 3 })))
+    act(() => void handle.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(endMove).toHaveBeenCalledTimes(1)
+    expect(clicks).not.toHaveBeenCalled()
+    window.removeEventListener('click', clicks)
+  })
+
+  it('leaves a still press on a drag-on-move control as a click', () => {
+    const target = pressTarget()
+    const handle = document.createElement('button')
+    handle.dataset.hudDrag = 'move'
+    target.append(handle)
+    const { result } = renderHook(() => useHudComposerDrag(true, { dragOnMoveWithin: '[data-hud-drag="move"]' }))
+
+    act(() =>
+      result.current.onPointerDown({
+        button: 0,
+        currentTarget: target,
+        pointerId: 4,
+        screenX: 100,
+        screenY: 200,
+        target: handle
+      } as never)
+    )
+    act(() => void vi.advanceTimersByTime(LONG_PRESS_MS * 2))
+    act(() => void window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 4, screenX: 101, screenY: 202 })))
+
+    const clicks = vi.fn()
+    window.addEventListener('click', clicks)
+    act(() => void window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 4 })))
+    act(() => void handle.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+
+    expect(beginMove).not.toHaveBeenCalled()
+    expect(endMove).not.toHaveBeenCalled()
+    expect(moveBy).not.toHaveBeenCalled()
+    expect(clicks).toHaveBeenCalledTimes(1)
+    window.removeEventListener('click', clicks)
+  })
+
+  it('still needs the hold outside a drag-on-move control', () => {
+    const target = pressTarget()
+    const other = document.createElement('div')
+    target.append(other)
+    const { result } = renderHook(() => useHudComposerDrag(true, { dragOnMoveWithin: '[data-hud-drag="move"]' }))
+
+    act(() =>
+      result.current.onPointerDown({
+        button: 0,
+        currentTarget: target,
+        pointerId: 5,
+        screenX: 100,
+        screenY: 200,
+        target: other
+      } as never)
+    )
+    act(() => void window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 5, screenX: 106, screenY: 200 })))
+
+    expect(beginMove).not.toHaveBeenCalled()
+
+    act(() => void vi.advanceTimersByTime(LONG_PRESS_MS))
+    act(() => void window.dispatchEvent(new PointerEvent('pointermove', { pointerId: 5, screenX: 120, screenY: 200 })))
+
+    expect(beginMove).toHaveBeenCalledTimes(1)
+    act(() => void window.dispatchEvent(new PointerEvent('pointerup', { pointerId: 5 })))
+  })
+
   it('keeps the grab alive when crossing a display cancels the pointer', () => {
     const target = pressTarget()
     const { result } = renderHook(() => useHudComposerDrag(true))

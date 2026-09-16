@@ -20,7 +20,14 @@ export function PluginVoiceHud() {
   const [mounted, setMounted] = useState<MountedVoice | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
   const windowing = window.hermesDesktop?.hud?.windowing
-  const { grabbing, onPointerDown } = useHudComposerDrag(windowing?.nativeDrag !== true, windowing)
+
+  // Press-and-hold anywhere on the surface; a press on a control the plugin marks
+  // data-hud-drag="move" (its round button) grabs as soon as the pointer travels.
+  const { grabbing, onPointerDown } = useHudComposerDrag(windowing?.nativeDrag !== true, {
+    controlDrag: windowing?.controlDrag,
+    dragOnMoveWithin: '[data-hud-drag="move"]',
+    workspaceTransfer: windowing?.workspaceTransfer
+  })
 
   // The surface paints only what it needs; the rest of the window is empty and hands the mouse through.
   useHudClickThrough(rootRef)

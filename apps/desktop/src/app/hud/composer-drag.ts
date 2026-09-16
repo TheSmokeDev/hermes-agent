@@ -7,10 +7,12 @@ import { triggerHaptic } from '@/lib/haptics'
 const LONG_PRESS_MS = 140
 /** Slop before the hold is read as a text selection instead of a grab. */
 const MOVE_TOLERANCE = 8
+/** Travel that turns a press on a drag-on-move element into a grab; less is a click. */
+const DRAG_START_PX = 4
 
 interface PressState {
   armed: boolean
-  mode: 'control' | 'hold'
+  mode: 'control' | 'hold' | 'move'
   originH: number
   originW: number
   pointerId: number
@@ -27,6 +29,10 @@ interface HudComposerDragOptions {
   /** X11/KWin only: keep the grabbed window visible while the user changes
    *  virtual desktops, then pin it to the destination desktop on release. */
   workspaceTransfer?: boolean
+  /** Presses landing inside an element matching this selector grab as soon as
+   *  the pointer travels DRAG_START_PX, with no hold; a still release stays a
+   *  click. For controls with nothing to select, such as a round button. */
+  dragOnMoveWithin?: string
 }
 
 function capturePointer(state: PressState): void {
@@ -96,7 +102,7 @@ function armGrab(state: PressState, workspaceTransfer: boolean): void {
  */
 export function useHudComposerDrag(
   enabled: boolean,
-  { controlDrag = false, workspaceTransfer = false }: HudComposerDragOptions = {}
+  { controlDrag = false, workspaceTransfer = false, dragOnMoveWithin }: HudComposerDragOptions = {}
 ) {
   const [grabbing, setGrabbing] = useState(false)
   const stateRef = useRef<PressState | null>(null)
@@ -135,6 +141,9 @@ export function useHudComposerDrag(
       const target = event.currentTarget
       const immediate = controlDrag && event.ctrlKey
 
+      const onMoveOnly = !immediate && dragOnMoveWithin !== undefined &&
+        event.target instanceof Element && event.target.closest(dragOnMoveWithin) !== null
+
       // A press over an existing contentEditable selection otherwise starts
       // Chromium's native text drag, which cancels our pointer stream. Cancel
       // that default action before it is chosen; do not blur or rewrite the
@@ -145,7 +154,7 @@ export function useHudComposerDrag(
 
       const state: PressState = {
         armed: false,
-        mode: immediate ? 'control' : 'hold',
+        mode: immediate ? 'control' : onMoveOnly ? 'move' : 'hold',
         originH: window.outerHeight,
         originW: window.outerWidth,
         pointerId: event.pointerId,
@@ -170,6 +179,11 @@ export function useHudComposerDrag(
         return
       }
 
+      // Drag-on-move arms from travel (see onMove), never from a timer.
+      if (state.mode === 'move') {
+        return
+      }
+
       timerRef.current = window.setTimeout(() => {
         const state = stateRef.current
 
@@ -190,7 +204,7 @@ export function useHudComposerDrag(
         }
       }, LONG_PRESS_MS)
     },
-    [controlDrag, enabled, workspaceTransfer]
+    [controlDrag, dragOnMoveWithin, enabled, workspaceTransfer]
   )
 
   useEffect(() => {
@@ -206,14 +220,30 @@ export function useHudComposerDrag(
       }
 
       if (!state.armed) {
-        if (
-          Math.abs(event.screenX - state.startX) > MOVE_TOLERANCE ||
-          Math.abs(event.screenY - state.startY) > MOVE_TOLERANCE
-        ) {
-          reset()
-        }
+        const travelX = Math.abs(event.screenX - state.startX)
+        const travelY = Math.abs(event.screenY - state.startY)
 
-        return
+        if (state.mode === 'move') {
+          if (travelX <= DRAG_START_PX && travelY <= DRAG_START_PX) {
+            return
+          }
+
+          // Travel is the grab: same arming as a completed hold.
+          armGrab(state, workspaceTransfer)
+          setGrabbing(true)
+          triggerHaptic('selection')
+          capturePointer(state)
+
+          if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur()
+          }
+        } else {
+          if (travelX > MOVE_TOLERANCE || travelY > MOVE_TOLERANCE) {
+            reset()
+          }
+
+          return
+        }
       }
 
       event.preventDefault()
@@ -259,7 +289,11 @@ export function useHudComposerDrag(
     }
 
     const preventEditorGesture = (event: Event) => {
-      if (stateRef.current?.mode === 'control') {
+      const mode = stateRef.current?.mode
+
+      // A drag-on-move press has nothing to select; keep its travel from
+      // painting a selection across the control it is moving.
+      if (mode === 'control' || mode === 'move') {
         event.preventDefault()
       }
     }
@@ -282,7 +316,7 @@ export function useHudComposerDrag(
       window.removeEventListener('dragstart', preventEditorGesture, true)
       window.removeEventListener('selectstart', preventEditorGesture, true)
     }
-  }, [enabled, reset])
+  }, [enabled, reset, workspaceTransfer])
 
   useEffect(() => reset, [reset])
 
