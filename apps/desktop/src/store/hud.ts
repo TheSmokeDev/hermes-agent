@@ -67,12 +67,15 @@ export function openHud(sessionId?: null | string): void {
     rememberedSessionProfile($sessions.get(), sessionId ?? null, $activeGatewayProfile.get())
   )
 
-  void api.open({ sessionId: sessionId ?? null, profile }).then(result => {
-    if (result.ok) {
-      $hudActive.set(true)
-      $hudSession.set(sessionId ?? null)
-    }
-  }).catch(error => notifyError(error, 'Could not open HUD'))
+  void api
+    .open({ sessionId: sessionId ?? null, profile })
+    .then(result => {
+      if (result.ok) {
+        $hudActive.set(true)
+        $hudSession.set(sessionId ?? null)
+      }
+    })
+    .catch(error => notifyError(error, 'Could not open HUD'))
 }
 
 /** Leave HUD mode. Callable from either window — main closes the child, the

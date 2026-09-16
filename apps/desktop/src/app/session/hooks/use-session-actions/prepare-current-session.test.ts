@@ -10,12 +10,15 @@ function fixture() {
     selectedStoredSessionId: 'stored-a' as string | null,
     activeRuntimeId: null as string | null
   }
+
   const createSession = vi.fn(async () => null as string | null)
+
   const requestGateway = vi.fn(async (method: string) =>
     method === 'session.resume'
       ? { session_id: 'runtime-a' }
       : { session_id: 'runtime-a', stored_session_id: 'stored-a' }
   )
+
   const deps: PrepareCurrentSessionDeps = {
     activeRuntimeId: null,
     createSession,

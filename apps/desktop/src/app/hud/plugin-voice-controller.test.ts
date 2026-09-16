@@ -9,7 +9,8 @@ const gateway = vi.hoisted(() => ({ request: vi.fn() }))
 vi.mock('@/store/gateway', () => ({ requestGatewayForAgent: gateway.request }))
 
 const descriptor: PluginVoiceDescriptor = {
-  id: 'surface-id', pluginId: 'demo-voice',
+  id: 'surface-id',
+  pluginId: 'demo-voice',
   owner: { connectionId: 'remote', profile: 'bot', sessionId: 'live', storedSessionId: 'stored' }
 }
 
@@ -48,7 +49,8 @@ describe('native plugin voice preparation', () => {
 
   it('stops when session.prepare resolves a different conversation', async () => {
     gateway.request.mockImplementation(async (_connection: string, _profile: string, method: string) =>
-      method === 'session.prepare' ? { session_id: 'other', stored_session_id: 'elsewhere' } : {})
+      method === 'session.prepare' ? { session_id: 'other', stored_session_id: 'elsewhere' } : {}
+    )
     const stop = vi.fn()
     Object.assign(window, { hermesDesktop: { hud: { voice: { stop } } } })
 

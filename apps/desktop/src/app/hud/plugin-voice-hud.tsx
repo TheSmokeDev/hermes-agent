@@ -47,50 +47,53 @@ export function PluginVoiceHud() {
     let dispose: (() => void) | undefined
     const api = window.hermesDesktop?.hud?.voice
 
-    void api?.get().then(async descriptor => {
-      if (cancelled || !descriptor) {
-        return
-      }
-
-      const resource = createPluginVoiceController(descriptor)
-      const stopWatching = watchPluginVoiceLifetime(descriptor, resource)
-      let previous: MountedVoice['render'] | undefined
-      let prepared = false
-
-      const publish = () => {
-        const render = $pluginVoiceRenderers.get().get(descriptor.pluginId)
-
-        if (previous && render !== previous) {
-          resource.controller.stop()
-        } else if (prepared && render && !resource.controller.signal.aborted && !previous) {
-          previous = render
-          setMounted({ controller: resource.controller, render })
+    void api
+      ?.get()
+      .then(async descriptor => {
+        if (cancelled || !descriptor) {
+          return
         }
-      }
 
-      const offRenderers = $pluginVoiceRenderers.listen(publish)
+        const resource = createPluginVoiceController(descriptor)
+        const stopWatching = watchPluginVoiceLifetime(descriptor, resource)
+        let previous: MountedVoice['render'] | undefined
+        let prepared = false
 
-      // A missing/disabled plugin cannot leave a blank, immortal HUD after disk discovery settles.
-      const registrationDeadline = window.setTimeout(() => {
-        if (!previous) {
+        const publish = () => {
+          const render = $pluginVoiceRenderers.get().get(descriptor.pluginId)
+
+          if (previous && render !== previous) {
+            resource.controller.stop()
+          } else if (prepared && render && !resource.controller.signal.aborted && !previous) {
+            previous = render
+            setMounted({ controller: resource.controller, render })
+          }
+        }
+
+        const offRenderers = $pluginVoiceRenderers.listen(publish)
+
+        // A missing/disabled plugin cannot leave a blank, immortal HUD after disk discovery settles.
+        const registrationDeadline = window.setTimeout(() => {
+          if (!previous) {
+            resource.controller.stop()
+          }
+        }, 30_000)
+
+        dispose = () => {
+          window.clearTimeout(registrationDeadline)
+          offRenderers()
+          stopWatching()
+        }
+
+        try {
+          await resource.controller.prepareSession()
+          prepared = true
+          publish()
+        } catch {
           resource.controller.stop()
         }
-      }, 30_000)
-
-      dispose = () => {
-        window.clearTimeout(registrationDeadline)
-        offRenderers()
-        stopWatching()
-      }
-
-      try {
-        await resource.controller.prepareSession()
-        prepared = true
-        publish()
-      } catch {
-        resource.controller.stop()
-      }
-    }).catch(() => void window.hermesDesktop?.hud?.close())
+      })
+      .catch(() => void window.hermesDesktop?.hud?.close())
 
     return () => {
       cancelled = true
@@ -102,15 +105,28 @@ export function PluginVoiceHud() {
     <div className="h-screen w-screen overflow-hidden text-foreground" ref={rootRef}>
       {/* The surface paints its own panels; press-and-hold anywhere on it moves the window.
           data-hud-grabbing keeps the window solid while it chases the cursor (click-through.ts). */}
-      <div className="inline-flex max-h-screen max-w-full flex-col overflow-hidden" data-hud-grabbing={grabbing ? '' : undefined}
-        onPointerDown={onPointerDown}>
-        <div className={`flex shrink-0 items-center justify-end ${windowing?.nativeDrag ? '[-webkit-app-region:drag]' : ''}`}>
-          <Button aria-label={t.common.close} onClick={() => mounted ? mounted.controller.stop() : void window.hermesDesktop?.hud?.close()} size="icon-sm"
-            variant="ghost">
+      <div
+        className="inline-flex max-h-screen max-w-full flex-col overflow-hidden"
+        data-hud-grabbing={grabbing ? '' : undefined}
+        onPointerDown={onPointerDown}
+      >
+        <div
+          className={`flex shrink-0 items-center justify-end ${windowing?.nativeDrag ? '[-webkit-app-region:drag]' : ''}`}
+        >
+          <Button
+            aria-label={t.common.close}
+            onClick={() => (mounted ? mounted.controller.stop() : void window.hermesDesktop?.hud?.close())}
+            size="icon-sm"
+            variant="ghost"
+          >
             <X />
           </Button>
         </div>
-        {mounted ? createElement(mounted.render, { controller: mounted.controller }) : <Loader label={t.common.loading} />}
+        {mounted ? (
+          createElement(mounted.render, { controller: mounted.controller })
+        ) : (
+          <Loader label={t.common.loading} />
+        )}
       </div>
     </div>
   )

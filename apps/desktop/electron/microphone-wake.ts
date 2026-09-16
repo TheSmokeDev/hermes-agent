@@ -8,6 +8,7 @@ export interface MicrophoneWakeClient {
 export function createMicrophoneWakeCoordinator() {
   const arbiter = createMicrophoneArbiter()
   const clients = new Map<number, MicrophoneWakeClient>()
+
   let active: {
     senderId: number
     token: string
@@ -43,7 +44,13 @@ export function createMicrophoneWakeCoordinator() {
       }
 
       const peers = [...clients].filter(([id]) => id !== senderId).map(([, client]) => client)
-      const lease = { senderId, token, peers, released: false, paused: Promise.all(peers.map(peer => peer.pause())).then(() => undefined) }
+      const lease = {
+        senderId,
+        token,
+        peers,
+        released: false,
+        paused: Promise.all(peers.map(peer => peer.pause())).then(() => undefined)
+      }
       active = lease
 
       try {

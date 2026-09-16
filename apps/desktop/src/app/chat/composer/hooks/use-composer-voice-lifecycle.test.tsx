@@ -98,13 +98,16 @@ describe('native and plugin composer capture', () => {
   it('coalesces draft preparation and requires the published controller for microphone ownership', async () => {
     $newChatRoute.set({ connectionId: 'original', profile: 'coder' })
     let finish!: (runtimeId: string) => void
+
     const onPrepareVoiceSession = vi.fn(
       () =>
         new Promise<string>(resolve => {
           finish = resolve
         })
     )
+
     const input = args()
+
     const hook = renderHook(
       ({ sessionId }: { sessionId: string | null }) =>
         useComposerVoice({
@@ -114,6 +117,7 @@ describe('native and plugin composer capture', () => {
         }),
       { initialProps: { sessionId: null as string | null } }
     )
+
     const oldController = hook.result.current.voiceController
     expect(oldController.owner).toEqual({
       connectionId: 'original',
@@ -171,10 +175,12 @@ describe('native and plugin composer capture', () => {
 
   it('pins the tile owner and aborts active or pending consumers on replacement and unmount', async () => {
     bind()
+
     const hook = renderHook(({ sessionId }) => useComposerVoice(args(sessionId)), {
       initialProps: { sessionId: 'runtime-one' },
       wrapper: StrictMode
     })
+
     expect(hook.result.current.voiceController.owner).toEqual({
       connectionId: 'original',
       profile: 'coder',

@@ -39,13 +39,16 @@ export function watchPluginVoiceLifetime(
 
   if (navigator.permissions?.query) {
     // Chromium supports microphone; TypeScript's cross-browser PermissionName omits it.
-    void navigator.permissions.query({ name: 'microphone' as PermissionName }).then(status => {
-      if (!disposed) {
-        permission = status
-        status.addEventListener('change', permissionChanged)
-        permissionChanged()
-      }
-    }).catch(() => undefined)
+    void navigator.permissions
+      .query({ name: 'microphone' as PermissionName })
+      .then(status => {
+        if (!disposed) {
+          permission = status
+          status.addEventListener('change', permissionChanged)
+          permissionChanged()
+        }
+      })
+      .catch(() => undefined)
   }
 
   return () => {

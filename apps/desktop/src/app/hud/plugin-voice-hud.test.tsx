@@ -16,7 +16,8 @@ const gateway = vi.hoisted(() => ({ request: vi.fn() }))
 vi.mock('@/store/gateway', () => ({ requestGatewayForAgent: gateway.request }))
 
 const descriptor: PluginVoiceDescriptor = {
-  id: 'surface-id', pluginId: 'demo-voice',
+  id: 'surface-id',
+  pluginId: 'demo-voice',
   owner: { connectionId: 'remote', profile: 'bot', sessionId: 'live', storedSessionId: 'stored' }
 }
 
@@ -32,27 +33,55 @@ function bridgeFixture() {
   const arbiter = createMicrophoneArbiter()
   const stopped = new Set<(id: string) => void>()
   let permission: (() => void) | undefined
-  const status = { state: 'granted', addEventListener: (_event: string, fn: () => void) => { permission = fn }, removeEventListener: vi.fn() }
+  const status = {
+    state: 'granted',
+    addEventListener: (_event: string, fn: () => void) => {
+      permission = fn
+    },
+    removeEventListener: vi.fn()
+  }
   vi.stubGlobal('navigator', { permissions: { query: async () => status } })
   const close = vi.fn()
   const stop = vi.fn((id: string) => stopped.forEach(fn => fn(id)))
 
   const voice = {
-    open: vi.fn(async () => {}), get: async () => descriptor, stop,
-    unregister: vi.fn(), onStopped: (fn: (id: string) => void) => { stopped.add(fn);
+    open: vi.fn(async () => {}),
+    get: async () => descriptor,
+    stop,
+    unregister: vi.fn(),
+    onStopped: (fn: (id: string) => void) => {
+      stopped.add(fn)
 
- return () => { stopped.delete(fn) } }
+      return () => {
+        stopped.delete(fn)
+      }
+    }
   }
 
-  Object.assign(window, { hermesDesktop: {
-    hud: { voice, close },
-    microphone: { acquire: async (token: string) => arbiter.acquire(7, token), release: (token: string) => arbiter.release(7, token) }
-  } })
-  gateway.request.mockImplementation(async (_connection, _profile, method) => method.startsWith('session.')
-    ? { session_id: descriptor.owner.sessionId, stored_session_id: descriptor.owner.storedSessionId }
-    : {})
+  Object.assign(window, {
+    hermesDesktop: {
+      hud: { voice, close },
+      microphone: {
+        acquire: async (token: string) => arbiter.acquire(7, token),
+        release: (token: string) => arbiter.release(7, token)
+      }
+    }
+  })
+  gateway.request.mockImplementation(async (_connection, _profile, method) =>
+    method.startsWith('session.')
+      ? { session_id: descriptor.owner.sessionId, stored_session_id: descriptor.owner.storedSessionId }
+      : {}
+  )
 
-  return { arbiter, voice, stop, deny: () => { status.state = 'denied'; permission?.() } }
+  return {
+    arbiter,
+    voice,
+    stop,
+    deny: () => {
+      status.state = 'denied'
+      permission?.()
+    }
+  }
 }
 
 describe('plugin voice renderer through the public context', () => {
@@ -67,25 +96,39 @@ describe('plugin voice renderer through the public context', () => {
       controller = props.controller
       const [collapsed, setCollapsed] = useState(false)
       const [draft, setDraft] = useState('')
-      useEffect(() => { mounts++;
+      useEffect(() => {
+        mounts++
 
- return () => { mounts-- } }, [])
+        return () => {
+          mounts--
+        }
+      }, [])
 
-      return <>
-        <button onClick={() => setCollapsed(value => !value)}>collapse</button>
-        <input aria-label="draft" hidden={collapsed} onChange={event => setDraft(event.target.value)} value={draft} />
-      </>
+      return (
+        <>
+          <button onClick={() => setCollapsed(value => !value)}>collapse</button>
+          <input aria-label="draft" hidden={collapsed} onChange={event => setDraft(event.target.value)} value={draft} />
+        </>
+      )
     })
     const launcher = render(<button onClick={() => void context.voice!.open(descriptor.owner)}>open</button>)
     fireEvent.click(screen.getByText('open'))
-    await waitFor(() => expect(voice.open).toHaveBeenCalledWith({ pluginId: descriptor.pluginId, owner: descriptor.owner }))
+    await waitFor(() =>
+      expect(voice.open).toHaveBeenCalledWith({ pluginId: descriptor.pluginId, owner: descriptor.owner })
+    )
     launcher.unmount()
-    const hud = render(<StrictMode><PluginVoiceHud /></StrictMode>)
+    const hud = render(
+      <StrictMode>
+        <PluginVoiceHud />
+      </StrictMode>
+    )
     await screen.findByLabelText('draft')
     expect(mounts).toBe(1)
     const lease = await controller.acquire()
     expect(lease).not.toBeNull()
-    lease!.signal.addEventListener('abort', () => { releases++ })
+    lease!.signal.addEventListener('abort', () => {
+      releases++
+    })
     fireEvent.change(screen.getByLabelText('draft'), { target: { value: 'unsent' } })
     fireEvent.click(screen.getByText('collapse'))
     await context.voice!.open(descriptor.owner)
@@ -106,9 +149,11 @@ describe('plugin voice renderer through the public context', () => {
     const { arbiter, deny, stop } = bridgeFixture()
     const context = createPluginContext(descriptor.pluginId)
     let controller!: PluginVoiceController
-    context.voice!.register(props => { controller = props.controller;
+    context.voice!.register(props => {
+      controller = props.controller
 
- return <span>ready</span> })
+      return <span>ready</span>
+    })
     const hud = render(<PluginVoiceHud />)
     await screen.findByText('ready')
     expect(arbiter.acquire(8, 'native')).toBe(true)
@@ -123,6 +168,13 @@ describe('plugin voice renderer through the public context', () => {
     expect(await controller.acquire()).toBeNull()
     hud.unmount()
     expect(controller.signal.aborted).toBe(true)
-    await expect(acquireMicrophoneLease({ owner: Symbol('native'), voiceContextIsCurrent: () => false, pause: async () => {}, resume: () => {} })).resolves.toBeNull()
+    await expect(
+      acquireMicrophoneLease({
+        owner: Symbol('native'),
+        voiceContextIsCurrent: () => false,
+        pause: async () => {},
+        resume: () => {}
+      })
+    ).resolves.toBeNull()
   })
 })

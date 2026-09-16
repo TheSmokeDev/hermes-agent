@@ -22,12 +22,14 @@ it('closes a late microphone grant after cancellation or unmount without constru
   for (const unmount of [false, true]) {
     let grant!: (stream: MediaStream) => void
     const track = { stop: vi.fn() }
+
     const getUserMedia = vi.fn(
       () =>
         new Promise<MediaStream>(resolve => {
           grant = resolve
         })
     )
+
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } })
     const recorder = Object.assign(vi.fn(), { isTypeSupported: () => true })
     vi.stubGlobal('MediaRecorder', recorder)

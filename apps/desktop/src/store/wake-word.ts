@@ -41,27 +41,29 @@ let peerMicrophonePaused = false
 export function installWakeMicrophoneHandoff(): () => void {
   let resume: (() => Promise<void>) | null = null
 
-  return window.hermesDesktop?.microphone?.onWakeHandoff?.(async action => {
-    if (action === 'resume') {
-      peerMicrophonePaused = false
-      const restore = resume
-      resume = null
-      await restore?.()
+  return (
+    window.hermesDesktop?.microphone?.onWakeHandoff?.(async action => {
+      if (action === 'resume') {
+        peerMicrophonePaused = false
+        const restore = resume
+        resume = null
+        await restore?.()
 
-      return
-    }
+        return
+      }
 
-    peerMicrophonePaused = true
-    const hadCapture = Boolean(clientCapture?.active)
-    stopClientCapture()
-    const gateway = $gateway.get()
+      peerMicrophonePaused = true
+      const hadCapture = Boolean(clientCapture?.active)
+      stopClientCapture()
+      const gateway = $gateway.get()
 
-    if (gateway && (hadCapture || $wakeWord.get().listening)) {
-      // Restore on the socket that owned wake, even if the main window navigates during voice.
-      resume = () => resumeWakeAfterVoice((method, params) => gateway.request(method, params))
-      await gateway.request('wake.pause', {})
-    }
-  }) ?? (() => {})
+      if (gateway && (hadCapture || $wakeWord.get().listening)) {
+        // Restore on the socket that owned wake, even if the main window navigates during voice.
+        resume = () => resumeWakeAfterVoice((method, params) => gateway.request(method, params))
+        await gateway.request('wake.pause', {})
+      }
+    }) ?? (() => {})
+  )
 }
 
 /** Stop client-side PCM capture (also called on wake.detected before voice). */

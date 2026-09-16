@@ -141,8 +141,11 @@ export function useHudComposerDrag(
       const target = event.currentTarget
       const immediate = controlDrag && event.ctrlKey
 
-      const onMoveOnly = !immediate && dragOnMoveWithin !== undefined &&
-        event.target instanceof Element && event.target.closest(dragOnMoveWithin) !== null
+      const onMoveOnly =
+        !immediate &&
+        dragOnMoveWithin !== undefined &&
+        event.target instanceof Element &&
+        event.target.closest(dragOnMoveWithin) !== null
 
       // A press over an existing contentEditable selection otherwise starts
       // Chromium's native text drag, which cancels our pointer stream. Cancel

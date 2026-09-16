@@ -51,6 +51,7 @@ describe('composer voice ownership', () => {
       })
 
     const resume = vi.fn(() => expect(pauseSettled).toBe(true))
+
     const acquired = acquireMicrophoneLease({
       owner: Symbol('owner'),
       pause,
@@ -121,6 +122,7 @@ describe('exclusive capture lifetimes', () => {
         pause: async () => {},
         resume: () => {}
       })
+
     expect(await competitor()).toBeNull()
     ownerAbort.abort()
     expect(await competitor()).toBeNull()

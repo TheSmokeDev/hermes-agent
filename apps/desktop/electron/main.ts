@@ -16103,7 +16103,13 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
 async function fetchJsonForBackend(
   descriptor,
   path,
-  opts: { method?: string; body?: unknown; upload?: unknown; timeoutMs?: number; pluginHeaders?: Record<string, string> } = {}
+  opts: {
+    method?: string
+    body?: unknown
+    upload?: unknown
+    timeoutMs?: number
+    pluginHeaders?: Record<string, string>
+  } = {}
 ) {
   const url = `${descriptor.baseUrl}${path}`
 
@@ -16894,7 +16900,9 @@ async function dispatchHermesApiRequest(request) {
   return handleHermesApiRequest(request).finally(releaseProfileDeletion)
 }
 
-ipcMain.handle('hermes:api', (_event, request) => withPluginRequestAuth(request, () => dispatchHermesApiRequest(request)))
+ipcMain.handle('hermes:api', (_event, request) =>
+  withPluginRequestAuth(request, () => dispatchHermesApiRequest(request))
+)
 
 // Main serializes cross-window ambient claims (see event-dedupe.ts for why a
 // spoken reply holds its claim far longer than a beep).

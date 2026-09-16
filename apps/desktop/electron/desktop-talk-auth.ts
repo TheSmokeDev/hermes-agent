@@ -101,7 +101,11 @@ export function createDesktopTalkAuth() {
       try {
         return await send({ [TOKEN_HEADER]: grant.token })
       } catch (error) {
-        const safe = new Error(String(error instanceof Error ? error.message : error).split(grant.token).join('[redacted]'))
+        const safe = new Error(
+          String(error instanceof Error ? error.message : error)
+            .split(grant.token)
+            .join('[redacted]')
+        )
 
         if (error instanceof Error) {
           safe.name = error.name

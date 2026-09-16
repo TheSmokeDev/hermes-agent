@@ -17,15 +17,18 @@ export function registerMicrophoneIpc() {
     return new Promise((resolve, reject) => {
       const id = randomUUID()
       const timer = setTimeout(() => settle(false), 35_000)
+
       const settle = (ok: boolean) => {
         clearTimeout(timer)
         replies.delete(id)
+
         if (ok) {
           resolve()
         } else {
           reject(new Error('Could not hand off the wake microphone'))
         }
       }
+
       replies.set(id, { senderId: sender.id, settle })
       sender.send('hermes:microphone:wake', { id, action })
     })
@@ -37,14 +40,17 @@ export function registerMicrophoneIpc() {
     }
 
     watched.add(sender.id)
+
     const gone = () => {
       for (const reply of replies.values()) {
         if (reply.senderId === sender.id) {
           reply.settle(true)
         }
       }
+
       void microphone.remove(sender.id)
     }
+
     sender.on('render-process-gone', gone)
     sender.once('destroyed', () => {
       gone()

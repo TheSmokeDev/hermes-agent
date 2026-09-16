@@ -156,11 +156,14 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   microphone: {
     onWakeHandoff: callback => {
       const listener = (_event, request) => {
-        void Promise.resolve().then(() => callback(request.action)).then(
-          () => ipcRenderer.send('hermes:microphone:wake-settled', request.id, true),
-          () => ipcRenderer.send('hermes:microphone:wake-settled', request.id, false)
-        )
+        void Promise.resolve()
+          .then(() => callback(request.action))
+          .then(
+            () => ipcRenderer.send('hermes:microphone:wake-settled', request.id, true),
+            () => ipcRenderer.send('hermes:microphone:wake-settled', request.id, false)
+          )
       }
+
       ipcRenderer.on('hermes:microphone:wake', listener)
       ipcRenderer.send('hermes:microphone:watch-wake')
 

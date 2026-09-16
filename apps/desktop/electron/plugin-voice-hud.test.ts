@@ -8,9 +8,11 @@ const owner = { connectionId: 'local', profile: 'default', sessionId: 'live', st
 function fixture(validateOwner = async () => {}) {
   const send = vi.fn()
   let window: { isDestroyed(): boolean; webContents: { id: number; send: typeof send } } | null = null
+
   const spawn = vi.fn(() => {
     window = { isDestroyed: () => false, webContents: { id: 7, send } }
   })
+
   const focus = vi.fn()
   const close = vi.fn()
   const hud = createPluginVoiceHud({ getWindow: () => window, spawn, focus, close, validateOwner })
@@ -31,12 +33,14 @@ function fixture(validateOwner = async () => {}) {
 describe('plugin voice HUD ownership', () => {
   it('coalesces pending opens, focuses the exact owner and refuses colliding connection/profile identities', async () => {
     let resolve!: () => void
+
     const validate = vi.fn(
       () =>
         new Promise<void>(done => {
           resolve = done
         })
     )
+
     const { hud, spawn, focus, close, clear } = fixture(validate)
     const request = { pluginId: 'voice-plugin', owner }
     const first = hud.open({ ...request, token: 'must-not-cross', owner: { ...owner, secret: 'must-not-cross' } })

@@ -3,7 +3,6 @@ import { BrowserWindow, ipcMain } from 'electron'
 import type { createPluginVoiceHud } from './plugin-voice-hud'
 
 export function registerPluginVoiceIpc(voice: ReturnType<typeof createPluginVoiceHud>) {
-
   ipcMain.handle('hermes:hud:voice:open', (event, request) => {
     if (!BrowserWindow.fromWebContents(event.sender)) {
       throw new Error('Voice requires an app window')

@@ -2,7 +2,11 @@ import { acquireMicrophoneLease } from '@/app/chat/composer/hooks/composer-micro
 import { requestGatewayForAgent } from '@/store/gateway'
 import type { PluginVoiceController } from '@/store/plugin-voice'
 
-import { parsePluginVoiceOwner, type PluginVoiceDescriptor, type PluginVoiceOwner } from '../../../electron/plugin-voice-contract'
+import {
+  parsePluginVoiceOwner,
+  type PluginVoiceDescriptor,
+  type PluginVoiceOwner
+} from '../../../electron/plugin-voice-contract'
 
 interface PluginVoiceControllerDeps {
   prepare(owner: PluginVoiceOwner, signal: AbortSignal): Promise<{ session_id: string; stored_session_id: string }>
@@ -24,12 +28,12 @@ const scopedWake = async (owner: PluginVoiceOwner, method: string): Promise<void
 
 const nativeDeps: PluginVoiceControllerDeps = {
   prepare: async (owner, signal) => {
-    const request = <T>(method: string, params: Record<string, unknown>) => requestGatewayForAgent<T>(
-      owner.connectionId, owner.profile, method, params, 30_000, signal
-    )
+    const request = <T>(method: string, params: Record<string, unknown>) =>
+      requestGatewayForAgent<T>(owner.connectionId, owner.profile, method, params, 30_000, signal)
 
     const prepared = await request<{ session_id: string; stored_session_id: string }>('session.prepare', {
-      session_id: owner.sessionId, stored_session_id: owner.storedSessionId
+      session_id: owner.sessionId,
+      stored_session_id: owner.storedSessionId
     })
 
     if (prepared.session_id !== owner.sessionId || prepared.stored_session_id !== owner.storedSessionId) {
@@ -70,16 +74,26 @@ export function createPluginVoiceController(descriptor: PluginVoiceDescriptor, d
       return preparation
     }
 
-    preparation = deps.prepare(owner, lifetime.signal).then(result => {
-      if (lifetime.signal.aborted || result.session_id !== owner.sessionId || result.stored_session_id !== owner.storedSessionId) {
-        throw new Error('Voice owner no longer matches the prepared conversation')
-      }
+    preparation = deps
+      .prepare(owner, lifetime.signal)
+      .then(result => {
+        if (
+          lifetime.signal.aborted ||
+          result.session_id !== owner.sessionId ||
+          result.stored_session_id !== owner.storedSessionId
+        ) {
+          throw new Error('Voice owner no longer matches the prepared conversation')
+        }
 
-      return owner
-    }).catch(error => {
-      stop()
-      throw error
-    }).finally(() => { preparation = null })
+        return owner
+      })
+      .catch(error => {
+        stop()
+        throw error
+      })
+      .finally(() => {
+        preparation = null
+      })
 
     return preparation
   }
@@ -89,19 +103,20 @@ export function createPluginVoiceController(descriptor: PluginVoiceDescriptor, d
     owner,
     signal: lifetime.signal,
     prepareSession,
-    acquire: options => acquireMicrophoneLease({
-      owner: token,
-      ownerSignal: lifetime.signal,
+    acquire: options =>
+      acquireMicrophoneLease({
+        owner: token,
+        ownerSignal: lifetime.signal,
         signal: options?.signal
           ? AbortSignal.any([options.signal, microphonePermission.signal])
           : microphonePermission.signal,
-      voiceContextIsCurrent: () => !lifetime.signal.aborted,
-      pause: async () => {
-        await prepareSession()
-        await deps.pause(owner)
-      },
-      resume: () => deps.resume(owner)
-    }),
+        voiceContextIsCurrent: () => !lifetime.signal.aborted,
+        pause: async () => {
+          await prepareSession()
+          await deps.pause(owner)
+        },
+        resume: () => deps.resume(owner)
+      }),
     stop
   }
 
