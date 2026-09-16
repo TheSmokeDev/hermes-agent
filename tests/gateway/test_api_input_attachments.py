@@ -794,14 +794,20 @@ async def test_a_path_the_child_cannot_open_is_refused_not_leaked(tmp_path, monk
 def test_the_mount_table_and_the_store_agree_on_a_junctioned_home(tmp_path, monkeypatch):
     """Both sides must resolve the home, or the container translation silently
     degrades to the raw host path."""
+    import os
     import subprocess
+    import sys
     from tools.credential_files import to_agent_visible_cache_path
     real, link = tmp_path / "real-home", tmp_path / "linked-home"
     (real / "images").mkdir(parents=True)
-    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(real)],
-                          capture_output=True, text=True)
-    if made.returncode != 0 or not link.exists():
-        pytest.skip("this host does not allow junction creation")
+    if sys.platform == "win32":
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(real)],
+                              capture_output=True, text=True)
+        if made.returncode != 0 or not link.exists():
+            pytest.skip("this host does not allow junction creation")
+    else:
+        # The same property under test: a home reached through a link.
+        os.symlink(real, link, target_is_directory=True)
     monkeypatch.setenv("HERMES_HOME", str(link))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     # What the store writes: the home resolved through the junction.
