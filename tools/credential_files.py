@@ -278,6 +278,14 @@ def _cache_dir_roots(container_base: str, *, create_missing: bool) -> Iterator[T
                 host_dir.mkdir(parents=True, exist_ok=True)
             except OSError:
                 continue  # unwritable home (tests, RO mounts) — skip as before
+        # Resolve the real directory. Writers that resolve their own home (a symlinked or
+        # junctioned HERMES_HOME) would otherwise store bytes under a path no mount root
+        # is a prefix of, and the container translation would silently hand back the raw
+        # host path. Resolving an already-real directory is a no-op.
+        try:
+            host_dir = host_dir.resolve()
+        except OSError:
+            pass
         yield host_dir, f"{base}/{new_subpath}"
 
 

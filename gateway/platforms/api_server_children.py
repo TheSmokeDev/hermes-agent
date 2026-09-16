@@ -65,6 +65,26 @@ def cancel_linked_child(parent, *, approval_key):
         service.cancel(handle, reason="Owning API run stopped")
 
 
+def launch_attachment_audience(adapter, run):
+    """The audience an attachment must still belong to at LAUNCH, not at admission.
+
+    The admission-time context is a snapshot, so comparing it against itself can never
+    disagree. On the attachment-bearing path re-run the live verification instead: it
+    re-reads the current member set and raises ``discord_audience_changed`` when it
+    moved, refusing the dispatch before any child starts.
+    """
+    from hermes_state_input_attachments import audience_key
+    binding = getattr(run, "discord_task_binding", None)
+    if not run.child_request.get("attachments") or binding is None:
+        return audience_key(getattr(run, "discord_task_context", None))
+    from gateway.discord_task_context import task_contexts
+    profile = (run.request_profile
+               or getattr(adapter.gateway_runner, "_primary_profile_name", None) or "default")
+    fresh = task_contexts(adapter.gateway_runner).verify(
+        **binding, profile=profile, owner=run.child_dispatch["run_scope"])
+    return audience_key(fresh)
+
+
 def run_child_sync(adapter, run, parent):
     """Called inside the existing run's profile/session/approval scope; hold it until terminal."""
     dispatch, request = run.child_dispatch, run.child_request
@@ -73,13 +93,12 @@ def run_child_sync(adapter, run, parent):
     db = getattr(parent, "_session_db", None)
     if db is None or str(getattr(parent, "session_id", "")) != dispatch["parent_session_id"]:
         raise ValueError("Linked child dispatch requires the authorized parent and its durable store")
-    from hermes_state_input_attachments import audience_key
     from gateway.platforms.api_server_input_attachments import manifest_context
     # Revalidates immutable bytes, ownership and the current Discord audience before launch;
     # the frozen set must match this request's references exactly.
     verified = db.claim_child_dispatch(
         dispatch, attachments=request.get("attachments"),
-        attachment_audience=audience_key(getattr(run, "discord_task_context", None)))
+        attachment_audience=launch_attachment_audience(adapter, run))
     if "worker" in request:
         if verified:
             raise ValueError("Installed task workers expose no host-file delivery contract")

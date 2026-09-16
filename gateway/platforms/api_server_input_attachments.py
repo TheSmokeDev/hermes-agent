@@ -92,16 +92,29 @@ def delivery_refusal(child) -> str | None:
     return None
 
 
+def agent_visible_path(host_path: str) -> str:
+    """The path the child will actually open, or a refusal — never a raw host path.
+
+    ``to_agent_visible_cache_path`` degrades to its input when no cache mount contains
+    the bytes. On a remote backend that answer is both unopenable by the child and a
+    host-path leak into its context, so it is a refusal rather than a fallback.
+    """
+    from tools.credential_files import to_agent_visible_cache_path
+    mapped = to_agent_visible_cache_path(host_path)
+    if terminal_backend() != "local" and mapped == host_path:
+        raise IngressError("attachment_path_not_agent_visible")
+    return mapped
+
+
 def manifest_context(context, verified):
     """Append one bounded server-created manifest; a text-only dispatch is returned unchanged."""
     if not verified:
         return context
-    from tools.credential_files import to_agent_visible_cache_path
     items = [{
         "attachment_id": row["attachment_id"], "filename": row["filename"],
         "content_type": row["content_type"], "bytes": row["bytes"], "sha256": row["sha256"],
         "kind": "image" if row["content_type"].startswith("image/") else "file",
-        "path": to_agent_visible_cache_path(row["path"])} for row in verified]
+        "path": agent_visible_path(row["path"])} for row in verified]
     block = MANIFEST_HEADING + "\n" + json.dumps(
         {"version": 1, "attachments": items, "guidance": _MANIFEST_GUIDANCE},
         sort_keys=True, separators=(",", ":"))

@@ -174,10 +174,47 @@ class InputAttachmentStore:
                 import os
                 os.fsync(stream.fileno())
             path.chmod(stat.S_IRUSR)
-            conn.execute("INSERT INTO input_attachments (" + ",".join(row) + ") VALUES ("
-                         + ",".join("?" for _ in row) + ")", tuple(row.values()))
+            try:
+                conn.execute("INSERT INTO input_attachments (" + ",".join(row) + ") VALUES ("
+                             + ",".join("?" for _ in row) + ")", tuple(row.values()))
+            except BaseException:
+                # Retention keys on rows, so bytes left behind by a rolled-back or
+                # retried write would never be reclaimed. Drop them with the row.
+                self._discard(path)
+                raise
             return receipt(row)
         return self.db._execute_write(write)
+
+    @staticmethod
+    def _discard(path) -> bool:
+        """Best-effort removal of one stored file (they are written read-only)."""
+        try:
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            path.unlink()
+            return True
+        except OSError:
+            return False
+
+    def _sweep_orphan_files(self, conn) -> int:
+        """Reclaim our own bytes that no row owns — a commit lost after the write.
+
+        Both directories are shared staging caches, so only files carrying this
+        store's exact ``att_<32 hex>`` id shape are ever considered.
+        """
+        known = {row["attachment_id"] for row in
+                 conn.execute("SELECT attachment_id FROM input_attachments")}
+        removed = 0
+        for name in ("images", "attachments"):
+            directory = self.home / name
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            for child in directory.iterdir():
+                if (child.is_symlink() or not child.is_file()
+                        or not re.fullmatch(r"att_[0-9a-f]{32}", child.stem)
+                        or child.stem in known):
+                    continue
+                removed += self._discard(child)
+        return removed
 
     def expire_unbound(self, *, now=None) -> int:
         def write(conn):
@@ -187,10 +224,9 @@ class InputAttachmentStore:
             for row in rows:
                 path = self._path(row)
                 if path.exists():
-                    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-                    path.unlink()
+                    self._discard(path)
                 conn.execute("UPDATE input_attachments SET expired=1 WHERE attachment_id=?", (row["attachment_id"],))
-            return len(rows)
+            return len(rows) + self._sweep_orphan_files(conn)
         return self.db._execute_write(write)
 
     def verify(self, conn, references, *, owner_scope, conversation_id, audience) -> list[dict]:

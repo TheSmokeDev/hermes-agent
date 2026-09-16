@@ -336,3 +336,39 @@ def test_native_source_boundaries_do_not_fall_back_to_another_task(native_source
         page = env.service.catalog(app=app)
         assert page["truncated"] and len(page["recipients"]) <= 1
     assert env.desktop.composes == env.desktop.submits == env.desktop.captures == 0
+
+
+def junction(link, target):
+    """A directory junction — the Windows reparse point an unprivileged user can make."""
+    import subprocess
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                          capture_output=True, text=True)
+    return made.returncode == 0 and link.exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
+def test_a_reparse_point_under_a_native_file_is_refused_on_windows(native_sources, tmp_path):
+    """The POSIX reader guards the path; the Windows reader must refuse the same shape."""
+    env, app, task = native_sources, "claude_code", TASKS[0]
+    real = env.paths[app, task]
+    token = env.service.catalog(app=app)["recipients"][0]["target_token"]
+    assert env.service.history(target_token=token)["messages"][1]["text"] == "answer " + task
+    # Swap the project directory for a junction pointing at an identical copy.
+    moved = tmp_path / "relocated"
+    moved.mkdir()
+    copy = moved / real.name
+    copy.write_bytes(real.read_bytes())
+    private_file(copy)
+    project = real.parent
+    for leftover in project.iterdir():
+        leftover.unlink()
+    project.rmdir()
+    if not junction(project, moved):
+        pytest.skip("this host does not allow junction creation")
+    assert copy.exists() and (project / real.name).read_bytes() == real.read_bytes()
+    with pytest.raises(RecipientError, match="unsafe_history_source"):
+        sources.read_file(project / real.name)
+    with pytest.raises(RecipientError):
+        env.service.history(target_token=token)
+    assert env.desktop.composes == env.desktop.submits == env.desktop.captures == 0
+    assert env.native.writes == [] and env.native.secrets_read == 0

@@ -48,6 +48,7 @@ if sys.platform == "win32":
         import win32file
 
         native = WindowsClaudeNative()
+        _safe_path(path)
         try:
             with native._file(path, read=True, changing=True) as handle:
                 before = win32file.GetFileInformationByHandle(handle)
@@ -64,6 +65,7 @@ if sys.platform == "win32":
                     raise RecipientError("history_source_changed")
         except native.api.error as exc:
             raise RecipientError("native_history_unavailable", 503) from exc
+        _safe_path(path)
         identity = [before[4], before[8], before[9]]
         modified = before[3].timestamp()
         return prefix, data, offset, size, identity, modified

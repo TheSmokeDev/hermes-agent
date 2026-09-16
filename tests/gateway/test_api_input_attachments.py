@@ -472,6 +472,17 @@ def parse_manifest(context):
     return json.loads(body)
 
 
+async def wait_settled(box, run_id, contexts):
+    """Terminal status, or the first recorded child launch — whichever lands first."""
+    async def wait():
+        while True:
+            status = await (await box.client.get(f"/v1/runs/{run_id}", headers=box.auth)).json()
+            if contexts or status.get("status") in {"completed", "failed", "cancelled"}:
+                return status
+            await asyncio.sleep(0.02)
+    return await asyncio.wait_for(wait(), timeout=30)
+
+
 async def wait_terminal(box, run_id):
     async def wait():
         while True:
@@ -615,6 +626,166 @@ async def test_retention_never_reclaims_bytes_bound_to_durable_accepted_work(tmp
             row = conn.execute("SELECT expired FROM input_attachments WHERE attachment_id=?",
                                (bound["attachment_id"],)).fetchone()
         assert row["expired"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_audience_that_moves_between_admission_and_launch_refuses_the_dispatch(
+        tmp_path, monkeypatch):
+    """The admission context is a snapshot; only a fresh read can disagree with it."""
+    from tests.gateway.test_dashboard_consumption import gateway
+    from tests.gateway.test_discord_task_context import binding, room_fixture
+    room = room_fixture()
+    payloads, children, parents, contexts = [], [], [], []
+    child_only_provider(monkeypatch, payloads, children)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    async with gateway(tmp_path, monkeypatch) as (_, keys, stores, adapter, client):
+        room.runner.config = adapter.gateway_runner.config
+        adapter.gateway_runner = room.runner
+        db = stores["alpha"]
+        auth = {"Authorization": "Bearer " + keys["alpha"]}
+        proof = binding(room)
+        assert (await client.post("/p/alpha/v1/task-context/discord/redeem",
+                                  headers=auth, json=proof)).status == 200
+        response = await client.post(
+            "/p/alpha/v1/input-attachments", headers=auth,
+            json=upload_body(png_bytes(), upload_id="u1", session_id="same-session",
+                             discord_task_context=proof))
+        assert response.status == 200, await response.text()
+        shot = await response.json()
+        record_child_context(monkeypatch, contexts)
+
+        def build_parent(**kwargs):
+            # The barrier: a listener leaves the call after admission, before the launch.
+            room.channel.voice_states.pop(room.peer.id, None)
+            parent = AIAgent(api_key="fixture-only-key", provider="openrouter", model="test-model",
+                             base_url="https://openrouter.ai/api/v1", session_id=kwargs["session_id"],
+                             session_db=db, platform="api_server", enabled_toolsets=ATTACHMENT_TOOLSETS,
+                             quiet_mode=True, skip_context_files=True, skip_memory=True,
+                             tool_progress_callback=kwargs["tool_progress_callback"])
+            parents.append(parent)
+            return parent
+
+        monkeypatch.setattr(adapter, "_create_agent", build_parent)
+        body = {**run_body([reference(shot)]), "session_id": "same-session",
+                "discord_task_context": proof}
+        with (patch("model_tools.get_tool_definitions", return_value=[]),
+              patch("model_tools.check_toolset_requirements", return_value={}),
+              patch("agent.process_bootstrap.OpenAI")):
+            admitted = await client.post(
+                "/p/alpha/v1/runs", headers={**auth, "Idempotency-Key": "one-action"}, json=body)
+            assert admitted.status == 202, await admitted.text()
+            run_id = (await admitted.json())["run_id"]
+
+            async def settled():
+                while True:
+                    status = await (await client.get(f"/p/alpha/v1/runs/{run_id}",
+                                                     headers=auth)).json()
+                    if contexts or status.get("status") in {"completed", "failed", "cancelled"}:
+                        return status
+                    await asyncio.sleep(0.02)
+            terminal = await asyncio.wait_for(settled(), timeout=30)
+        assert contexts == [] and children == [], "a child launched under the stale audience"
+        assert terminal["status"] == "failed", terminal
+        assert "discord_audience_changed" in terminal["error"]
+        with db._read_ctx() as conn:
+            rows = conn.execute("SELECT attachment_id, supplied_at FROM input_attachment_bindings").fetchall()
+            state = conn.execute("SELECT state FROM child_dispatches").fetchone()["state"]
+        # Bound, and deliberately never delivered.
+        assert [row["attachment_id"] for row in rows] == [shot["attachment_id"]]
+        assert rows[0]["supplied_at"] is None
+        assert state == "admitted"
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_row_never_leaves_its_bytes_behind(tmp_path, monkeypatch):
+    """Force the INSERT to fail after the write: retention keys on rows, so an orphan
+    file would never be reclaimed."""
+    monkeypatch.setattr(input_attachments, "UNBOUND_TTL_SECONDS", -1)
+    async with host(tmp_path, monkeypatch) as box:
+        _, doomed = await upload(box, png_bytes(), upload_id="u1")
+        # Sweep it: the row survives as a tombstone, its bytes are gone.
+        monkeypatch.setattr(input_attachments, "UNBOUND_TTL_SECONDS", 3600)
+        input_attachments.InputAttachmentStore(box.db).expire_unbound()
+        collided = box.root / "images" / (doomed["attachment_id"] + ".png")
+        assert not collided.exists()
+        # A fresh upload minted onto the tombstoned id writes its file, then the
+        # INSERT fails on the primary key.
+        monkeypatch.setattr(input_attachments.uuid, "uuid4",
+                            lambda: SimpleNamespace(hex=doomed["attachment_id"][4:]))
+        response, payload = await upload(box, png_bytes(size=(5, 5)), upload_id="u2")
+        assert response.status != 200, payload
+        assert not collided.exists(), "rolled-back bytes were left behind"
+        with box.db._read_ctx() as conn:
+            assert conn.execute("SELECT COUNT(*) c FROM input_attachments").fetchone()["c"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retention_reclaims_our_orphan_files_and_never_a_foreign_one(tmp_path, monkeypatch):
+    async with host(tmp_path, monkeypatch) as box:
+        _, live = await upload(box, png_bytes(), upload_id="u1")
+        images = box.root / "images"
+        orphan = images / ("att_" + "f" * 32 + ".png")
+        orphan.write_bytes(png_bytes())
+        # The staging cache is shared: a file outside this store's id shape is not ours.
+        foreign = images / "desktop-drop.png"
+        foreign.write_bytes(png_bytes())
+        odd_shape = images / "att_not-a-real-id.png"
+        odd_shape.write_bytes(png_bytes())
+        swept = input_attachments.InputAttachmentStore(box.db).expire_unbound()
+        assert swept == 1
+        assert not orphan.exists()
+        assert foreign.exists() and odd_shape.exists()
+        assert (images / (live["attachment_id"] + ".png")).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_path_the_child_cannot_open_is_refused_not_leaked(tmp_path, monkeypatch):
+    """A remote backend whose mount roots do not contain the bytes must refuse."""
+    payloads, children, parents, contexts = [], [], [], []
+    child_only_provider(monkeypatch, payloads, children)
+    async with host(tmp_path, monkeypatch) as box:
+        parent_builder(box.adapter, box.db, monkeypatch, parents)
+        record_child_context(monkeypatch, contexts)
+        _, shot = await upload(box, png_bytes(), upload_id="u1")
+        stored = str(box.root / "images" / (shot["attachment_id"] + ".png"))
+        elsewhere = tmp_path / "other-home"
+        elsewhere.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(elsewhere))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        with (patch("model_tools.get_tool_definitions", return_value=[]),
+              patch("model_tools.check_toolset_requirements", return_value={}),
+              patch("agent.process_bootstrap.OpenAI")):
+            response, admitted = await dispatch(box, run_body([reference(shot)]))
+            assert response.status == 202, admitted
+            terminal = await wait_settled(box, admitted["run_id"], contexts)
+        # A launch context at all means the unopenable path was handed to the child.
+        assert contexts == [], contexts
+        assert children == []
+        assert terminal["status"] == "failed", terminal
+        assert "attachment_path_not_agent_visible" in terminal["error"]
+        blob = json.dumps(terminal) + json.dumps(payloads)
+        assert stored not in blob and str(box.root) not in blob
+
+
+def test_the_mount_table_and_the_store_agree_on_a_junctioned_home(tmp_path, monkeypatch):
+    """Both sides must resolve the home, or the container translation silently
+    degrades to the raw host path."""
+    import subprocess
+    from tools.credential_files import to_agent_visible_cache_path
+    real, link = tmp_path / "real-home", tmp_path / "linked-home"
+    (real / "images").mkdir(parents=True)
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(real)],
+                          capture_output=True, text=True)
+    if made.returncode != 0 or not link.exists():
+        pytest.skip("this host does not allow junction creation")
+    monkeypatch.setenv("HERMES_HOME", str(link))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    # What the store writes: the home resolved through the junction.
+    stored = str((link / "images").resolve() / ("att_" + "a" * 32 + ".png"))
+    mapped = to_agent_visible_cache_path(stored)
+    assert mapped != stored, "a junctioned home degraded to the raw host path"
+    assert mapped.startswith("/root/.hermes/images/")
+    assert attachment_routes.agent_visible_path(stored) == mapped
 
 
 @pytest.mark.asyncio

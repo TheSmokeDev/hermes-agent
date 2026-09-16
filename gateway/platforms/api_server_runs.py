@@ -338,6 +338,9 @@ class _RunLaunch:
     child_request: Optional[dict] = None
     child_dispatch: Optional[dict] = None
     discord_task_context: Optional[dict] = None
+    # The proof/session/binding triple, kept so a launch can re-snapshot the LIVE
+    # audience instead of comparing the admission context against itself.
+    discord_task_binding: Optional[dict] = None
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
     @property
@@ -587,6 +590,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         origin_claim=origin_claim, child_request=child_request, child_dispatch=child_dispatch,
         discord_task_context=discord_context,
+        discord_task_binding=body.get("discord_task_context") if discord_context is not None else None,
         turn_author=turn_author)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
