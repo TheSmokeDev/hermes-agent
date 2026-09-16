@@ -25,6 +25,16 @@ export function PluginVoiceHud() {
   // The surface paints only what it needs; the rest of the window is empty and hands the mouse through.
   useHudClickThrough(rootRef)
 
+  // index.html paints an opaque themed background onto <html> as an inline style; without this
+  // the transparent window is a solid slab (the chat HUD, pet overlay and quick entry do the same).
+  useEffect(() => {
+    const style = document.createElement('style')
+    style.textContent = 'html,body,#root{background:transparent !important;}'
+    document.head.appendChild(style)
+
+    return () => style.remove()
+  }, [])
+
   useEffect(() => {
     let cancelled = false
     let dispose: (() => void) | undefined
