@@ -85,8 +85,11 @@ def delivery_refusal(child) -> str | None:
         # Shape is validated separately; anything that is not a resolvable name provides no tool.
         if not isinstance(selected, list):
             return "child_toolsets_missing_attachment_tools"
-        from toolsets import resolve_multiple_toolsets
-        available = set(resolve_multiple_toolsets([n for n in selected if isinstance(n, str)]))
+        from toolsets import resolve_toolset
+        available: set = set()
+        for name in selected:
+            if isinstance(name, str):
+                available.update(resolve_toolset(name))
         if any(tool not in available for tool in REQUIRED_CHILD_TOOLS):
             return "child_toolsets_missing_attachment_tools"
     return None
