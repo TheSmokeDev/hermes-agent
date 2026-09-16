@@ -20,7 +20,7 @@ export function PluginVoiceHud() {
   const [mounted, setMounted] = useState<MountedVoice | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
   const windowing = window.hermesDesktop?.hud?.windowing
-  const { onPointerDown } = useHudComposerDrag(windowing?.nativeDrag !== true, windowing)
+  const { grabbing, onPointerDown } = useHudComposerDrag(windowing?.nativeDrag !== true, windowing)
 
   // The surface paints only what it needs; the rest of the window is empty and hands the mouse through.
   useHudClickThrough(rootRef)
@@ -94,7 +94,9 @@ export function PluginVoiceHud() {
   return (
     <div className="h-screen w-screen overflow-hidden text-foreground" ref={rootRef}>
       <div className="inline-flex max-h-screen max-w-full flex-col overflow-hidden rounded-lg bg-background">
-        <div className={`flex shrink-0 items-center justify-end ${windowing?.nativeDrag ? '[-webkit-app-region:drag]' : ''}`} onPointerDown={onPointerDown}>
+        {/* data-hud-grabbing keeps the window solid while it chases the cursor (click-through.ts). */}
+        <div className={`flex shrink-0 items-center justify-end ${windowing?.nativeDrag ? '[-webkit-app-region:drag]' : ''}`}
+          data-hud-grabbing={grabbing ? '' : undefined} onPointerDown={onPointerDown}>
           <Button aria-label={t.common.close} onClick={() => mounted ? mounted.controller.stop() : void window.hermesDesktop?.hud?.close()} size="icon-sm"
             variant="ghost">
             <X />
