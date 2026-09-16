@@ -74,7 +74,7 @@ else:
         _safe_path(path)
         with path.open("rb") as stream:
             before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid():
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid():  # windows-footgun: ok — POSIX branch only
                 raise RecipientError("unsafe_history_source")
             prefix = stream.read(PREFIX_BYTES)
             offset = max(0, before.st_size - HISTORY_BYTES) if not prefix_only else 0
