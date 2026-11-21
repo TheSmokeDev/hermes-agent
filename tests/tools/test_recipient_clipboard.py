@@ -197,3 +197,84 @@ foreach($expanded in @($false,$true)){
     assert value["expansions"] == [
         {"actions": 1, "copy": 1, "invoked": 1, "restored": True, "actions_collapses": 0, "copy_collapses": 0},
         {"actions": 0, "copy": 0, "invoked": 1, "restored": True, "actions_collapses": 0, "copy_collapses": 0}]
+
+
+@pytest.mark.windows_only
+def test_deeplink_item_accepts_either_label_but_only_one_match():
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_FUNCTIONS
+    script = ("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
+              "Add-Type -AssemblyName UIAutomationClient\nAdd-Type -AssemblyName UIAutomationTypes\n"
+              + 'Add-Type -TypeDefinition @"\n' + MENU_SHIM + '\n"@\n'
+              + CLIPBOARD_FUNCTIONS + r'''
+$desc=[System.Windows.Automation.TreeScope]::Descendants
+function Rid($element){return [string]$element.Id}
+function Element($id,$name){
+ $e=[pscustomobject]@{Id=$id;Current=[pscustomobject]@{Name=$name;ControlType=[System.Windows.Automation.ControlType]::MenuItem;IsOffscreen=$false;IsEnabled=$true;ProcessId=7};Nodes=@()}
+ $e|Add-Member ScriptMethod FindAll {param($scope,$condition);return @($this.Nodes|Where-Object {$_.Current.Name -ceq $condition.Value})}
+ return $e
+}
+$labels=@('Copy deeplink Alt+Ctrl+L','Copy deeplink')
+$answers=@{}
+foreach($mode in @('old','new','both','none')){
+ $main=Element 0 ''
+ switch($mode){
+  old {$main.Nodes=@((Element 1 'Copy deeplink Alt+Ctrl+L'),(Element 3 'Copy as Markdown'))}
+  new {$main.Nodes=@((Element 2 'Copy deeplink'),(Element 3 'Copy as Markdown'))}
+  both {$main.Nodes=@((Element 1 'Copy deeplink Alt+Ctrl+L'),(Element 2 'Copy deeplink'))}
+  none {$main.Nodes=@((Element 3 'Copy as Markdown'))}
+ }
+ try {$answers[$mode]=[string](FindVisibleNamed $main $labels ([System.Windows.Automation.ControlType]::MenuItem)).Id}
+ catch {$answers[$mode]=$_.Exception.Message}
+}
+$answers|ConvertTo-Json -Compress
+''')
+    bootstrap = ("[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false);"
+                 "Invoke-Expression ([Text.Encoding]::Unicode.GetString("
+                 "[Convert]::FromBase64String([Console]::In.ReadLine())))")
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand",
+         base64.b64encode(bootstrap.encode("utf-16le")).decode()],
+        input=base64.b64encode(script.encode("utf-16le")).decode() + "\n", capture_output=True,
+        text=True, encoding="utf-8", timeout=15, creationflags=windows_hide_flags())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"old": "1", "new": "2", "both": "task_deeplink_ambiguous",
+                                         "none": "task_deeplink_unavailable_Copy_deeplink_Alt+Ctrl+L"}
+
+
+@pytest.mark.windows_only
+def test_deeplink_copy_retries_only_transient_menu_misses():
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_FUNCTIONS
+    script = ("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
+              + CLIPBOARD_FUNCTIONS + r'''
+function Start-Sleep {param($Milliseconds)}
+$answers=@{}
+$plans=@{
+ recovers=@('task_deeplink_unavailable_Copy','task_deeplink_invoke_failed','ok');
+ gives_up=@('task_deeplink_unavailable','task_deeplink_unavailable','task_deeplink_unavailable','ok');
+ clipboard=@('clipboard_changed','ok');
+ ambiguous=@('task_deeplink_ambiguous','ok')
+}
+foreach($key in $plans.Keys){
+ $script:plan=$plans[$key];$script:calls=0
+ function CopyTaskDeeplink($window,$target){$step=$script:plan[$script:calls];$script:calls++;if($step -ne 'ok'){throw $step};return @{deeplink='link'}}
+ try {$result=(CopyTaskDeeplinkWithRetry $null $null).deeplink}catch{$result=$_.Exception.Message}
+ $answers[$key]=@($result,$script:calls)
+}
+$answers|ConvertTo-Json -Compress
+''')
+    bootstrap = ("[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false);"
+                 "Invoke-Expression ([Text.Encoding]::Unicode.GetString("
+                 "[Convert]::FromBase64String([Console]::In.ReadLine())))")
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand",
+         base64.b64encode(bootstrap.encode("utf-16le")).decode()],
+        input=base64.b64encode(script.encode("utf-16le")).decode() + "\n", capture_output=True,
+        text=True, encoding="utf-8", timeout=15, creationflags=windows_hide_flags())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"recovers": ["link", 3], "gives_up": ["task_deeplink_unavailable", 3],
+                                         "clipboard": ["clipboard_changed", 1],
+                                         "ambiguous": ["task_deeplink_ambiguous", 1]}
