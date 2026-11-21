@@ -122,8 +122,16 @@ def test_peer_send_requires_current_owner_and_fresh_authority(peer, fault):
     assert len(native.writes) == (1 if fault in {"none", "uncertain_write"} else 0)
 
 
-@pytest.mark.parametrize("fault", ["none", "wrong_uuid", "wrong_session", "wrong_origin",
-                                  "wrong_message", "missing_message", "partial_row"])
+# Row shape observed from a live Claude Code 2.1.330 receiver: its own row UUID,
+# the derived ID only in origin.msg_id, and the text inside a peer envelope.
+ENVELOPE = ("Another Claude session sent a message:\n{}\n\nThis came from another Claude "
+            "session \u2014 not typed by your user, but very likely working on their behalf.")
+
+
+@pytest.mark.parametrize("fault", ["none", "receiver_uuid", "peer_envelope", "wrong_msg_id",
+                                  "wrong_session", "wrong_origin", "wrong_message",
+                                  "envelope_altered", "foreign_header", "missing_message",
+                                  "partial_row"])
 def test_peer_reconcile_requires_exact_posted_native_message(peer, fault):
     service, native, _, _, _, history = peer
     target = service.list_recipients()[0]["identity"]
@@ -132,17 +140,41 @@ def test_peer_reconcile_requires_exact_posted_native_message(peer, fault):
     row = {"type": "user", "sessionId": target["task_id"], "uuid": wire["uuid"],
            "origin": {"kind": "peer", "msg_id": wire["msg_id"]},
            "message": {"role": "user", "content": "original"}}
-    if fault == "wrong_uuid": row["uuid"] = str(uuid.uuid4())
+    if fault in {"receiver_uuid", "peer_envelope", "envelope_altered", "foreign_header"}:
+        row["uuid"] = str(uuid.uuid4())
+        row["origin"]["from"] = "unknown"
+        row["isMeta"] = True
+    if fault == "peer_envelope": row["message"]["content"] = ENVELOPE.format("original")
+    if fault == "envelope_altered": row["message"]["content"] = ENVELOPE.format("original, then more")
+    if fault == "foreign_header":
+        row["message"]["content"] = ENVELOPE.format("original").replace("Another Claude session", "Someone", 1)
+    if fault == "wrong_msg_id": row["origin"]["msg_id"] = str(uuid.uuid4())
     if fault == "wrong_session": row["sessionId"] = str(uuid.uuid4())
     if fault == "wrong_origin": row["origin"]["kind"] = "human"
     if fault == "wrong_message": row["message"]["content"] = "something else"
     history.write_text(json.dumps(row) + ("" if fault == "partial_row" else "\n"), encoding="utf-8")
     receipt = service.reconcile(target, "scoped-op", message=None if fault == "missing_message" else "original")
-    assert receipt["status"] == ("posted" if fault == "none" else "unknown")
-    if fault == "none":
+    posted = fault in {"none", "receiver_uuid", "peer_envelope"}
+    assert receipt["status"] == ("posted" if posted else "unknown")
+    if posted:
         assert receipt["message_receipt"]["native_message_id"] == wire["msg_id"]
         assert service.reconcile(target, "scoped-op", message="original") == receipt
     assert len(native.writes) == 1 and native.secrets_read == 1
+
+
+def test_refused_pipe_open_is_a_named_failure_before_any_write(peer):
+    service, native, *_ = peer
+    target = service.list_recipients()[0]["identity"]
+
+    @contextmanager
+    def refused(pipe):
+        raise OSError("claude_pipe_access_denied")
+        yield
+
+    native.connect = refused
+    receipt = service.send(target, "original", "scoped-op", authorize=lambda: None)
+    assert receipt == {"status": "failed", "reason": "claude_pipe_access_denied"}
+    assert native.writes == [] and native.secrets_read == 0
 
 
 @pytest.mark.windows_only
@@ -178,6 +210,32 @@ def test_windows_pipe_checks_real_server_before_writing(tmp_path, wrong_pid):
         reader.join(5)
         assert not reader.is_alive() and not errors
         assert received == ([] if wrong_pid else [b"owned test payload\n"])
+    finally:
+        server.Close()
+
+
+@pytest.mark.windows_only
+def test_windows_pipe_without_write_grant_reports_access_denied():
+    import ntsecuritycon
+    import pywintypes
+    import win32pipe
+    import win32security
+
+    native = WindowsClaudeNative()
+    # The caller may read but not write, as a sandboxed token sees Claude's pipe.
+    dacl = win32security.ACL()
+    dacl.AddAccessAllowedAce(win32security.ACL_REVISION, ntsecuritycon.FILE_GENERIC_READ, native.sid)
+    descriptor = win32security.SECURITY_DESCRIPTOR()
+    descriptor.SetSecurityDescriptorDacl(True, dacl, False)
+    attributes = pywintypes.SECURITY_ATTRIBUTES()
+    attributes.SECURITY_DESCRIPTOR = descriptor
+    path = "\\\\.\\pipe\\LOCAL\\cc-msg-" + uuid.uuid4().hex
+    server = win32pipe.CreateNamedPipe(path, win32pipe.PIPE_ACCESS_INBOUND,
+                                      win32pipe.PIPE_TYPE_BYTE, 1, 65536, 65536, 5000, attributes)
+    try:
+        with pytest.raises(OSError, match="claude_pipe_access_denied"):
+            with native.connect(path):
+                pytest.fail("a pipe without a write grant must not connect")
     finally:
         server.Close()
 

@@ -21,10 +21,23 @@ _PIPE = re.compile(r"\\\\\.\\pipe\\(?:local\\)?cc-msg-[0-9a-f]{32}", re.I)
 _TOKEN = re.compile(r"[0-9a-f]{32}")
 _ID_FIELDS = ("pid", "process_started", "exe", "task_id", "pipe", "pid_domain", "peer_protocol")
 _MESSAGE_NAMESPACE = uuid.UUID("f44ba2ea-9ae1-4ca0-8d96-07c54f6310ad")
+# Claude Code 2.1.330 records an admitted peer message under its own row UUID and
+# wraps the text: this header line, the exact text, a blank line, then a notice
+# written by the receiver. Claude Code 2.1.268 stored the text verbatim.
+_PEER_HEADER = "Another Claude session sent a message:\n"
 
 
 def _message_id(operation_id):
     return str(uuid.uuid5(_MESSAGE_NAMESPACE, identifier(operation_id, "operation_id")))
+
+
+def _peer_content_matches(content, message):
+    if content == message:
+        return True
+    if not content.startswith(_PEER_HEADER):
+        return False
+    body = content[len(_PEER_HEADER):]
+    return body == message or body.startswith(message + "\n\n")
 
 
 def _json(data):
@@ -144,8 +157,11 @@ class ClaudeRecipients:
             if exc.status in {401, 403}:
                 raise
             return {"status": "unknown" if attempted else "failed", "reason": exc.code}
-        except OSError:
-            return {"status": "unknown" if attempted else "failed", "reason": "claude_pipe_unavailable"}
+        except OSError as exc:
+            # A refused open happens before any write, so it stays a plain failure.
+            denied = not attempted and exc.args == ("claude_pipe_access_denied",)
+            return {"status": "unknown" if attempted else "failed",
+                    "reason": "claude_pipe_access_denied" if denied else "claude_pipe_unavailable"}
         return self.reconcile(identity, operation_id, message=message)
 
     def reconcile(self, identity, operation_id, *, message=None):
@@ -170,7 +186,9 @@ class ClaudeRecipients:
                 if not isinstance(row, dict):
                     continue
                 origin, body = row.get("origin"), row.get("message")
-                if (row.get("type") != "user" or row.get("uuid") != native_id
+                # The peer origin's msg_id carries the derived ID; the row UUID may
+                # be the receiver's own (Claude Code 2.1.330 and later).
+                if (row.get("type") != "user"
                         or row.get("sessionId") != identity["task_id"]
                         or not isinstance(origin, dict) or origin.get("kind") != "peer"
                         or origin.get("msg_id") != native_id or not isinstance(body, dict)
@@ -180,7 +198,7 @@ class ClaudeRecipients:
                 if isinstance(content, list) and all(isinstance(p, dict) and p.get("type") == "text"
                                                      and isinstance(p.get("text"), str) for p in content):
                     content = "".join(p.get("text", "") for p in content)
-                if content == message:
+                if isinstance(content, str) and _peer_content_matches(content, message):
                     self.select(identity)
                     return {"status": "posted", "message_receipt": {
                         "native_message_id": native_id, "session_id": identity["task_id"],
@@ -329,7 +347,12 @@ class WindowsClaudeNative:
             with _handle(win32file.CreateFile(pipe, self.con.GENERIC_WRITE, 0, None, self.con.OPEN_EXISTING,
                                               self.con.FILE_FLAG_OVERLAPPED | 0x100000 | 0x10000, None)) as handle:
                 yield _WindowsPipe(handle, win32pipe.GetNamedPipeServerProcessId(handle), self.kernel)
-        except self.api.error:
+        except self.api.error as exc:
+            # ERROR_ACCESS_DENIED: the pipe's default DACL grants write only to the
+            # owner, SYSTEM and Administrators, so a sandboxed or other-user host
+            # (for example a restricted token) cannot open it.
+            if exc.winerror == 5:
+                raise OSError("claude_pipe_access_denied") from None
             raise OSError("claude_pipe_unavailable") from None
 
 
