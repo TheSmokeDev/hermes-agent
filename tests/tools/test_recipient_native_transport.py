@@ -133,7 +133,9 @@ $cases=@{
  placeholder_last=@('Work with Codex',"Work with Codex`n",@('Work with Codex',"`n"));
  placeholder_first=@('Do anything',"`nDo anything",@("`n",'Do anything'));
  mismatched_order=@('Work with Codex',"Work with Codex`n",@("`n",'Work with Codex'));
- typed=@('Work with Codex','hello',@('hello'))
+ typed=@('Work with Codex','hello',@('hello'));
+ lone_break=@('Work with Codex',"`n",@("`n"));
+ break_with_text=@('Work with Codex',"`n",@('x'))
 }
 foreach($key in $cases.Keys){$c=Composer $cases[$key][0] $cases[$key][1] $cases[$key][2];$values[$key]=ComposerValue $c.composer $c.value}
 $finds=@{}
@@ -161,7 +163,8 @@ foreach($kind in @('one','two','none')){
                               "named_box": ["box", "box"], "unnamed_outer": ["box", "box"],
                               "profile": ["box", "box"]}
     assert value["values"] == {"placeholder_last": "", "placeholder_first": "",
-                               "mismatched_order": "Work with Codex\n", "typed": "hello"}
+                               "mismatched_order": "Work with Codex\n", "typed": "hello",
+                               "lone_break": "", "break_with_text": "\n"}
     assert value["finds"] == {"one": "e1", "two": "task_deeplink_ambiguous",
                               "none": "task_deeplink_unavailable_composer"}
 
@@ -188,6 +191,88 @@ def test_codex_requests_carry_the_reviewed_selectors(monkeypatch):
     WindowsRecipients(profiles={"codex_desktop": {"composer_names": ["Ask Codex"]}})._call("snapshot", target={})
     WindowsRecipients(profiles={})._call("windows")
     assert sent[0]["selectors"] == {"composer_names": ["Do anything", "Work with Codex"],
-                                    "user_markers": ["You said:"], "conversation_names": ["Conversation"]}
+                                    "user_markers": ["You said:"], "conversation_names": ["Conversation"],
+                                    "send_names": ["Send", "Send message", "Send prompt", "Queue"]}
     assert sent[1]["selectors"]["composer_names"] == ["Ask Codex"]
     assert "selectors" not in sent[2]
+
+
+@pytest.mark.windows_only
+def test_native_send_time_checks_rebind_the_pane_and_the_send_control():
+    import base64
+    import os
+    import re
+    from pathlib import Path
+    import subprocess
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_FUNCTIONS
+    from tools.computer_use.recipient_windows_script import CONTROL_ROLE_SCRIPT, SCRIPT
+    functions = "".join(re.search(r"function %s\(.*?\n}\n" % name, SCRIPT, re.S).group(0)
+                        for name in ("ComposerValue", "FindRuntime", "VerifyComposer", "VerifySubmit"))
+    script = ("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
+              "Add-Type -AssemblyName UIAutomationClient\nAdd-Type -AssemblyName UIAutomationTypes\n"
+              + CONTROL_ROLE_SCRIPT + CLIPBOARD_FUNCTIONS + functions + r'''
+$children='children';$any='any';$request=$null
+function Rid($element){return [string]$element.Id}
+function CodexTaskBinding($window,$target){return @{}}
+function AllNodes($window){return $script:nodes}
+$T=[System.Windows.Automation.ControlType]
+function Element($id,$name,$role,$parent,$value=$null){
+ $e=[pscustomobject]@{Id=$id;Parent=$parent;Kids=@();Value=$value;Current=[pscustomobject]@{Name=$name;ControlType=$role;IsOffscreen=$false;IsEnabled=$true}}
+ $e|Add-Member ScriptMethod FindAll {param($scope,$condition);return @($this.Kids)}
+ $e|Add-Member ScriptMethod TryGetCurrentPattern {param($pattern,$out)
+  if($pattern -eq [System.Windows.Automation.ValuePattern]::Pattern -and $null -ne $this.Value){
+   $out.Value=[pscustomobject]@{Current=[pscustomobject]@{Value=$this.Value;IsReadOnly=$false}};return $true}
+  if($pattern -eq [System.Windows.Automation.InvokePattern]::Pattern -and $this.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button){
+   $out.Value=[pscustomobject]@{Id=$this.Id};return $true}
+  return $false}
+ if($parent){$parent.Kids+=$e}
+ $script:nodes+=$e
+ return $e
+}
+$walker=[pscustomobject]@{};$walker|Add-Member ScriptMethod GetParent {param($e);return $e.Parent}
+function Build($kind){
+ $script:nodes=@()
+ $root=Element 'root' '' $T::Document $null
+ if($kind -eq 'single'){
+  $pane=Element 'pane' '' $T::Group $root;[void](Element 'mark' 'You said:' $T::Text $pane)
+  [void](Element 'editor' 'Do anything' $T::Edit $pane 'hello');[void](Element 'send' 'Send' $T::Button $pane)
+  [void](Element 'stray' 'Send' $T::Button $root)
+  return @{pane_id='pane';composer_id='editor';composer_name='Do anything'}
+ }
+ $conv=Element 'conversation' 'Conversation' $T::Group $root;[void](Element 'mark' 'You said:' $T::Text $conv)
+ $box=Element 'box' '' $T::Group $conv
+ [void](Element 'editor' 'Work with Codex' $T::Edit $box 'hello');[void](Element 'send' 'Send' $T::Button $box)
+ [void](Element 'voice' 'Start voice chat' $T::Button $box);[void](Element 'stray' 'Send' $T::Button $conv)
+ return @{pane_id='conversation';composer_id='editor';composer_name='Work with Codex'}
+}
+$answers=@{}
+foreach($kind in @('single','conversation')){
+ foreach($case in @('send','stray','voice','box_pane','text')){
+  $target=Build $kind
+  if($kind -eq 'single' -and $case -eq 'voice'){continue}
+  $expected='hello';$submit=$case
+  if($case -eq 'box_pane'){$target.pane_id=$(if($kind -eq 'single'){'root'}else{'box'});$submit='send'}
+  if($case -eq 'text'){$expected='changed';$submit='send'}
+  try {$verified=VerifyComposer $null $target $expected;$answers["$kind-$case"]=[string](VerifySubmit $verified $submit).Id}
+  catch {$answers["$kind-$case"]=$_.Exception.Message}
+ }
+}
+$answers|ConvertTo-Json -Compress
+''')
+    bootstrap = ("[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false);"
+                 "Invoke-Expression ([Text.Encoding]::Unicode.GetString("
+                 "[Convert]::FromBase64String([Console]::In.ReadLine())))")
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand",
+         base64.b64encode(bootstrap.encode("utf-16le")).decode()],
+        input=base64.b64encode(script.encode("utf-16le")).decode() + "\n", capture_output=True,
+        text=True, encoding="utf-8", timeout=30, creationflags=windows_hide_flags())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "single-send": "send", "single-stray": "submit_control_changed",
+        "single-box_pane": "recipient_pane_changed", "single-text": "composer_text_changed",
+        "conversation-send": "send", "conversation-stray": "submit_control_changed",
+        "conversation-voice": "submit_control_changed",
+        "conversation-box_pane": "recipient_pane_changed", "conversation-text": "composer_text_changed"}

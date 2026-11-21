@@ -91,8 +91,8 @@ class WindowsRecipients:
                      "accessibility_truncated", "unsupported_accessibility", "recipient_task_changed", "task_deeplink_unavailable",
                      "clipboard_busy", "clipboard_changed", "clipboard_format_not_preservable",
                      "clipboard_backup_failed", "clipboard_restore_failed", "clipboard_owner_unavailable",
-                     "task_deeplink_ambiguous", "task_deeplink_unavailable_Do_anything",
-                     "task_deeplink_unavailable_composer", "ambiguous_conversation",
+                     "task_deeplink_ambiguous", "task_deeplink_unavailable_composer",
+                     "task_deeplink_invoke_failed",
                      "task_deeplink_unavailable_Chat_actions", "task_deeplink_unavailable_Copy",
                      "task_deeplink_unavailable_Copy_deeplink_Alt+Ctrl+L"}
             raise RecipientError(code if code in known else "native_accessibility_refused")

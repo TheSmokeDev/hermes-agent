@@ -171,14 +171,17 @@ function CopyTaskDeeplink($window,$target) {
   $backup=New-Object HermesClipboardBackup
   $backup.AssertUnchanged()
   [void](ExactWindow $target)
-  $invoke.Invoke()
+  # The item can report an error after it has already copied; still read the
+  # clipboard so a completed copy is restored instead of left behind.
+  $invokeFailed=$false
+  try {$invoke.Invoke()} catch {$invokeFailed=$true}
   $timer=[Diagnostics.Stopwatch]::StartNew()
   while($timer.ElapsedMilliseconds -lt 2000){
    $link=$backup.ReadCopy([uint32]$target.pid)
    if($null -ne $link){$answer=@{deeplink=$link;preserved_formats=$backup.FormatCount};break}
    Start-Sleep -Milliseconds 25
   }
-  if($null -eq $answer){throw 'task_deeplink_unavailable'}
+  if($null -eq $answer){if($invokeFailed){throw 'task_deeplink_invoke_failed'};throw 'task_deeplink_unavailable'}
   return $answer
  } finally {
   if($backup){try {$restored=$backup.RestoreIfUnchanged();if($answer){$answer.clipboard_restored=$restored}}finally{$backup.Dispose()}}
@@ -188,9 +191,10 @@ function CopyTaskDeeplink($window,$target) {
 }
 function CodexSelectors {
  # recipient_view sends the host-reviewed lists; these defaults match its own.
- $selected=@{composer_names=@('Do anything','Work with Codex');user_markers=@('You said:');conversation_names=@('Conversation')}
+ $selected=@{composer_names=@('Do anything','Work with Codex');user_markers=@('You said:');conversation_names=@('Conversation');
+  send_names=@('Send','Send message','Send prompt','Queue')}
  if($request -and $request.selectors){
-  foreach($key in @('composer_names','user_markers','conversation_names')){
+  foreach($key in @('composer_names','user_markers','conversation_names','send_names')){
    if($request.selectors.PSObject.Properties.Name -contains $key){$selected[$key]=@($request.selectors.$key)}
   }
  }
@@ -232,10 +236,24 @@ function ComposerPane($editor) {
   (HasMarkerChild $outer $selectors.user_markers)){return @{pane=$outer;box=$box}}
  return @{pane=$box;box=$box}
 }
+function CopyTaskDeeplinkWithRetry($window,$target) {
+ # Codex 26.1117 sometimes renders the Copy submenu late or rejects the first Invoke
+ # while the menu animates. Copying the link only reads the open chat, and every
+ # attempt restores the clipboard, so a transient menu miss is retried twice. Clipboard
+ # contention, ambiguity and a changed window are never retried.
+ for($attempt=1;;$attempt++){
+  try {return CopyTaskDeeplink $window $target}
+  catch {
+   $reason=$_.Exception.Message
+   if($attempt -ge 3 -or $reason -like 'clipboard_*' -or $reason -in @('task_deeplink_ambiguous','recipient_window_changed')){throw}
+   Start-Sleep -Milliseconds 300
+  }
+ }
+}
 function CodexTaskBinding($window,$target) {
  $editor=FindVisibleComposer $window
  $editorId=Rid $editor;$paneId=Rid ((ComposerPane $editor).pane)
- $copied=CopyTaskDeeplink $window $target
+ $copied=CopyTaskDeeplinkWithRetry $window $target
  $matched=[regex]::Match([string]$copied.deeplink,'^codex://threads/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$')
  if(-not $matched.Success){
   throw 'task_deeplink_unavailable'

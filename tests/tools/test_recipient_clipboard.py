@@ -241,3 +241,40 @@ $answers|ConvertTo-Json -Compress
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"old": "1", "new": "2", "both": "task_deeplink_ambiguous",
                                          "none": "task_deeplink_unavailable_Copy_deeplink_Alt+Ctrl+L"}
+
+
+@pytest.mark.windows_only
+def test_deeplink_copy_retries_only_transient_menu_misses():
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.computer_use.recipient_windows_clipboard import CLIPBOARD_FUNCTIONS
+    script = ("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
+              + CLIPBOARD_FUNCTIONS + r'''
+function Start-Sleep {param($Milliseconds)}
+$answers=@{}
+$plans=@{
+ recovers=@('task_deeplink_unavailable_Copy','task_deeplink_invoke_failed','ok');
+ gives_up=@('task_deeplink_unavailable','task_deeplink_unavailable','task_deeplink_unavailable','ok');
+ clipboard=@('clipboard_changed','ok');
+ ambiguous=@('task_deeplink_ambiguous','ok')
+}
+foreach($key in $plans.Keys){
+ $script:plan=$plans[$key];$script:calls=0
+ function CopyTaskDeeplink($window,$target){$step=$script:plan[$script:calls];$script:calls++;if($step -ne 'ok'){throw $step};return @{deeplink='link'}}
+ try {$result=(CopyTaskDeeplinkWithRetry $null $null).deeplink}catch{$result=$_.Exception.Message}
+ $answers[$key]=@($result,$script:calls)
+}
+$answers|ConvertTo-Json -Compress
+''')
+    bootstrap = ("[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false);"
+                 "Invoke-Expression ([Text.Encoding]::Unicode.GetString("
+                 "[Convert]::FromBase64String([Console]::In.ReadLine())))")
+    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand",
+         base64.b64encode(bootstrap.encode("utf-16le")).decode()],
+        input=base64.b64encode(script.encode("utf-16le")).decode() + "\n", capture_output=True,
+        text=True, encoding="utf-8", timeout=15, creationflags=windows_hide_flags())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"recovers": ["link", 3], "gives_up": ["task_deeplink_unavailable", 3],
+                                         "clipboard": ["clipboard_changed", 1],
+                                         "ambiguous": ["task_deeplink_ambiguous", 1]}

@@ -41,13 +41,15 @@ WINDOW_FIELDS = ("exe", "pid", "window_id", "process_started", "product", "compa
 CODEX_COMPOSER_NAMES = ("Do anything", "Work with Codex")
 CODEX_USER_MARKERS = ("You said:",)
 CODEX_CONVERSATION_NAMES = ("Conversation",)
+CODEX_SEND_NAMES = ("Send", "Send message", "Send prompt", "Queue")
 
 
 def codex_selectors(profile: dict | None = None) -> dict:
     profile = profile or {}
     return {"composer_names": list(profile.get("composer_names", CODEX_COMPOSER_NAMES)),
             "user_markers": list(profile.get("user_markers", CODEX_USER_MARKERS)),
-            "conversation_names": list(profile.get("conversation_names", CODEX_CONVERSATION_NAMES))}
+            "conversation_names": list(profile.get("conversation_names", CODEX_CONVERSATION_NAMES)),
+            "send_names": list(profile.get("send_names", CODEX_SEND_NAMES))}
 
 
 def window_identity(window: dict) -> dict:
@@ -98,7 +100,8 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
     # Host-reviewed selectors are installation configuration, never request/model input.
     selectors = codex_selectors(profile) if app == "codex_desktop" else {
         "composer_names": (profile or {}).get("composer_names", []),
-        "user_markers": (profile or {}).get("user_markers", []), "conversation_names": []}
+        "user_markers": (profile or {}).get("user_markers", []), "conversation_names": [],
+        "send_names": (profile or {}).get("send_names", ["Send", "Send message", "Send prompt"])}
     names, markers = selectors["composer_names"], selectors["user_markers"]
     if app == "claude_code" and not any(n.get("selected") and n.get("name") == "Code" for n in nodes):
         raise RecipientError("claude_code_pane_unverified")
@@ -114,10 +117,7 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
     # Role-labelled transcript markers distinguish a conversation from a shell/editor.
     pane = _conversation_pane(nodes, by_id, box, markers, selectors["conversation_names"])
     peers = [n for n in nodes if n.get("parent") == pane["id"]]
-    default_send_names = ["Send", "Send message", "Send prompt"]
-    if app == "codex_desktop":
-        default_send_names.append("Queue")
-    send_names = (profile or {}).get("send_names", default_send_names)
+    send_names = selectors["send_names"]
     # The submit control is the composer's sibling in both layouts.
     submits = [n for n in nodes if n.get("parent") == box["id"] and n.get("role") == "Button"
                and n.get("name") in send_names

@@ -36,7 +36,13 @@ function WindowFacts($window) {
 function ComposerValue($composer,$value) {
  # An empty composer exposes its placeholder plus a line break, in either order
  # (Codex 26.1117 reports placeholder first), as exactly those two Text children.
+ # After a send, Codex 26.1117 can also leave only the line break as one Text child.
  $raw=$value.Current.Value;$name=$composer.Current.Name;$order=$null
+ if($raw -ceq "`n"){
+  $parts=@($composer.FindAll($children,$any))
+  if($parts.Count -eq 1 -and $parts[0].Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
+   $parts[0].Current.Name -ceq "`n"){return ''}
+ }
  if($raw -ceq ("`n"+$name)){$order=@("`n",$name)}elseif($raw -ceq ($name+"`n")){$order=@($name,"`n")}
  if($null -ne $order){
   $parts=$composer.FindAll($children,$any)
@@ -103,6 +109,15 @@ function VerifyComposer($window,$target,$expected) {
  }
  return @{composer=$composer;value=$value;nodes=$nodes;box=$layout.box}
 }
+function VerifySubmit($verified,$submitId) {
+ # The exact Send control beside the verified composer, still named as a send control.
+ $button=FindRuntime $verified.nodes $submitId
+ if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne (Rid $verified.box) -or
+  $button.Current.Name -cnotin (CodexSelectors).send_names -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
+ $invoke=$null
+ if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
+ return $invoke
+}
 try {
  switch($request.action){
   'windows' {
@@ -139,18 +154,12 @@ try {
   'submit' {
    $w=ExactWindow $request.target
    $verified=VerifyComposer $w $request.target ([string]$request.message)
-   $button=FindRuntime $verified.nodes $request.submit_id
-   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne (Rid $verified.box) -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
-   $invoke=$null
-   if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
+   [void](VerifySubmit $verified $request.submit_id)
    [Console]::Out.WriteLine('{"ready":true}'); [Console]::Out.Flush()
    if([Console]::In.ReadLine() -cne 'commit'){throw 'authorization_missing'}
    $w=ExactWindow $request.target
    $verified=VerifyComposer $w $request.target ([string]$request.message)
-   $button=FindRuntime $verified.nodes $request.submit_id
-   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne (Rid $verified.box) -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
-   $invoke=$null
-   if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
+   $invoke=VerifySubmit $verified $request.submit_id
    # Invoke the exact submit control: no foreground-global keyboard/Enter fallback.
    $invoke.Invoke()
    $result=@{submitted=$true}
