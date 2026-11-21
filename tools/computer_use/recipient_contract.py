@@ -33,12 +33,54 @@ def app_identity(window: dict) -> str | None:
 
 WINDOW_FIELDS = ("exe", "pid", "window_id", "process_started", "product", "company")
 
+# Host-reviewed Codex Desktop selectors; a profile may replace each list. The
+# native driver receives the same lists, so both sides resolve the same controls.
+# Codex 26.1117 names the follow-up composer "Work with Codex" and keeps "Do anything"
+# for a new chat. Its transcript is a "Conversation" group that also holds the
+# composer's own unnamed group.
+CODEX_COMPOSER_NAMES = ("Do anything", "Work with Codex")
+CODEX_USER_MARKERS = ("You said:",)
+CODEX_CONVERSATION_NAMES = ("Conversation",)
+
+
+def codex_selectors(profile: dict | None = None) -> dict:
+    profile = profile or {}
+    return {"composer_names": list(profile.get("composer_names", CODEX_COMPOSER_NAMES)),
+            "user_markers": list(profile.get("user_markers", CODEX_USER_MARKERS)),
+            "conversation_names": list(profile.get("conversation_names", CODEX_CONVERSATION_NAMES))}
+
 
 def window_identity(window: dict) -> dict:
     identity = {key: window.get(key) for key in WINDOW_FIELDS}
     if any(value in (None, "", 0) for value in identity.values()):
         raise RecipientError("unverified_window")
     return identity
+
+
+def _has_marker(nodes, container, markers) -> bool:
+    return any(n.get("parent") == container["id"] and n.get("role") == "Text"
+               and n.get("name") in markers for n in nodes)
+
+
+def _conversation_pane(nodes, by_id, box, markers, conversation_names) -> dict:
+    """The one transcript pane bound to this composer, in either supported layout."""
+    if not markers:
+        raise RecipientError("unverified_conversation")
+    # Single-pane layout: the composer and the transcript markers share a parent.
+    if _has_marker(nodes, box, markers):
+        return box
+    # Conversation layout: an unnamed composer group directly inside the one named
+    # conversation group that holds the transcript markers.
+    outer = by_id.get(box.get("parent"))
+    if (outer is None or box.get("role") != "Group" or box.get("name")
+            or outer.get("role") != "Group" or outer.get("name") not in conversation_names
+            or not _has_marker(nodes, outer, markers)):
+        raise RecipientError("unverified_conversation")
+    panes = [n for n in nodes if n.get("role") == "Group" and n.get("name") in conversation_names
+             and _has_marker(nodes, n, markers)]
+    if panes != [outer]:
+        raise RecipientError("ambiguous_conversation")
+    return outer
 
 
 def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
@@ -54,7 +96,10 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
            for n in nodes):
         raise RecipientError("unsupported_accessibility")
     # Host-reviewed selectors are installation configuration, never request/model input.
-    names = (profile or {}).get("composer_names", ["Do anything"] if app == "codex_desktop" else [])
+    selectors = codex_selectors(profile) if app == "codex_desktop" else {
+        "composer_names": (profile or {}).get("composer_names", []),
+        "user_markers": (profile or {}).get("user_markers", []), "conversation_names": []}
+    names, markers = selectors["composer_names"], selectors["user_markers"]
     if app == "claude_code" and not any(n.get("selected") and n.get("name") == "Code" for n in nodes):
         raise RecipientError("claude_code_pane_unverified")
     editors = [n for n in nodes if n.get("role") == "Edit" and n.get("name") in names
@@ -63,19 +108,19 @@ def recipient_view(snapshot: dict, profile: dict | None = None) -> dict:
         raise RecipientError("ambiguous_composer" if editors else "unsupported_accessibility")
     editor = editors[0]
     by_id = {n["id"]: n for n in nodes}
-    pane = by_id.get(editor.get("parent"))
-    if pane is None or pane.get("role") not in {"Group", "Pane", "Document"}:
+    box = by_id.get(editor.get("parent"))
+    if box is None or box.get("role") not in {"Group", "Pane", "Document"}:
         raise RecipientError("unverified_task_pane")
-    peers = [n for n in nodes if n.get("parent") == pane["id"]]
     # Role-labelled transcript markers distinguish a conversation from a shell/editor.
-    markers = (profile or {}).get("user_markers", ["You said:"] if app == "codex_desktop" else [])
-    if not markers or not any(n.get("name") in markers and n.get("role") == "Text" for n in peers):
-        raise RecipientError("unverified_conversation")
+    pane = _conversation_pane(nodes, by_id, box, markers, selectors["conversation_names"])
+    peers = [n for n in nodes if n.get("parent") == pane["id"]]
     default_send_names = ["Send", "Send message", "Send prompt"]
     if app == "codex_desktop":
         default_send_names.append("Queue")
     send_names = (profile or {}).get("send_names", default_send_names)
-    submits = [n for n in peers if n.get("role") == "Button" and n.get("name") in send_names
+    # The submit control is the composer's sibling in both layouts.
+    submits = [n for n in nodes if n.get("parent") == box["id"] and n.get("role") == "Button"
+               and n.get("name") in send_names
                and n.get("enabled") and n.get("invoke_supported") and not n.get("offscreen")]
     if len(submits) > 1:
         raise RecipientError("ambiguous_submit_control")

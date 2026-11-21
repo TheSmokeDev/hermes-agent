@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from tools.computer_use.recipient_contract import RecipientError
+from tools.computer_use.recipient_contract import RecipientError, codex_selectors
 
 
 class WindowsRecipients:
@@ -49,6 +49,9 @@ class WindowsRecipients:
         argv = [str(powershell), "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", encoded]
         options = dict(text=True, encoding="utf-8", errors="replace",
                        creationflags=windows_hide_flags(), env=sanitized_cua_driver_env())
+        if action != "windows":
+            # The native side resolves the same composer, markers and pane as recipient_view.
+            arguments["selectors"] = codex_selectors(self.profiles.get("codex_desktop"))
         payload = (base64.b64encode(SCRIPT.encode("utf-16le")).decode("ascii") + "\n"
                    + json.dumps({"action": action, **arguments}, ensure_ascii=False) + "\n")
         try:
@@ -89,6 +92,7 @@ class WindowsRecipients:
                      "clipboard_busy", "clipboard_changed", "clipboard_format_not_preservable",
                      "clipboard_backup_failed", "clipboard_restore_failed", "clipboard_owner_unavailable",
                      "task_deeplink_ambiguous", "task_deeplink_unavailable_Do_anything",
+                     "task_deeplink_unavailable_composer", "ambiguous_conversation",
                      "task_deeplink_unavailable_Chat_actions", "task_deeplink_unavailable_Copy",
                      "task_deeplink_unavailable_Copy_deeplink_Alt+Ctrl+L"}
             raise RecipientError(code if code in known else "native_accessibility_refused")

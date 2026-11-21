@@ -429,3 +429,139 @@ def test_native_receipt_observation_requires_current_live_identity(tmp_path):
     posted = service.reconcile(operation_id="operation", target_token=token)
     assert posted["status"] == "posted" and posted["message_receipt"]["native_message_id"] == "native-item"
     assert len(observed) == desktop.submits == 1
+
+
+def conversation_snapshot():
+    """The Codex 26.1117 tree observed live: the transcript and an unnamed composer
+    group are children of one "Conversation" group, and Send appears beside the
+    "Work with Codex" composer once it holds text."""
+    task_id = "11111111-2222-4333-8444-555555555555"
+    return {"window": dict(WINDOW), "task_binding": {
+        "task_id": task_id, "deeplink": "codex://threads/" + task_id,
+        "pid": WINDOW["pid"], "window_id": WINDOW["window_id"],
+        "process_started": WINDOW["process_started"], "composer_id": "editor", "pane_id": "conversation",
+    }, "nodes": [
+        {"id": "document", "parent": "root", "role": "Document", "name": "Reply with SAPPHIRE"},
+        {"id": "conversation", "parent": "document", "role": "Group", "name": "Conversation"},
+        {"id": "old", "parent": "conversation", "role": "Text", "name": "You said:"},
+        {"id": "old-content", "parent": "conversation", "role": "Text", "name": "prior",
+         "text_supported": True},
+        {"id": "old-time", "parent": "conversation", "role": "Group", "name": ""},
+        {"id": "old-time-text", "parent": "old-time", "role": "Text", "name": "11:47 PM",
+         "text_supported": True},
+        {"id": "copy-message", "parent": "conversation", "role": "Button", "name": "Copy message",
+         "invoke_supported": True, "enabled": True},
+        {"id": "assistant", "parent": "conversation", "role": "Text", "name": "ChatGPT said:"},
+        {"id": "reply", "parent": "conversation", "role": "Text", "name": "SAPPHIRE", "text_supported": True},
+        {"id": "copy-reply", "parent": "conversation", "role": "Button", "name": "Copy",
+         "invoke_supported": True, "enabled": True},
+        {"id": "box", "parent": "conversation", "role": "Group", "name": "", "invoke_supported": True},
+        {"id": "editor", "parent": "box", "role": "Edit", "name": "Work with Codex",
+         "value_supported": True, "enabled": True, "value": ""},
+        {"id": "send", "parent": "box", "role": "Button", "name": "Send",
+         "invoke_supported": True, "enabled": True},
+        {"id": "voice", "parent": "box", "role": "Button", "name": "Start voice chat",
+         "invoke_supported": True, "enabled": True},
+    ]}
+
+
+def _node(state, node_id):
+    return next(n for n in state["nodes"] if n["id"] == node_id)
+
+
+def test_codex_conversation_layout_resolves_one_bound_pane():
+    view = recipient_view(conversation_snapshot())
+    assert view["identity"]["pane_id"] == "conversation" and view["identity"]["composer_id"] == "editor"
+    assert view["identity"]["composer_name"] == "Work with Codex"
+    assert view["submit_id"] == "send" and view["composer_text"] == ""
+    assert view["messages"] == [{"id": "old", "text": "prior"}]
+
+
+@pytest.mark.parametrize("mutation,code", [
+    (lambda s: _node(s, "box").update(name="Composer"), "unverified_conversation"),
+    (lambda s: _node(s, "conversation").update(name="Sidebar"), "unverified_conversation"),
+    (lambda s: _node(s, "conversation").update(role="Pane"), "unverified_conversation"),
+    (lambda s: _node(s, "old").update(name="PS>"), "unverified_conversation"),
+    (lambda s: s["nodes"].extend([
+        {"id": "other", "parent": "document", "role": "Group", "name": "Conversation"},
+        {"id": "other-user", "parent": "other", "role": "Text", "name": "You said:"}]), "ambiguous_conversation"),
+    (lambda s: s["nodes"].append(dict(_node(s, "editor"), id="editor-2", name="Do anything")), "ambiguous_composer"),
+    (lambda s: s["nodes"].append({"id": "approve", "parent": "conversation", "role": "Button",
+                                  "name": "Allow once"}), "approval_surface_active"),
+    (lambda s: s["nodes"].append({"id": "dialog", "parent": "root", "role": "Window", "modal": True}),
+     "approval_surface_active"),
+    # A binding taken from the composer's own group is not the bound transcript pane.
+    (lambda s: s["task_binding"].update(pane_id="box"), "recipient_task_identity_unverified"),
+    (lambda s: s["task_binding"].update(composer_id="voice"), "recipient_task_identity_unverified"),
+])
+def test_codex_conversation_layout_refuses_ambiguity_and_guards(mutation, code):
+    state = conversation_snapshot()
+    mutation(state)
+    with pytest.raises(RecipientError, match=code):
+        recipient_view(state)
+
+
+def test_codex_conversation_layout_submit_must_be_the_composer_sibling():
+    state = conversation_snapshot()
+    _node(state, "send")["parent"] = "conversation"
+    assert recipient_view(state)["submit_id"] is None
+    state = conversation_snapshot()
+    state["nodes"].append(dict(_node(state, "send"), id="send-2"))
+    with pytest.raises(RecipientError, match="ambiguous_submit_control"):
+        recipient_view(state)
+
+
+def test_codex_composer_names_follow_the_host_profile():
+    state = conversation_snapshot()
+    with pytest.raises(RecipientError, match="unsupported_accessibility"):
+        recipient_view(state, {"composer_names": ["Do anything"]})
+    assert recipient_view(state, {"composer_names": ["Work with Codex"]})["submit_id"] == "send"
+
+
+class ConversationDesktop(Desktop):
+    def __init__(self):
+        super().__init__()
+        self.state = conversation_snapshot()
+
+    def compose(self, target, message, *, authorize):
+        authorize()
+        self.composes += 1
+        _node(self.state, "editor")["value"] = message
+
+    def submit(self, target, message, submit_id, *, authorize):
+        authorize()
+        assert submit_id == "send" and target["pane_id"] == "conversation"
+        self.submits += 1
+        box = self.state["nodes"].index(_node(self.state, "box"))
+        self.state["nodes"][box:box] = [
+            {"id": "new", "parent": "conversation", "role": "Text", "name": "You said:"},
+            {"id": "new-content", "parent": "conversation", "role": "Text", "name": message,
+             "text_supported": True},
+            {"id": "new-copy", "parent": "conversation", "role": "Button", "name": "Copy message",
+             "invoke_supported": True, "enabled": True},
+            {"id": "new-assistant", "parent": "conversation", "role": "Text", "name": "ChatGPT said:"},
+        ]
+        _node(self.state, "editor")["value"] = ""
+
+
+def test_codex_conversation_layout_two_phase_send_posts_once(tmp_path):
+    desktop = ConversationDesktop()
+    service = bridge(tmp_path, desktop)
+    row = service.list_recipients(app="codex_desktop")["recipients"][0]
+    assert row["proven_control"] == "ui_bridge" and "send" in row["operations"]
+    queued = prepare(service, row["target_token"])
+    assert queued["status"] == "queued" and desktop.composes == 1 and desktop.submits == 0
+    posted = commit(service, row["target_token"], queued)
+    assert posted["status"] == "posted" and posted["message_receipt"]["native_message_id"] == "new"
+    assert prepare(service, row["target_token"])["status"] == "posted" and desktop.submits == 1
+
+
+def test_codex_conversation_layout_reverifies_pane_before_submission(tmp_path):
+    desktop = ConversationDesktop()
+    service = bridge(tmp_path, desktop)
+    token = selected(service)
+    queued = prepare(service, token)
+    _node(desktop.state, "box")["parent"] = "document"
+    with pytest.raises(RecipientError):
+        commit(service, token, queued)
+    assert desktop.submits == 0

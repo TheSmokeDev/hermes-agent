@@ -34,12 +34,15 @@ function WindowFacts($window) {
   title=$window.Current.Name}
 }
 function ComposerValue($composer,$value) {
- $raw=$value.Current.Value
- if($raw -ceq ("`n"+$composer.Current.Name)){
+ # An empty composer exposes its placeholder plus a line break, in either order
+ # (Codex 26.1117 reports placeholder first), as exactly those two Text children.
+ $raw=$value.Current.Value;$name=$composer.Current.Name;$order=$null
+ if($raw -ceq ("`n"+$name)){$order=@("`n",$name)}elseif($raw -ceq ($name+"`n")){$order=@($name,"`n")}
+ if($null -ne $order){
   $parts=$composer.FindAll($children,$any)
   if($parts.Count -eq 2 -and $parts[0].Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
    $parts[1].Current.ControlType -eq [System.Windows.Automation.ControlType]::Text -and
-   $parts[0].Current.Name -ceq "`n" -and $parts[1].Current.Name -ceq $composer.Current.Name){return ''}
+   $parts[0].Current.Name -ceq $order[0] -and $parts[1].Current.Name -ceq $order[1]){return ''}
  }
  return $raw
 }
@@ -81,7 +84,8 @@ function VerifyComposer($window,$target,$expected) {
  $nodes=AllNodes $window
  $composer=FindRuntime $nodes $target.composer_id
  $pane=FindRuntime $nodes $target.pane_id
- if((Rid ($walker.GetParent($composer))) -cne (Rid $pane)){throw 'recipient_pane_changed'}
+ $layout=ComposerPane $composer
+ if((Rid $layout.pane) -cne (Rid $pane)){throw 'recipient_pane_changed'}
  if((ControlRole $composer.Current.ControlType) -ne 'Edit' -or (ControlRole $pane.Current.ControlType) -notin @('Group','Pane','Document')){throw 'wrong_composer'}
  if($composer.Current.Name -cne $target.composer_name -or -not $composer.Current.IsEnabled -or $composer.Current.IsOffscreen){throw 'wrong_composer'}
  $value=$null
@@ -97,7 +101,7 @@ function VerifyComposer($window,$target,$expected) {
   if(($n.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern,[ref]$modal) -and $modal.Current.IsModal) -or
    ($c.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $c.Name -in @('Approve','Allow once','Allow this session','Run command','Yes, proceed'))){throw 'approval_surface_active'}
  }
- return @{composer=$composer;value=$value;nodes=$nodes}
+ return @{composer=$composer;value=$value;nodes=$nodes;box=$layout.box}
 }
 try {
  switch($request.action){
@@ -136,7 +140,7 @@ try {
    $w=ExactWindow $request.target
    $verified=VerifyComposer $w $request.target ([string]$request.message)
    $button=FindRuntime $verified.nodes $request.submit_id
-   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne $request.target.pane_id -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
+   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne (Rid $verified.box) -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
    $invoke=$null
    if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
    [Console]::Out.WriteLine('{"ready":true}'); [Console]::Out.Flush()
@@ -144,7 +148,7 @@ try {
    $w=ExactWindow $request.target
    $verified=VerifyComposer $w $request.target ([string]$request.message)
    $button=FindRuntime $verified.nodes $request.submit_id
-   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne $request.target.pane_id -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
+   if((ControlRole $button.Current.ControlType) -ne 'Button' -or (Rid ($walker.GetParent($button))) -cne (Rid $verified.box) -or -not $button.Current.IsEnabled -or $button.Current.IsOffscreen){throw 'submit_control_changed'}
    $invoke=$null
    if(-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){throw 'submit_control_unsupported'}
    # Invoke the exact submit control: no foreground-global keyboard/Enter fallback.

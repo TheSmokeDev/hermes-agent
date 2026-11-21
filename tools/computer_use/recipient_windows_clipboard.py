@@ -134,16 +134,19 @@ function TaskMenuRoots($window,$target) {
  return $roots
 }
 function FindVisibleNamed($window,$name,$type,$menuTarget=$null) {
- $condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$name)
+ # $name may list accepted labels of one control; exactly one visible match across them.
+ $conditions=@(@($name) | ForEach-Object {New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,$_)})
  $wait=[Diagnostics.Stopwatch]::StartNew()
  do {
   $roots=@($window)
   if($menuTarget -and $type -eq [System.Windows.Automation.ControlType]::MenuItem){$roots=@(TaskMenuRoots $window $menuTarget)}
   $matches=@{}
   foreach($root in $roots){
-   foreach($element in $root.FindAll($desc,$condition)){
-    if($element.Current.ControlType -eq $type -and -not $element.Current.IsOffscreen -and $element.Current.IsEnabled){
-     $matches[(Rid $element)]=$element
+   foreach($condition in $conditions){
+    foreach($element in $root.FindAll($desc,$condition)){
+     if($element.Current.ControlType -eq $type -and -not $element.Current.IsOffscreen -and $element.Current.IsEnabled){
+      $matches[(Rid $element)]=$element
+     }
     }
    }
   }
@@ -151,7 +154,7 @@ function FindVisibleNamed($window,$name,$type,$menuTarget=$null) {
   if($matches.Count -gt 1){throw 'task_deeplink_ambiguous'}
   Start-Sleep -Milliseconds 50
  } while($wait.ElapsedMilliseconds -lt 1000)
- throw ('task_deeplink_unavailable_'+$name.Replace(' ','_'))
+ throw ('task_deeplink_unavailable_'+(@($name)[0]).Replace(' ','_'))
 }
 function CopyTaskDeeplink($window,$target) {
  $actions=$null;$copy=$null;$backup=$null;$answer=$null
@@ -162,7 +165,8 @@ function CopyTaskDeeplink($window,$target) {
   $copyItem=FindVisibleNamed $window 'Copy' ([System.Windows.Automation.ControlType]::MenuItem) $target
   $copy=$copyItem.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
   if($copy.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Expanded){$copy.Expand();Start-Sleep -Milliseconds 150}
-  $item=FindVisibleNamed $window 'Copy deeplink Alt+Ctrl+L' ([System.Windows.Automation.ControlType]::MenuItem) $target
+  # Codex 26.1117 drops the shortcut from the item's accessible name.
+  $item=FindVisibleNamed $window @('Copy deeplink Alt+Ctrl+L','Copy deeplink') ([System.Windows.Automation.ControlType]::MenuItem) $target
   $invoke=$item.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
   $backup=New-Object HermesClipboardBackup
   $backup.AssertUnchanged()
@@ -182,9 +186,55 @@ function CopyTaskDeeplink($window,$target) {
   if($actions){try{if($actions.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded){$actions.Collapse()}}catch{}}
  }
 }
+function CodexSelectors {
+ # recipient_view sends the host-reviewed lists; these defaults match its own.
+ $selected=@{composer_names=@('Do anything','Work with Codex');user_markers=@('You said:');conversation_names=@('Conversation')}
+ if($request -and $request.selectors){
+  foreach($key in @('composer_names','user_markers','conversation_names')){
+   if($request.selectors.PSObject.Properties.Name -contains $key){$selected[$key]=@($request.selectors.$key)}
+  }
+ }
+ return $selected
+}
+function FindVisibleComposer($window) {
+ $names=(CodexSelectors).composer_names
+ $condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Edit)
+ $wait=[Diagnostics.Stopwatch]::StartNew()
+ do {
+  $hits=@{}
+  foreach($element in $window.FindAll($desc,$condition)){
+   if($element.Current.Name -cin $names -and -not $element.Current.IsOffscreen -and $element.Current.IsEnabled){
+    $hits[(Rid $element)]=$element
+   }
+  }
+  if($hits.Count -eq 1){return @($hits.Values)[0]}
+  if($hits.Count -gt 1){throw 'task_deeplink_ambiguous'}
+  Start-Sleep -Milliseconds 50
+ } while($wait.ElapsedMilliseconds -lt 1000)
+ throw 'task_deeplink_unavailable_composer'
+}
+function HasMarkerChild($element,$markers) {
+ foreach($child in $element.FindAll($children,$any)){
+  if((ControlRole $child.Current.ControlType) -eq 'Text' -and $child.Current.Name -cin $markers){return $true}
+ }
+ return $false
+}
+function ComposerPane($editor) {
+ # Mirrors recipient_view: the composer's parent when it holds the transcript markers,
+ # otherwise the named conversation group directly around an unnamed composer group.
+ $selectors=CodexSelectors
+ $box=$walker.GetParent($editor)
+ if($null -eq $box){throw 'recipient_pane_changed'}
+ if(HasMarkerChild $box $selectors.user_markers){return @{pane=$box;box=$box}}
+ $outer=$walker.GetParent($box)
+ if($null -ne $outer -and (ControlRole $box.Current.ControlType) -eq 'Group' -and [string]::IsNullOrEmpty($box.Current.Name) -and
+  (ControlRole $outer.Current.ControlType) -eq 'Group' -and $outer.Current.Name -cin $selectors.conversation_names -and
+  (HasMarkerChild $outer $selectors.user_markers)){return @{pane=$outer;box=$box}}
+ return @{pane=$box;box=$box}
+}
 function CodexTaskBinding($window,$target) {
- $editor=FindVisibleNamed $window 'Do anything' ([System.Windows.Automation.ControlType]::Edit)
- $editorId=Rid $editor;$paneId=Rid ($walker.GetParent($editor))
+ $editor=FindVisibleComposer $window
+ $editorId=Rid $editor;$paneId=Rid ((ComposerPane $editor).pane)
  $copied=CopyTaskDeeplink $window $target
  $matched=[regex]::Match([string]$copied.deeplink,'^codex://threads/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$')
  if(-not $matched.Success){
@@ -192,8 +242,8 @@ function CodexTaskBinding($window,$target) {
  }
  $taskId=$matched.Groups[1].Value
  $fresh=ExactWindow $target
- $editor=FindVisibleNamed $fresh 'Do anything' ([System.Windows.Automation.ControlType]::Edit)
- if((Rid $editor) -cne $editorId -or (Rid ($walker.GetParent($editor))) -cne $paneId){throw 'recipient_task_changed'}
+ $editor=FindVisibleComposer $fresh
+ if((Rid $editor) -cne $editorId -or (Rid ((ComposerPane $editor).pane)) -cne $paneId){throw 'recipient_task_changed'}
  if(($target.task_id -and $target.task_id -cne $taskId) -or
     ($target.composer_id -and $target.composer_id -cne $editorId) -or
     ($target.pane_id -and $target.pane_id -cne $paneId)){throw 'recipient_task_changed'}
