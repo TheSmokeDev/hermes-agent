@@ -66,6 +66,9 @@ Administrators, read-only access for Everyone. A restricted token, such as a
 command run inside the Codex Windows sandbox, can list, select and read history.
 Its write open is refused. The send then fails before writing, with reason
 `claude_pipe_access_denied`. Other open failures report `claude_pipe_unavailable`.
+Either `failed` receipt means nothing reached Claude. The bridge still records the
+attempt and keeps that operation terminal. After moving the host out of the
+sandbox, send the text again under a new operation ID.
 
 ## Protocol evidence and verification
 

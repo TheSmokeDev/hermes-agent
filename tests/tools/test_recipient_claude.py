@@ -162,18 +162,19 @@ def test_peer_reconcile_requires_exact_posted_native_message(peer, fault):
     assert len(native.writes) == 1 and native.secrets_read == 1
 
 
-def test_refused_pipe_open_is_a_named_failure_before_any_write(peer):
+@pytest.mark.parametrize("raised", ["claude_pipe_access_denied", "claude_pipe_unavailable"])
+def test_refused_pipe_open_is_a_named_failure_before_any_write(peer, raised):
     service, native, *_ = peer
     target = service.list_recipients()[0]["identity"]
 
     @contextmanager
     def refused(pipe):
-        raise OSError("claude_pipe_access_denied")
+        raise OSError(raised)
         yield
 
     native.connect = refused
     receipt = service.send(target, "original", "scoped-op", authorize=lambda: None)
-    assert receipt == {"status": "failed", "reason": "claude_pipe_access_denied"}
+    assert receipt == {"status": "failed", "reason": raised}
     assert native.writes == [] and native.secrets_read == 0
 
 
